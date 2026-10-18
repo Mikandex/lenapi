@@ -186,7 +186,7 @@ python lenora.py migration
 python lenora.py runserver
 ```
 
-The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `settings.py`, `main.py`, `test.py`, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The source tree keeps working applications under `examples/`; they are separate from the installable `lenapi` package.
+The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `settings.py`, `main.py`, `test.py`, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
 
 `settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LenApi()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
 
@@ -203,10 +203,10 @@ python -m pytest
 
 The `generate_test`, `run_test`, and `run_test_output` commands are application commands. Run them from an application directory, where `main.py` and `settings.py` live. `run_test_output` writes a CSV report under that application directory.
 
-For the included Student API example, run those commands from `examples/student_api`:
+For the included Student API example, run those commands from `app/student_api`:
 
 ```bash
-cd examples/student_api
+cd app/student_api
 python lenora.py generate_test
 python lenora.py run_test
 ```
@@ -922,4 +922,4 @@ The engine is disposed on ASGI lifespan shutdown. For response serialization fro
 - JSON responses by default, with `Response` and `JSONResponse` for explicit control
 - Request cookie parsing through `request.cookies`, plus `Response.set_cookie()` and `Response.delete_cookie()`
 
-The installable library lives in `lenapi/`; runnable applications and their migrations are kept separately under `examples/`. The standalone wheel and source download contain the framework, packaging metadata, documentation, and library tests, but omit application code and local databases.
+The installable library lives in `lenapi/`; runnable applications and their migrations are kept separately under `app/`. The standalone wheel and source download contain the framework, packaging metadata, documentation, and library tests, but omit application code and local databases.

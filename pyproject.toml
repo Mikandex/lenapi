@@ -35,6 +35,6 @@ where = ["."]
 include = ["lenapi*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "examples/student_api"]
+testpaths = ["tests", "app/student_api"]
 python_files = ["test.py", "test_*.py", "*_test.py"]
 addopts = "-ra"
