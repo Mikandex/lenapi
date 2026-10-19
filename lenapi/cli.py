@@ -78,13 +78,11 @@ def home():
 ''',
     "app/__init__.py": '''"""Application package."""
 ''',
-    "app/models.py": '''"""Define project-specific database models here."""
+    "app/models.py": '''"""Define project-specific database models here.
 
-from lenapi import model
-
-
-class Example(model.Model):
-    name = model.StringField(max_length=120)
+The framework-provided User model is included in the first migration
+automatically. Add project models to this file when you need them.
+"""
 ''',
     "app/schemas.py": '''"""Project request and response schemas."""
 
