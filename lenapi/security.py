@@ -115,6 +115,7 @@ class JWTAuth:
         token_lifetime_seconds: int = 3600,
         refresh_token_lifetime_seconds: int = 60 * 60 * 24 * 30,
         issuer: str | None = None,
+        authenticate=None,
     ) -> None:
         key = secret_key.encode("utf-8") if isinstance(secret_key, str) else secret_key
         if not isinstance(key, bytes) or len(key) < 32:
@@ -127,6 +128,7 @@ class JWTAuth:
         self.token_lifetime_seconds = token_lifetime_seconds
         self.refresh_token_lifetime_seconds = refresh_token_lifetime_seconds
         self.issuer = issuer
+        self.authenticate = authenticate
 
     def create_access_token(
         self,
@@ -187,13 +189,18 @@ class JWTAuth:
                   if key not in {"sub", "iat", "exp", "iss", "token_use"}}
         return self.create_access_token(payload["sub"], claims=claims)
 
-    def router(self, authenticate):
+    def router(self, authenticate=None):
         """Build `/auth/token` and `/auth/refresh` routes for an app.
 
-        `authenticate(username, password)` must return the user's string ID, or
+        `authenticate(username, password)` may be supplied here or when
+        constructing the instance. It must return the user's string ID, or
         `(string_id, claims)`, when credentials are valid; otherwise return None.
         """
         from .application import Router
+
+        authenticate = authenticate or self.authenticate
+        if authenticate is None:
+            raise ValueError("JWT token routes require an authenticate(username, password) callback")
 
         router = Router(prefix="/auth")
 

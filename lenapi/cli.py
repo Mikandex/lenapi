@@ -64,82 +64,31 @@ TOKEN = {
     "ISSUER": API_TITLE,
 }
 ''',
-    "main.py": '''"""Application entry point."""
+    "main.py": '''"""Application routes."""
 
-from lenapi import Depends, LenApi, check_password, create_authenticator, hash_api_key, make_api_key, make_password
 from app import models  # Import models so migrations can discover them.
+from app.authentication import app
+
+
+@app.get("/")
+def home():
+    return {"message": "lenApp is running"}
+''',
+    "app/authentication.py": '''"""Project authentication setup and built-in auth endpoints."""
+
+from lenapi import Depends, LenApi
+from lenapi.authentication import UserPublic, UserRegistration, authentication_type, register_user
+from app import models
 import settings
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 app = LenApi()
-
-if settings.AUTHENTICATION == "basic_login":
-    identifier_field = getattr(settings, "BASIC_AUTH_FIELD", "username")
-    if identifier_field not in models.User.__table__.columns:
-        raise ValueError(f"BASIC_AUTH_FIELD '{identifier_field}' is not a field on User")
-
-
-def authenticate_user(username, password):
-    user = models.User.get(username=username).get()
-    if user is not None and check_password(password, user.password):
-        return str(user.id)
-    return None
-
-
-def authenticate_api_key(api_key):
-    if not api_key:
-        return None
-    user = models.User.get(api_key=hash_api_key(api_key)).get()
-    return {"user_id": str(user.id), "auth_method": "api_key"} if user is not None else None
-
-
-authenticator = create_authenticator(
-    settings, authenticate=authenticate_user, authenticate_api_key=authenticate_api_key,
-    security_store=app.security_store,
-)
-if settings.AUTHENTICATION == "jwt":
-    app.include_router(authenticator.router(authenticate_user))
-
-
-class UserRegistration(BaseModel):
-    username: str = Field(min_length=1, max_length=120)
-    email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=254)
-    first_name: str = Field(default="", max_length=150)
-    last_name: str = Field(default="", max_length=150)
-    password: str = Field(min_length=8, max_length=128)
-    confirm_password: str = Field(min_length=8, max_length=128)
-
-    @model_validator(mode="after")
-    def passwords_must_match(self):
-        if self.password != self.confirm_password:
-            raise ValueError("password and confirm_password must match")
-        return self
-
-
-class UserPublic(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    username: str
-    email: str | None
-    first_name: str
-    last_name: str
-    api_key: str | None = None
+auth_type = settings.AUTHENTICATION  # e.g. "jwt", "api_key", "basic_login", or "session"
+authenticator = authentication_type(auth_type, settings=settings, user_model=models.User, app=app)
 
 
 @app.post("/auth/register", response_model=UserPublic)
-def register_user(data: UserRegistration):
-    api_key = make_api_key() if settings.AUTHENTICATION == "api_key" else None
-    user = models.User.create(
-        username=data.username,
-        email=data.email,
-        first_name=data.first_name,
-        last_name=data.last_name,
-        password=make_password(data.password),
-        api_key=hash_api_key(api_key) if api_key is not None else None,
-    )
-    return {"id": user.id, "username": user.username, "email": user.email,
-            "first_name": user.first_name, "last_name": user.last_name, "api_key": api_key}
+def create_user(data: UserRegistration):
+    return register_user(models.User, data, authentication=auth_type)
 
 
 @app.get("/auth/profile")
@@ -147,11 +96,6 @@ def auth_profile(identity=Depends(authenticator)):
     if isinstance(identity, dict) and "sub" in identity:
         return {"user_id": identity["sub"]}
     return {"identity": identity}
-
-
-@app.get("/")
-def home():
-    return {"message": "lenApp is running"}
 ''',
     "app/__init__.py": '''"""Application package."""
 ''',
@@ -328,18 +272,12 @@ python lenora.py migration
 python lenora.py runserver
 ```
 
-The development server uses port 8009. Open `/docs/` for Swagger UI. Run `python lenora.py run_test` to run `test.py` and any generated endpoint tests.
+The development server uses port 8009. Open `/docs/` for Swagger UI. Run `python lenora.py test` to generate endpoint checks, run the tests, and write a CSV report.
 ''',
-    "test.py": '''"""Starter smoke tests for the application."""
-
-from main import app
-
-
-def test_root_route_is_registered():
-    assert any(route.path == "/" and "GET" in route.methods for route in app.routes)
+    "tests/__init__.py": '''"""Project test package. Run its tests with ``python lenora.py test``."""
 ''',
     "pytest.ini": '''[pytest]
-python_files = test.py test_*.py *_test.py
+python_files = test_*.py *_test.py
 ''',
 }
 
@@ -391,6 +329,15 @@ def _main() -> None:
         help="CSV report path (default: outputs/lenapi_pytest_results.csv)",
     )
     run_test_output.add_argument("paths", nargs="*", help="optional pytest files or directories")
+    test_command = commands.add_parser(
+        "test", help="generate endpoint checks, run tests, and write a CSV report"
+    )
+    test_command.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
+    test_command.add_argument(
+        "--output", default="outputs/lenapi_test_results.csv",
+        help="CSV report path (default: outputs/lenapi_test_results.csv)",
+    )
+    test_command.add_argument("paths", nargs="*", help="optional pytest files or directories")
 
     args = parser.parse_args()
 
@@ -427,7 +374,7 @@ def _main() -> None:
         print(f"Next: cd {args.name} && python lenora.py migration && python lenora.py runserver")
         return
 
-    if args.command in {"generate_test", "run_test", "run_test_output"}:
+    if args.command in {"generate_test", "run_test", "run_test_output", "test"}:
         module_name, separator, attribute_path = args.app.partition(":")
         if not separator or not module_name:
             parser.error("--app must use the form package.module:app")
@@ -443,10 +390,15 @@ def _main() -> None:
             for method in route.methods
         )
         websocket_endpoints = sorted(route.path for route in app.websocket_routes)
-        if args.command == "generate_test":
-            test_dir = Path.cwd() / "tests"
-            test_dir.mkdir(parents=True, exist_ok=True)
-            destination = test_dir / "test_generated_endpoints.py"
+        generated_test_temp = None
+        if args.command in {"generate_test", "test"}:
+            if args.command == "generate_test":
+                test_dir = Path.cwd() / "tests"
+                test_dir.mkdir(parents=True, exist_ok=True)
+                destination = test_dir / "test_generated_endpoints.py"
+            else:
+                generated_test_temp = tempfile.TemporaryDirectory(prefix="lenapi-generated-tests-")
+                destination = Path(generated_test_temp.name) / "test_generated_endpoints.py"
             websocket_test_source = (
                 '''@pytest.mark.parametrize("path", WEBSOCKET_ENDPOINTS)
 def test_websocket_endpoint_is_registered(path):
@@ -455,7 +407,7 @@ def test_websocket_endpoint_is_registered(path):
 '''
                 if websocket_endpoints else ""
             )
-            generated_source = f'''"""Generated endpoint registration and OpenAPI coverage. Regenerate with python lenora.py generate_test."""
+            generated_source = f'''"""Generated endpoint registration and OpenAPI coverage."""
 
 from importlib import import_module
 
@@ -486,13 +438,16 @@ def test_http_endpoint_is_registered_and_documented(method, path):
 {websocket_test_source}
 '''
             destination.write_text(generated_source, encoding="utf-8")
-            print(f"Generated {destination}")
+            print(f"Generated endpoint checks: {len(http_endpoints) + len(websocket_endpoints)}")
+            if args.command == "generate_test":
+                print(f"Generated {destination}")
             print(f"HTTP endpoints covered: {len(http_endpoints)}")
             for method, path in http_endpoints:
                 print(f"  {method.upper():7} {path}")
             for path in websocket_endpoints:
                 print(f"  WEBSOCKET {path}")
-            return
+            if args.command == "generate_test":
+                return
 
         print("Endpoints covered by generated route tests:")
         for method, path in http_endpoints:
@@ -501,7 +456,17 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             print(f"  WEBSOCKET {path}")
         sys.stdout.flush()
 
-        if args.paths:
+        if args.command == "test":
+            pytest_args = [*args.paths]
+            if not pytest_args and (Path.cwd() / "tests").is_dir():
+                pytest_args.append("tests")
+            pytest_args.append(str(destination))
+            project_dir = Path.cwd().resolve()
+            pytest_args = [
+                str((project_dir / path).resolve()) if not Path(path).is_absolute() else path
+                for path in pytest_args
+            ]
+        elif args.paths:
             pytest_args = [*args.paths]
         else:
             pytest_args = []
@@ -512,11 +477,22 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             if not pytest_args:
                 pytest_args = ["tests"]
         command = [sys.executable, "-m", "pytest", "-q"]
-        if args.command == "run_test_output":
+        if args.command in {"run_test_output", "test"}:
             with tempfile.TemporaryDirectory(prefix="lenapi-pytest-") as temp_dir:
                 junit_path = Path(temp_dir) / "results.xml"
+                run_options = {}
+                if args.command == "test":
+                    project_dir = Path.cwd().resolve()
+                    framework_root = str(Path(__file__).resolve().parents[1])
+                    environment = os.environ.copy()
+                    search_paths = [framework_root, str(project_dir)]
+                    if environment.get("PYTHONPATH"):
+                        search_paths.append(environment["PYTHONPATH"])
+                    environment["PYTHONPATH"] = os.pathsep.join(search_paths)
+                    run_options = {"cwd": project_dir.parent, "env": environment}
                 result = subprocess.run(
-                    [*command, "--junitxml", str(junit_path), *pytest_args], check=False
+                    [*command, "--junitxml", str(junit_path), *pytest_args], check=False,
+                    **run_options,
                 )
                 suites = ET.parse(junit_path).getroot()
                 cases = suites.findall(".//testcase")
@@ -559,6 +535,8 @@ def test_http_endpoint_is_registered_and_documented(method, path):
                 print(f"CSV report written to {report_path}")
         else:
             result = subprocess.run([*command, *pytest_args], check=False)
+        if generated_test_temp is not None:
+            generated_test_temp.cleanup()
         raise SystemExit(result.returncode)
 
     if args.command == "runserver":

@@ -180,13 +180,13 @@ The repository root contains the lenApi library. Create an application scaffold 
 
 ```bash
 python -m pip install -e '.[server]'
-python lenora.py startproject my_api
+lenora startproject my_api
 cd my_api
 python lenora.py migration
 python lenora.py runserver
 ```
 
-The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `settings.py`, `main.py`, `test.py`, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
+Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/authentication.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
 
 `settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LenApi()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
 
@@ -201,7 +201,7 @@ python -m pip install -e '.[test]'
 python -m pytest
 ```
 
-The `generate_test`, `run_test`, and `run_test_output` commands are application commands. Run them from an application directory, where `main.py` and `settings.py` live. `run_test_output` writes a CSV report under that application directory.
+The `test`, `generate_test`, `run_test`, and `run_test_output` commands are application commands. Run them from an application directory, where `main.py` and `settings.py` live. `test` generates endpoint checks temporarily, runs them, and writes a CSV report under `outputs/`. `run_test_output` also writes a CSV report.
 
 For the included Student API example, run those commands from `app/student_api`:
 
@@ -209,6 +209,7 @@ For the included Student API example, run those commands from `app/student_api`:
 cd app/student_api
 python lenora.py generate_test
 python lenora.py run_test
+python lenora.py test
 ```
 
 Request bodies are limited to 10 MiB by default, and lenApi allows up to 30 seconds to receive the body. Configure `MAX_REQUEST_BODY_SIZE` (bytes) and `REQUEST_BODY_TIMEOUT_SECONDS` in `settings.py`; set either to `None` to disable that limit. Oversized bodies receive HTTP 413, and bodies that exceed the receive timeout receive HTTP 408. Direct `Application(...)` instances accept the equivalent `max_request_body_size` and `request_body_timeout` arguments.
@@ -390,20 +391,20 @@ BASIC_AUTH_FIELD = "email"  # username, email, phone, or another User field
 
 The HTTP Basic username slot is treated as the configured identifier, so a client can send `auth=(email, password)` or `auth=(phone, password)`. For a custom identifier, add that field to `User` and migrate the database; then set `BASIC_AUTH_FIELD` to the model field name.
 
-The generated `main.py` uses that setting to protect `/auth/profile`; Swagger shows the selected scheme. JWT mode also registers `/auth/token` and `/auth/refresh`. `create_authenticator(settings, ...)` builds the selected dependency; provide callbacks for database-backed credentials and stores:
+The generated `main.py` uses the selected setting to protect `/auth/profile`; Swagger shows the selected scheme. JWT mode also registers `/auth/token` and `/auth/refresh` automatically. Initialize the selected method through `authentication_type`:
 
 ```python
-from lenapi import Depends, create_authenticator
+from lenapi import Depends
+from lenapi.authentication import authentication_type
+from app import models
 import settings
 
-auth = create_authenticator(settings, authenticate=authenticate_user)
+auth_type = settings.AUTHENTICATION  # "jwt", "api_key", "basic_login", "session", etc.
+auth = authentication_type(auth_type, settings=settings, user_model=models.User, app=app)
 
 @app.get("/protected")
 def protected(user=Depends(auth)):
     return {"authenticated": True}
-
-if settings.AUTHENTICATION == "jwt":
-    app.include_router(auth.router(authenticate_user))
 ```
 
 The primary authentication setting chooses one method for the scaffold's default protected route: `jwt`, `api_key`, `basic_login`, `opaque_bearer`, or `session`. Session cookies, HMAC, and OIDC can also be attached as additional callable dependencies on selected routes. This lets an app use API keys generally and require a session cookie on a browser route, or require both on one route:
