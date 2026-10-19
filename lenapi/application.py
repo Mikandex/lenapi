@@ -647,7 +647,3 @@ class LENAPI(Application):
             from .authentication import install_default_authentication
 
             install_default_authentication(self, project_settings)
-
-
-# Backwards-compatible alias; LENAPI is the canonical public spelling.
-LenApi = LENAPI
