@@ -3,6 +3,7 @@
 import argparse
 import csv
 from importlib import import_module
+from importlib.util import find_spec
 import logging
 import os
 from pathlib import Path
@@ -323,6 +324,9 @@ def _main() -> None:
 
     args = parser.parse_args()
 
+    if args.command in {"run_test", "run_test_output", "test"} and find_spec("pytest") is None:
+        parser.error("test commands require pytest; install lenApi with `pip install 'lenapi[test]'`")
+
     if args.command == "runserver":
         project_settings = None
         if (Path.cwd() / "settings.py").is_file():
@@ -392,6 +396,7 @@ def test_websocket_endpoint_is_registered(path):
             generated_source = f'''"""Generated endpoint registration and OpenAPI coverage."""
 
 from importlib import import_module
+import sys
 
 import pytest
 
@@ -400,9 +405,19 @@ from lenapi.openapi import build_openapi
 APP_IMPORT_STRING = {args.app!r}
 HTTP_ENDPOINTS = {http_endpoints!r}
 WEBSOCKET_ENDPOINTS = {websocket_endpoints!r}
+PROJECT_ROOT = {str(Path.cwd().resolve())!r}
+FRAMEWORK_ROOT = {str(Path(__file__).resolve().parents[1])!r}
 
 
 def load_app():
+    # Resolve the app from this project even when its parent directory has a
+    # different main.py. Put the installed/source framework first so a
+    # project-local compatibility module cannot shadow the lenapi package.
+    for path in (PROJECT_ROOT, FRAMEWORK_ROOT):
+        while path in sys.path:
+            sys.path.remove(path)
+    sys.path.insert(0, PROJECT_ROOT)
+    sys.path.insert(0, FRAMEWORK_ROOT)
     module_name, _, attribute_path = APP_IMPORT_STRING.partition(":")
     app = import_module(module_name)
     for attribute in attribute_path.split(".") if attribute_path else []:
@@ -476,6 +491,11 @@ def test_http_endpoint_is_registered_and_documented(method, path):
                     [*command, "--junitxml", str(junit_path), *pytest_args], check=False,
                     **run_options,
                 )
+                if not junit_path.is_file():
+                    logger.error("pytest did not create its JUnit report; see the pytest output above.")
+                    if generated_test_temp is not None:
+                        generated_test_temp.cleanup()
+                    raise SystemExit(result.returncode or 1)
                 suites = ET.parse(junit_path).getroot()
                 cases = suites.findall(".//testcase")
                 case_results = []
