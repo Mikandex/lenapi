@@ -194,10 +194,9 @@ Use the installed `lenora` command to create the first project; `python lenora.p
 
 ## Automated tests
 
-Install the test extra and run the library and example application tests from the repository root:
+Pytest is installed with lenApi, so you can run the library and example application tests directly from the repository root:
 
 ```bash
-python -m pip install -e '.[test]'
 python -m pytest
 ```
 

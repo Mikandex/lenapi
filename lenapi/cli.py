@@ -325,7 +325,7 @@ def _main() -> None:
     args = parser.parse_args()
 
     if args.command in {"run_test", "run_test_output", "test"} and find_spec("pytest") is None:
-        parser.error("test commands require pytest; install lenApi with `pip install 'lenapi[test]'`")
+        parser.error("pytest is missing; reinstall lenApi or install it with `python -m pip install pytest`")
 
     if args.command == "runserver":
         project_settings = None
