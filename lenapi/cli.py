@@ -66,51 +66,30 @@ TOKEN = {
 ''',
     "main.py": '''"""Application routes."""
 
+from lenapi import LenApi
 from app import models  # Import models so migrations can discover them.
-from app.authentication import app
+
+app = LenApi()
 
 
 @app.get("/")
 def home():
     return {"message": "lenApp is running"}
 ''',
-    "app/authentication.py": '''"""Project authentication setup and built-in auth endpoints."""
-
-from lenapi import Depends, LenApi
-from lenapi.authentication import UserPublic, UserRegistration, authentication_type, register_user
-from app import models
-import settings
-
-app = LenApi()
-auth_type = settings.AUTHENTICATION  # e.g. "jwt", "api_key", "basic_login", or "session"
-authenticator = authentication_type(auth_type, settings=settings, user_model=models.User, app=app)
-
-
-@app.post("/auth/register", response_model=UserPublic)
-def create_user(data: UserRegistration):
-    return register_user(models.User, data, authentication=auth_type)
-
-
-@app.get("/auth/profile")
-def auth_profile(identity=Depends(authenticator)):
-    if isinstance(identity, dict) and "sub" in identity:
-        return {"user_id": identity["sub"]}
-    return {"identity": identity}
-''',
     "app/__init__.py": '''"""Application package."""
 ''',
-    "app/models.py": '''"""Define database models here."""
+    "app/models.py": '''"""Define project-specific database models here."""
 
 from lenapi import model
 
 
-class User(model.Model):
-    username = model.StringField(max_length=120, unique=True)
-    email = model.StringField(max_length=254, unique=True, nullable=True)
-    first_name = model.StringField(max_length=150, default="")
-    last_name = model.StringField(max_length=150, default="")
-    password = model.StringField(max_length=255)
-    api_key = model.StringField(max_length=64, unique=True, nullable=True)
+class Example(model.Model):
+    name = model.StringField(max_length=120)
+''',
+    "app/schemas.py": '''"""Project request and response schemas."""
+
+# Default account schemas are supplied by the framework.
+from lenapi.authentication import UserPublic, UserRegistration
 ''',
     "lenora.py": '''"""Project-local command launcher."""
 
@@ -265,7 +244,10 @@ def downgrade() -> None:
     "migrations/versions/.gitkeep": "",
     "README.md": '''# lenApp
 
-Project settings are in `settings.py`; models belong in `app/models.py` and routes in `main.py`.
+Project settings are in `settings.py`; project models and schemas belong in
+`app/models.py` and `app/schemas.py`, and routes belong in `main.py`. The
+framework supplies the default `User` model and authentication setup. The
+first migration includes the framework user table automatically.
 
 ```bash
 python lenora.py migration

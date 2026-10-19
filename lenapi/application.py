@@ -634,3 +634,7 @@ class LenApi(Application):
             media_root=media_root if media_root is not None else getattr(project_settings, "MEDIA_ROOT", None),
             media_url=media_url if media_url is not None else getattr(project_settings, "MEDIA_URL", None),
         )
+        if project_settings is not None:
+            from .authentication import install_default_authentication
+
+            install_default_authentication(self, project_settings)

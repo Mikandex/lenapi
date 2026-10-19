@@ -1050,3 +1050,14 @@ BACKGROUND_JOBS_TABLE = Table(
     Column("created_at", Float, nullable=False),
     Column("completed_at", Float, nullable=True),
 )
+
+
+class User(Model):
+    """Framework-provided user table, included in every project's metadata."""
+
+    username = StringField(max_length=120, unique=True)
+    email = EmailField(max_length=254, unique=True, nullable=True)
+    first_name = StringField(max_length=150, default="")
+    last_name = StringField(max_length=150, default="")
+    password = StringField(max_length=255)
+    api_key = StringField(max_length=64, unique=True, nullable=True)

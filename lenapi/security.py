@@ -10,7 +10,6 @@ import re
 import secrets
 import threading
 import time
-import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -87,8 +86,8 @@ def check_password(password: str, encoded_password: str) -> bool:
 
 
 def make_api_key() -> str:
-    """Generate a hyphen-free UUIDv5 API key using a random UUIDv4 seed."""
-    return uuid.uuid5(uuid.NAMESPACE_DNS, str(uuid.uuid4())).hex
+    """Generate an API key from 32 bytes of cryptographically secure randomness."""
+    return secrets.token_urlsafe(32)
 
 
 def hash_api_key(api_key: str) -> str:

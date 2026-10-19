@@ -7,6 +7,7 @@ model, rather than putting credential lookup and password handling in
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .dependencies import Depends
 from .security import (
     APIKeyAuth,
     BasicAuth,
@@ -136,8 +137,12 @@ def webhook(secret, *, tolerance_seconds=300, nonce_store=None):
     return WebhookAuth(secret, tolerance_seconds=tolerance_seconds, nonce_store=nonce_store)
 
 
-def configure(settings, user_model, *, security_store=None):
+def configure(settings, user_model=None, *, security_store=None):
     """Build the primary authenticator selected by ``settings.AUTHENTICATION``."""
+    if user_model is None:
+        from .models import User
+
+        user_model = User
     mode = getattr(settings, "AUTHENTICATION", "jwt").lower()
     identifier_field = getattr(settings, "BASIC_AUTH_FIELD", "username")
     if mode == "basic_login":
@@ -164,13 +169,14 @@ def configure(settings, user_model, *, security_store=None):
     raise ValueError(f"Unknown AUTHENTICATION mode: {mode}")
 
 
-def authentication_type(auth_type, *, settings, user_model, app):
-    """Configure an application's selected authentication method in one call.
+def authentication_type(auth_type, *, settings, user_model=None, app=None):
+    """Create the authenticator selected by a project settings module.
 
     ``auth_type`` may be ``"jwt"``, ``"api_key"``, ``"basic_login``,
     ``"session"``, ``"opaque_bearer"``, ``"hmac"``, or ``"oidc"``. The
-    returned object is the dependency to use with ``Depends``. JWT token and
-    refresh routes are added to ``app`` automatically.
+    returned object is the dependency to use with ``Depends``. Pass ``app`` to
+    mount the JWT token and refresh routes. If ``user_model`` is omitted, the
+    framework's default ``User`` model is used.
     """
     from types import SimpleNamespace
 
@@ -184,13 +190,40 @@ def authentication_type(auth_type, *, settings, user_model, app):
         user_model,
         security_store=getattr(app, "security_store", None),
     )
-    if mode == "jwt":
+    if mode == "jwt" and app is not None:
         app.include_router(authenticator.router())
     return authenticator
 
 
-def register_user(user_model, data, *, authentication="jwt"):
+def install_default_authentication(app, settings):
+    """Install configured authentication and the built-in user endpoints."""
+    from .models import User
+
+    mode = getattr(settings, "AUTHENTICATION", "jwt").lower()
+    authenticator = authentication_type(
+        mode, settings=settings, user_model=User, app=app
+    )
+
+    @app.post("/auth/register", response_model=UserPublic)
+    def register(data: UserRegistration):
+        return register_user(User, data, authentication=mode)
+
+    @app.get("/auth/profile")
+    def profile(identity=Depends(authenticator)):
+        if isinstance(identity, dict) and "sub" in identity:
+            return {"user_id": identity["sub"]}
+        return {"identity": identity}
+
+    app.authenticator = authenticator
+    return authenticator
+
+
+def register_user(user_model=None, data=None, *, authentication="jwt"):
     """Create a user, hash its password, and return a one-time API key if used."""
+    if user_model is None:
+        from .models import User
+
+        user_model = User
     raw_key = make_api_key() if authentication == "api_key" else None
     user = user_model.create(
         username=data.username,
@@ -214,5 +247,6 @@ __all__ = [
     "UserRegistration", "UserPublic", "basic", "api_key", "jwt_auth",
     "session", "opaque_bearer", "hmac", "oidc", "webhook", "configure",
     "authentication_type",
+    "install_default_authentication",
     "register_user",
 ]

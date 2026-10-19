@@ -186,7 +186,7 @@ python lenora.py migration
 python lenora.py runserver
 ```
 
-Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/authentication.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
+Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LenApi()` installs auth routes based on `settings.AUTHENTICATION`. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
 
 `settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LenApi()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
 
@@ -389,21 +389,15 @@ AUTHENTICATION = "basic_login"  # choose one: jwt, api_key, basic_login, opaque_
 BASIC_AUTH_FIELD = "email"  # username, email, phone, or another User field
 ```
 
-The HTTP Basic username slot is treated as the configured identifier, so a client can send `auth=(email, password)` or `auth=(phone, password)`. For a custom identifier, add that field to `User` and migrate the database; then set `BASIC_AUTH_FIELD` to the model field name.
+The HTTP Basic username slot is treated as the configured identifier, so a client can send `auth=(email, password)` when `BASIC_AUTH_FIELD = "email"`. The framework's default `User` model supports `username` and `email` as identifiers.
 
-The generated `main.py` uses the selected setting to protect `/auth/profile`; Swagger shows the selected scheme. JWT mode also registers `/auth/token` and `/auth/refresh` automatically. Initialize the selected method through `authentication_type`:
+`LenApi()` reads this setting, configures the framework's default `User` model, and installs `/auth/register` and `/auth/profile`; Swagger shows the selected scheme. JWT mode also registers `/auth/token` and `/auth/refresh` automatically. There is no authentication setup module to add to the app. Use the configured dependency on your own protected routes:
 
 ```python
 from lenapi import Depends
-from lenapi.authentication import authentication_type
-from app import models
-import settings
-
-auth_type = settings.AUTHENTICATION  # "jwt", "api_key", "basic_login", "session", etc.
-auth = authentication_type(auth_type, settings=settings, user_model=models.User, app=app)
 
 @app.get("/protected")
-def protected(user=Depends(auth)):
+def protected(user=Depends(app.authenticator)):
     return {"authenticated": True}
 ```
 
@@ -500,30 +494,24 @@ Safe methods do not require the header; state-changing methods do. `SameSite` is
 
 `API_KEY` is generated uniquely for each new project. The scaffold's Basic/JWT credential callback looks up `User` in the database and verifies its hashed `password`. Use `make_password(password)` to hash a password and `check_password(password, stored_password)` to verify it; the latter returns a boolean. Never store plaintext passwords. The older `hash_password()` and `verify_password()` names remain available as aliases. Use HTTPS for Basic credentials and bearer/API key requests outside local development.
 
-When your registration or trusted user-provisioning flow creates a user, store the hash:
+The framework provides `lenapi.User` with `username`, `email`, `first_name`, `last_name`, `password`, and `api_key` fields. When a trusted provisioning flow creates a user directly, store the password hash:
 
 ```python
-from lenapi import make_password, model
-
-class User(model.Model):
-    username = model.StringField(max_length=120, unique=True)
-    email = model.StringField(max_length=254, unique=True, nullable=True)
-    first_name = model.StringField(max_length=150, default="")
-    last_name = model.StringField(max_length=150, default="")
-    password = model.StringField(max_length=255)
-    api_key = model.StringField(max_length=64, unique=True, nullable=True)
-    phone_number = model.StringField(max_length=30, nullable=True)
+from lenapi import User, make_password
 
 # In a registration handler, after validating the submitted password:
 user = User.create(
     username=username,
+    email=email,
+    first_name="",
+    last_name="",
     password=make_password(password),
 )
 ```
 
-Add user attributes by declaring more fields on `User`, then create and apply a migration. To accept a new field during registration, add it to the Pydantic registration schema and pass it to `User.create()` in the registration handler. Keep sensitive fields such as passwords out of public response schemas.
+Project-specific database models belong in `app/models.py`; the default framework `User` model and its authentication routes are maintained by lenApi and included in the first migration.
 
-When `settings.AUTHENTICATION = "api_key"`, registration generates a unique, hyphen-free UUIDv5 key for the new user and returns it once as plain text in the registration response. The `user.api_key` column remains nullable for installations using another authentication mode; in API key mode new registered users get a key automatically. lenApi stores a SHA-256 digest in that column, so the original key cannot be recovered later. Send the returned key on authenticated requests with `X-API-Key: <key>`. The API key authenticator resolves the digest back to its user and returns that user's identity. Existing users need to be issued a key through a key-rotation/provisioning flow before they can use API-key authentication.
+When `settings.AUTHENTICATION = "api_key"`, registration generates a URL-safe API key with 32 bytes of cryptographically secure randomness and returns it once as plain text in the registration response. The `user.api_key` column remains nullable for installations using another authentication mode; in API-key mode, newly registered users get a key automatically. lenApi stores only the key's SHA-256 digest in that column, so the original key cannot be recovered later. Send the returned key on authenticated requests with `X-API-Key: <key>`. The API-key authenticator hashes the supplied key before lookup and returns that user's identity. Existing users need to be issued a key through a key-rotation/provisioning flow before they can use API-key authentication.
 
 The scaffold also exposes `POST /auth/register`, which accepts `username`, `email`, `first_name`, `last_name`, `password`, and `confirm_password`. It validates that the passwords match, stores only the hashed `password`, and never stores `confirm_password`. The password encoding uses Django's `pbkdf2_sha256` format, so Django's password hashers can verify it; this is one-way hashing, not reversible encryption. See [Django password management](https://docs.djangoproject.com/en/6.0/topics/auth/passwords/) for the encoded format and verification helpers.
 
@@ -714,7 +702,7 @@ await student.adelete()
 Put application models in `app/models.py` and import that module from `main.py`. The migration command loads `main:app`, so it discovers those model classes before creating a migration. The library's `Model` base supplies an integer `id`:
 
 ```python
-from lenapi import model
+from lenapi import User, model
 
 class Classroom(model.Model):
     name = model.StringField(max_length=120)
@@ -730,13 +718,6 @@ class Course(model.Model):
 class Teacher(model.Model):
     name = model.StringField(max_length=120)
     courses = model.ManyToManyField("Course")
-
-class User(model.Model):
-    username = model.StringField(max_length=120, unique=True)
-    email = model.StringField(max_length=254, unique=True, nullable=True)
-    first_name = model.StringField(max_length=150, default="")
-    last_name = model.StringField(max_length=150, default="")
-    password = model.StringField(max_length=255)
 
 class Verification(model.Model):
     user_id = model.ForeignKeyField("user.id", model=model.cascade.delete)
