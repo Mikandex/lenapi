@@ -217,7 +217,7 @@ The runserver command looks for `app` in the current application's `main.py`. It
 
 ## Async database access
 
-Routes can be `async def`, and lenApi can inject a SQLAlchemy `AsyncSession` when configured with an `AsyncDatabase`. Async SQLite support is included in the standard lenApi installation through `aiosqlite`. For async PostgreSQL or MySQL, install the corresponding optional driver extra.
+Routes can be `async def`, and lenApi can inject a SQLAlchemy `AsyncSession` when configured with an `AsyncDatabase`. The standard lenApi installation includes SQLAlchemy's `asyncio` extra (including `greenlet`) and `aiosqlite`, so async SQLite is ready to use. For async PostgreSQL or MySQL, install the corresponding optional driver extra.
 
 Then configure both URLs in `settings.py`: `DATABASE_URL` is the synchronous URL used by migrations, while `ASYNC_DATABASE_URL` is used for awaited database requests. They should point to the same database. For SQLite, use `sqlite:///...` and `sqlite+aiosqlite:///...` respectively.
 
