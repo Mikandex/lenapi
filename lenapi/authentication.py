@@ -7,7 +7,6 @@ model, rather than putting credential lookup and password handling in
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .dependencies import Depends
 from .security import (
     APIKeyAuth,
     BasicAuth,
@@ -174,9 +173,10 @@ def authentication_type(auth_type, *, settings, user_model=None, app=None):
 
     ``auth_type`` may be ``"jwt"``, ``"api_key"``, ``"basic_login``,
     ``"session"``, ``"opaque_bearer"``, ``"hmac"``, or ``"oidc"``. The
-    returned object is the dependency to use with ``Depends``. Pass ``app`` to
-    mount the JWT token and refresh routes. If ``user_model`` is omitted, the
-    framework's default ``User`` model is used.
+    returned object is the dependency to use with ``Depends``. This only
+    configures authentication; it does not add login, registration, refresh,
+    or profile routes. If ``user_model`` is omitted, the framework's default
+    ``User`` model is used.
     """
     from types import SimpleNamespace
 
@@ -190,29 +190,17 @@ def authentication_type(auth_type, *, settings, user_model=None, app=None):
         user_model,
         security_store=getattr(app, "security_store", None),
     )
-    if mode == "jwt" and app is not None:
-        app.include_router(authenticator.router())
     return authenticator
 
 
 def install_default_authentication(app, settings):
-    """Install configured authentication and the built-in user endpoints."""
+    """Configure the app's authentication dependency without adding routes."""
     from .models import User
 
     mode = getattr(settings, "AUTHENTICATION", "jwt").lower()
     authenticator = authentication_type(
         mode, settings=settings, user_model=User, app=app
     )
-
-    @app.post("/auth/register", response_model=UserPublic, include_in_schema=False)
-    def register(data: UserRegistration):
-        return register_user(User, data, authentication=mode)
-
-    @app.get("/auth/profile", include_in_schema=False)
-    def profile(identity=Depends(authenticator)):
-        if isinstance(identity, dict) and "sub" in identity:
-            return {"user_id": identity["sub"]}
-        return {"identity": identity}
 
     app.authenticator = authenticator
     return authenticator

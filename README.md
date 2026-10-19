@@ -186,7 +186,7 @@ python lenora.py migration
 python lenora.py runserver
 ```
 
-Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LenApi()` installs auth routes based on `settings.AUTHENTICATION`. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
+Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LenApi()` configures the authentication dependency without adding authentication routes. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
 
 `settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LenApi()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
 
@@ -390,7 +390,7 @@ BASIC_AUTH_FIELD = "email"  # username, email, phone, or another User field
 
 The HTTP Basic username slot is treated as the configured identifier, so a client can send `auth=(email, password)` when `BASIC_AUTH_FIELD = "email"`. The framework's default `User` model supports `username` and `email` as identifiers.
 
-`LenApi()` reads this setting, configures the framework's default `User` model, and installs `/auth/register` and `/auth/profile`; Swagger shows the selected scheme. JWT mode also registers `/auth/token` and `/auth/refresh` automatically. There is no authentication setup module to add to the app. Use the configured dependency on your own protected routes:
+`LenApi()` reads this setting and configures the framework's default `User` model and authentication dependency. It does not register built-in `/auth/register`, `/auth/profile`, `/auth/token`, or `/auth/refresh` routes. Create only the auth endpoints your application needs, and use `app.authenticator` on protected routes:
 
 ```python
 from lenapi import Depends
@@ -508,11 +508,11 @@ user = User.create(
 )
 ```
 
-Project-specific database models belong in `app/models.py`; the default framework `User` model and its authentication routes are maintained by lenApi and included in the first migration.
+Project-specific database models belong in `app/models.py`; the default framework `User` model is maintained by lenApi and included in the first migration. Authentication is configured as a dependency; the framework does not add login, registration, refresh, or profile routes automatically.
 
 When `settings.AUTHENTICATION = "api_key"`, registration generates a URL-safe API key with 32 bytes of cryptographically secure randomness and returns it once as plain text in the registration response. The `user.api_key` column remains nullable for installations using another authentication mode; in API-key mode, newly registered users get a key automatically. lenApi stores only the key's SHA-256 digest in that column, so the original key cannot be recovered later. Send the returned key on authenticated requests with `X-API-Key: <key>`. The API-key authenticator hashes the supplied key before lookup and returns that user's identity. Existing users need to be issued a key through a key-rotation/provisioning flow before they can use API-key authentication.
 
-The scaffold also exposes `POST /auth/register`, which accepts `username`, `email`, `first_name`, `last_name`, `password`, and `confirm_password`. It validates that the passwords match, stores only the hashed `password`, and never stores `confirm_password`. The password encoding uses Django's `pbkdf2_sha256` format, so Django's password hashers can verify it; this is one-way hashing, not reversible encryption. See [Django password management](https://docs.djangoproject.com/en/6.0/topics/auth/passwords/) for the encoded format and verification helpers.
+Use `register_user()` from your own registration handler if you want the framework's user creation and password handling. The password encoding uses Django's `pbkdf2_sha256` format, so Django's password hashers can verify it; this is one-way hashing, not reversible encryption. See [Django password management](https://docs.djangoproject.com/en/6.0/topics/auth/passwords/) for the encoded format and verification helpers.
 
 ### Cookie-based browser sessions
 
