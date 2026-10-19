@@ -41,6 +41,7 @@ class Route:
     def __init__(
         self, path: str, methods: set[str], endpoint: Callable, response_model: Any = None,
         *, api_flag: bool = False, cool_time: int = 300, request_body: dict[str, Any] | None = None,
+        include_in_schema: bool = True,
     ) -> None:
         if cool_time <= 0:
             raise ValueError("cool_time must be a positive number of seconds")
@@ -49,6 +50,7 @@ class Route:
         self.endpoint = endpoint
         self.response_model = response_model
         self.request_body = request_body
+        self.include_in_schema = include_in_schema
         self.api_flag = api_flag
         self.cool_time = cool_time
         self.regex, self.parameter_names = self._compile_path(path)
@@ -94,29 +96,36 @@ class Router:
         self, path: str, *, methods: tuple[str, ...] = ("GET",), response_model: Any = None,
         api_flag: bool = False, cool_time: int = 300,
         request_body: dict[str, Any] | None = None,
+        include_in_schema: bool = True,
     ):
         def decorator(endpoint: Callable):
             self.routes.append(Route(
                 self.prefix + self._normalize_path(path), {method.upper() for method in methods},
                 endpoint, response_model, api_flag=api_flag, cool_time=cool_time,
-                request_body=request_body,
+                request_body=request_body, include_in_schema=include_in_schema,
             ))
             return endpoint
         return decorator
 
-    def get(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300):
-        return self.route(path, methods=("GET",), response_model=response_model, api_flag=api_flag, cool_time=cool_time)
+    def get(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
+            include_in_schema: bool = True):
+        return self.route(path, methods=("GET",), response_model=response_model, api_flag=api_flag,
+                          cool_time=cool_time, include_in_schema=include_in_schema)
 
     def post(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
-             request_body: dict[str, Any] | None = None):
+             request_body: dict[str, Any] | None = None, include_in_schema: bool = True):
         return self.route(path, methods=("POST",), response_model=response_model, api_flag=api_flag,
-                          cool_time=cool_time, request_body=request_body)
+                          cool_time=cool_time, request_body=request_body, include_in_schema=include_in_schema)
 
-    def put(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300):
-        return self.route(path, methods=("PUT",), response_model=response_model, api_flag=api_flag, cool_time=cool_time)
+    def put(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
+            include_in_schema: bool = True):
+        return self.route(path, methods=("PUT",), response_model=response_model, api_flag=api_flag,
+                          cool_time=cool_time, include_in_schema=include_in_schema)
 
-    def delete(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300):
-        return self.route(path, methods=("DELETE",), response_model=response_model, api_flag=api_flag, cool_time=cool_time)
+    def delete(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
+               include_in_schema: bool = True):
+        return self.route(path, methods=("DELETE",), response_model=response_model, api_flag=api_flag,
+                          cool_time=cool_time, include_in_schema=include_in_schema)
 
     def websocket(self, path: str):
         """Register an ASGI WebSocket handler on this router."""
@@ -133,7 +142,7 @@ class Router:
             self.routes.append(Route(
                 mount_prefix + route.path, route.methods, route.endpoint, route.response_model,
                 api_flag=route.api_flag, cool_time=route.cool_time,
-                request_body=route.request_body,
+                request_body=route.request_body, include_in_schema=route.include_in_schema,
             ))
         for route in router.websocket_routes:
             self.websocket_routes.append(Route(

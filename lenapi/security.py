@@ -203,7 +203,7 @@ class JWTAuth:
 
         router = Router(prefix="/auth")
 
-        @router.post("/token")
+        @router.post("/token", include_in_schema=False)
         async def issue_token(credentials: _Credentials):
             user = authenticate(credentials.username, credentials.password)
             if inspect.isawaitable(user):
@@ -223,7 +223,7 @@ class JWTAuth:
                 "expires_in": self.token_lifetime_seconds,
             }
 
-        @router.post("/refresh")
+        @router.post("/refresh", include_in_schema=False)
         def refresh_token(body: _RefreshRequest):
             try:
                 access_token = self.refresh_access_token(body.refresh_token)

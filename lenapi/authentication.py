@@ -204,11 +204,11 @@ def install_default_authentication(app, settings):
         mode, settings=settings, user_model=User, app=app
     )
 
-    @app.post("/auth/register", response_model=UserPublic)
+    @app.post("/auth/register", response_model=UserPublic, include_in_schema=False)
     def register(data: UserRegistration):
         return register_user(User, data, authentication=mode)
 
-    @app.get("/auth/profile")
+    @app.get("/auth/profile", include_in_schema=False)
     def profile(identity=Depends(authenticator)):
         if isinstance(identity, dict) and "sub" in identity:
             return {"user_id": identity["sub"]}

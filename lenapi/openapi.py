@@ -84,6 +84,8 @@ def build_openapi(app, *, title: str, version: str) -> dict[str, Any]:
     security_schemes: dict[str, dict[str, str]] = {}
 
     for route in app.routes:
+        if not route.include_in_schema:
+            continue
         for method in route.methods:
             operation: dict[str, Any] = {
                 "operationId": f"{route.endpoint.__name__}_{method.lower()}",
