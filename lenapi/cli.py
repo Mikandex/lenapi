@@ -254,6 +254,8 @@ python lenora.py migration
 python lenora.py runserver
 ```
 
+Migration checks for schema changes and skips the database upgrade when there is no new revision to apply.
+
 The development server uses port 8009. Open `/docs/` for Swagger UI. Run `python lenora.py test` to generate endpoint checks, run the tests, and write a CSV report.
 ''',
     "tests/__init__.py": '''"""Project test package. Run its tests with ``python lenora.py test``."""
@@ -557,6 +559,7 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         existing_revisions = [
             path for path in revisions.glob("*.py") if path.name != "__init__.py"
         ]
+        revisions_before_autogenerate = {path.resolve() for path in existing_revisions}
         config.attributes["lenapi_initial_revision"] = not existing_revisions
 
         # On a fresh non-SQLite database, apply the checked-in migration chain
@@ -627,6 +630,14 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             autogenerate=True,
             process_revision_directives=skip_empty_revision,
         )
+        revisions_after_autogenerate = {
+            path.resolve()
+            for path in revisions.glob("*.py")
+            if path.name != "__init__.py"
+        }
+        if revisions_after_autogenerate == revisions_before_autogenerate:
+            logger.info("No new migration detected; database was not migrated.")
+            return
 
     # `migration` generates then applies; `migrate` only applies revisions already created.
     from sqlalchemy import inspect, text
@@ -666,8 +677,15 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     if mark_existing_schema:
         command.stamp(config, "head")
         logger.info("Existing database matches the models; migration history initialized without changing its data.")
-    else:
-        command.upgrade(config, "head")
+
+    script = ScriptDirectory.from_config(config)
+    with engine.connect() as connection:
+        current_heads = set(MigrationContext.configure(connection).get_current_heads())
+    expected_heads = set(script.get_heads())
+    if current_heads == expected_heads:
+        logger.info("Database is already up to date; no migrations applied.")
+        return
+    command.upgrade(config, "head")
 
 
 def main() -> None:

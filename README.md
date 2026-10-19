@@ -900,6 +900,7 @@ The engine is disposed on ASGI lifespan shutdown. For response serialization fro
 - mountable `Router` groups
 - optional request-scoped SQLAlchemy `Session` injection
 - `python lenora.py runserver` development command (default port `8009`); `python lenora.py migration` generates and applies model migrations
+- Migration commands compare the database revision with migration files and skip the database upgrade when there is no new revision to apply
 - Swagger UI at `/docs/` and generated OpenAPI 3.1 at `/openapi.json`
 - JSON responses by default, with `Response` and `JSONResponse` for explicit control
 - Request cookie parsing through `request.cookies`, plus `Response.set_cookie()` and `Response.delete_cookie()`
