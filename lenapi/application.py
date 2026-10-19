@@ -577,7 +577,7 @@ class Application(Router):
         return values
 
 
-class LenApi(Application):
+class LENAPI(Application):
     """Application configured from the current project's optional settings.py."""
 
     def __init__(self, *, session_factory: Callable[[], Any] | None = None, database: Any = None,
@@ -647,3 +647,7 @@ class LenApi(Application):
             from .authentication import install_default_authentication
 
             install_default_authentication(self, project_settings)
+
+
+# Backwards-compatible alias; LENAPI is the canonical public spelling.
+LenApi = LENAPI

@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from lenapi import Body, HTTPException, LenApi, Request, UploadFile
+from lenapi import Body, HTTPException, LENAPI, Request, UploadFile
 from app.models import Classroom, Photo, Student
 from app.schemas import (
     ClassroomCreate,
@@ -21,7 +21,7 @@ from app.schemas import (
 )
 import settings
 
-app = LenApi()
+app = LENAPI()
 
 
 @app.get("/")
@@ -264,7 +264,7 @@ def delete_student(student_id: int):
     return Student.get(id=student_id).delete()
 
 
-# Async CRUD example. These routes use the AsyncSession configured by LenApi.
+# Async CRUD example. These routes use the AsyncSession configured by LENAPI.
 @app.post("/async/students", response_model=StudentRead)
 async def async_create_student(data: StudentCreate):
     return await Student.acreate(**data.model_dump())

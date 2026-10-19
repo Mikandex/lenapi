@@ -4,9 +4,9 @@ lenApi is a small ASGI framework experiment inspired by FastAPI. Pydantic v2 val
 
 ```python
 from pydantic import BaseModel, ConfigDict
-from lenapi import LenApi, Router
+from lenapi import LENAPI, Router
 
-app = LenApi()
+app = LENAPI()
 api = Router(prefix="/api")
 
 class GreetingInput(BaseModel):
@@ -43,10 +43,10 @@ The logger follows Python's normal logging configuration, so developers can set 
 Register WebSocket handlers with `@app.websocket(...)` and use the connection helpers from `lenapi.service`:
 
 ```python
-from lenapi import LenApi
+from lenapi import LENAPI
 from lenapi.service import WebSocket, WebSocketDisconnect
 
-app = LenApi()
+app = LENAPI()
 
 @app.websocket("/ws/{room_id}")
 async def room_socket(websocket: WebSocket, room_id: int):
@@ -125,9 +125,9 @@ Adapters use the provider's hosted checkout, so LenApi does not collect or store
 You can also define a router without a prefix and mount it with the Django Ninja style `add_router(prefix, router)` call. Prefixes with or without trailing slashes are normalized:
 
 ```python
-from lenapi import LenApi, Router
+from lenapi import LENAPI, Router
 
-app = LenApi()
+app = LENAPI()
 users = Router()
 
 @users.get("/")
@@ -186,11 +186,11 @@ python lenora.py migration
 python lenora.py runserver
 ```
 
-Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LenApi()` configures the authentication dependency without adding authentication routes. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
+Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LENAPI()` configures the authentication dependency without adding authentication routes. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
 
-`settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LenApi()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
+`settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LENAPI()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
 
-`settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LenApi()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
+`settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LENAPI()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
 
 ## Automated tests
 
@@ -224,10 +224,10 @@ Then configure both URLs in `settings.py`: `DATABASE_URL` is the synchronous URL
 ```python
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from lenapi import LenApi
+from lenapi import LENAPI
 from app.models import Student
 
-app = LenApi()
+app = LENAPI()
 
 @app.get("/async-students")
 async def list_students(db: AsyncSession):
@@ -328,7 +328,7 @@ asyncio.run(queue.run_worker())
 
 The API process and worker must register the same task names and handlers. `run_once()` is available for one-job execution in tests or custom worker loops; `status(job_id)` returns the persisted job status.
 
-Swagger UI is available at [http://127.0.0.1:8009/docs/](http://127.0.0.1:8009/docs/), and the generated OpenAPI document is at [http://127.0.0.1:8009/openapi.json](http://127.0.0.1:8009/openapi.json). These are enabled by default. Set `API_TITLE`, `API_VERSION`, `DOCS_URL`, and `OPENAPI_URL` in `settings.py` to configure the Swagger metadata and paths, or override them directly with `LenApi(title="My API", version="1.0.0", docs_url="/docs/", openapi_url="/openapi.json")`.
+Swagger UI is available at [http://127.0.0.1:8009/docs/](http://127.0.0.1:8009/docs/), and the generated OpenAPI document is at [http://127.0.0.1:8009/openapi.json](http://127.0.0.1:8009/openapi.json). These are enabled by default. Set `API_TITLE`, `API_VERSION`, `DOCS_URL`, and `OPENAPI_URL` in `settings.py` to configure the Swagger metadata and paths, or override them directly with `LENAPI(title="My API", version="1.0.0", docs_url="/docs/", openapi_url="/openapi.json")`.
 
 The sample app exposes the model queries as HTTP routes: `POST /classrooms` creates a classroom, `GET /classrooms` lists them, and `POST /students` accepts an optional `classroom_id`. `POST /students/batch` creates multiple students, `PUT /students/batch` updates multiple students by ID, and `DELETE /students/batch` deletes multiple students by ID. Batch requests are all-or-nothing: unknown IDs, duplicate names, or a protected deletion reject the whole operation. `PUT /students/{student_id}` updates one student; it returns HTTP 404 if the ID does not exist. `GET /students/{student_id}/classroom` returns the related classroom. Other student routes list, search, and check existence. These routes appear in Swagger at `/docs/`.
 
@@ -390,7 +390,7 @@ BASIC_AUTH_FIELD = "email"  # username, email, phone, or another User field
 
 The HTTP Basic username slot is treated as the configured identifier, so a client can send `auth=(email, password)` when `BASIC_AUTH_FIELD = "email"`. The framework's default `User` model supports `username` and `email` as identifiers.
 
-`LenApi()` reads this setting and configures the framework's default `User` model and authentication dependency. It does not register built-in `/auth/register`, `/auth/profile`, `/auth/token`, or `/auth/refresh` routes. Create only the auth endpoints your application needs, and use `app.authenticator` on protected routes:
+`LENAPI()` reads this setting and configures the framework's default `User` model and authentication dependency. It does not register built-in `/auth/register`, `/auth/profile`, `/auth/token`, or `/auth/refresh` routes. Create only the auth endpoints your application needs, and use `app.authenticator` on protected routes:
 
 ```python
 from lenapi import Depends
@@ -664,7 +664,7 @@ async def payments_webhook(
 Install the official PyMongo driver extra with `python -m pip install -e '.[mongodb]'`. Create a `MongoDatabase` using a MongoDB URI and database name, then bind Pydantic document classes to it. The default collection name is the lower-case document class name; set `collection_name` to override it. MongoDB creates collections on first write, so there is no Alembic migration step for them.
 
 ```python
-from lenapi import LenApi, MongoDatabase, MongoDocument
+from lenapi import LENAPI, MongoDatabase, MongoDocument
 
 mongo = MongoDatabase(
     "mongodb://127.0.0.1:27017",
@@ -678,7 +678,7 @@ class Student(MongoDocument):
     collection_name = "students"
 
 Student.bind(mongo)
-app = LenApi(mongodb=mongo)
+app = LENAPI(mongodb=mongo)
 
 # Synchronous CRUD
 student = Student.create(name="Ifeanyi", course="Python")
@@ -696,7 +696,7 @@ await student.asave()
 await student.adelete()
 ```
 
-`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. Configure `MONGODB_URI` and `MONGODB_DATABASE` in `settings.py` to have `LenApi()` configure `app.mongodb` automatically. MongoDB uses the official PyMongo synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
+`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. Configure `MONGODB_URI` and `MONGODB_DATABASE` in `settings.py` to have `LENAPI()` configure `app.mongodb` automatically. MongoDB uses the official PyMongo synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
 
 Put application models in `app/models.py` and import that module from `main.py`. The migration command loads `main:app`, so it discovers those model classes before creating a migration. The library's `Model` base supplies an integer `id`:
 

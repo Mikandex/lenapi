@@ -67,10 +67,10 @@ TOKEN = {
 ''',
     "main.py": '''"""Application routes."""
 
-from lenapi import LenApi
+from lenapi import LENAPI
 from app import models  # Import models so migrations can discover them.
 
-app = LenApi()
+app = LENAPI()
 
 
 @app.get("/")
