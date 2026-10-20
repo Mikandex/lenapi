@@ -325,6 +325,7 @@ def _main() -> None:
         epilog=(
             "Examples:\n"
             "  python lenora.py startproject myproject\n"
+            "  python lenora.py apikey\n"
             "  python lenora.py runserver --port 8010\n"
             "  python lenora.py migration --message add_users\n\n"
             "For flags and arguments for a command, run: "
@@ -344,6 +345,11 @@ def _main() -> None:
 
     startproject = commands.add_parser("startproject", help="create a new lenApi project")
     startproject.add_argument("name", nargs="?", default="lenApp", help="project folder name (default: lenApp)")
+
+    apikey_command = commands.add_parser(
+        "apikey", help="enable API-key authentication, add its model, and migrate"
+    )
+    apikey_command.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
 
     migration = commands.add_parser("migration", help="generate and apply a migration from model changes")
     migration.add_argument("--message", "-m", default="schema update", help="migration description")
@@ -434,6 +440,59 @@ def _main() -> None:
             parser.error(f"could not create project: {exc}")
         print(f"Created lenApi project in {project_dir}")
         print(f"Next: cd {args.name} && python lenora.py migration && python lenora.py runserver")
+        return
+
+    if args.command == "apikey":
+        settings_path = Path.cwd() / "settings.py"
+        models_path = Path.cwd() / "app" / "models.py"
+        if not settings_path.is_file() or not models_path.is_file():
+            parser.error("run `python lenora.py apikey` from a project with settings.py and app/models.py")
+
+        settings_source = settings_path.read_text(encoding="utf-8")
+        settings_lines = settings_source.splitlines()
+        auth_setting_found = False
+        for index, line in enumerate(settings_lines):
+            key, separator, _value = line.partition("=")
+            if separator and key.strip() == "AUTHENTICATION":
+                settings_lines[index] = 'AUTHENTICATION = "api_key"'
+                auth_setting_found = True
+                break
+        if not auth_setting_found:
+            settings_lines.extend(['', 'AUTHENTICATION = "api_key"'])
+        settings_path.write_text("\n".join(settings_lines) + "\n", encoding="utf-8")
+
+        models_source = models_path.read_text(encoding="utf-8")
+        has_api_key_model = any(
+            line.lstrip().startswith("class APIKey(")
+            for line in models_source.splitlines()
+        )
+        if not has_api_key_model:
+            api_key_model = '''\n\n# Added by `python lenora.py apikey`.
+from datetime import datetime
+from lenapi import model
+
+
+class APIKey(model.Model):
+    user_id = model.ForeignKeyField("user.id", model=model.CASCADE, nullable=False)
+    key_hash = model.StringField(max_length=64, unique=True, nullable=False)
+    is_active = model.BooleanField(default=True, nullable=False)
+    created_at = model.DateTimeField(default=datetime.utcnow, nullable=False)
+    revoked_at = model.DateTimeField(nullable=True)
+'''
+            with models_path.open("a", encoding="utf-8") as models_file:
+                models_file.write(api_key_model)
+            print(f"Added APIKey model to {models_path}")
+        else:
+            print("APIKey model already exists; leaving app/models.py unchanged.")
+
+        print('Enabled AUTHENTICATION = "api_key" in settings.py.')
+        # Re-enter the standard migration path so existing revisions are
+        # checked and only actual schema changes are generated and applied.
+        sys.argv = [
+            sys.argv[0], "migration", "--app", args.app,
+            "--message", "activate API-key authentication",
+        ]
+        _main()
         return
 
     if args.command in {"generate_test", "run_test", "run_test_output", "test"}:
@@ -1106,7 +1165,7 @@ def test_http_endpoint_is_registered_and_documented(method, path):
 def main() -> None:
     """Run the CLI and print an explicit result for migration commands."""
     command_name = sys.argv[1] if len(sys.argv) > 1 else None
-    is_migration = command_name in {"migration", "migrate", "background-worker", "showmigrations", "repair-migrations", "clear_migrations", "delete_migrations"}
+    is_migration = command_name in {"migration", "migrate", "background-worker", "showmigrations", "repair-migrations", "clear_migrations", "delete_migrations", "apikey"}
     if is_migration:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
