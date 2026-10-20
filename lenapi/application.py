@@ -227,6 +227,12 @@ class Application(Router):
         self.docs_url = docs_url
         self.openapi_url = openapi_url
         self.safe_guard_docs_url = bool(safe_guard_docs_url)
+        self._docs_guard_paths = {
+            normalized
+            for configured in (self.docs_url, self.openapi_url)
+            if configured
+            for normalized in (configured, configured.rstrip("/"))
+        }
         self.docs_session_lifetime_seconds = docs_session_lifetime_seconds
         self.docs_cookie_secure = docs_cookie_secure
         if self.safe_guard_docs_url and self.docs_url is None:
@@ -293,7 +299,10 @@ class Application(Router):
             return
         path, method = scope.get("path", "/"), scope.get("method", "GET").upper()
         route_scope = scope
-        if self.safe_guard_docs_url:
+        docs_login_path = (path == "/" and method in {"GET", "POST"}) or (
+            path == "/logout" and method == "POST"
+        )
+        if self.safe_guard_docs_url and (path in self._docs_guard_paths or docs_login_path):
             guarded_response = await self._dispatch_docs_guard(scope, receive)
             if guarded_response is not None:
                 await guarded_response(scope, receive, send)
@@ -462,19 +471,13 @@ class Application(Router):
         from .request import Request
 
         path, method = scope.get("path", "/"), scope.get("method", "GET").upper()
-        docs_paths = {
-            normalized
-            for configured in (self.docs_url, self.openapi_url)
-            if configured
-            for normalized in (configured, configured.rstrip("/"))
-        }
         request = Request(scope, receive, max_body_size=4096, body_timeout=self.request_body_timeout)
         secure = (
             self.docs_cookie_secure
             if self.docs_cookie_secure is not None
             else scope.get("scheme") == "https"
         )
-        if path in docs_paths:
+        if path in self._docs_guard_paths:
             try:
                 identity = await self.docs_guard.resolve_session(
                     request.cookies.get("lenapi_docs_session")

@@ -85,8 +85,23 @@ def home():
     "app/models.py": '''"""Define project-specific database models here.
 
 The framework-provided User model is included in the first migration
-automatically. Add project models to this file when you need them.
+automatically. Subclass it here to add columns to the same user table; the
+migration command detects those added columns.
 """
+
+# Uncomment this example to extend the framework User table:
+# from sqlalchemy import false
+#
+# from lenapi import model
+# from lenapi.models import User as BaseUser
+#
+# class User(BaseUser):
+#     bio = model.TextField(default="", nullable=False, server_default="")
+#     is_verified = model.BooleanField(
+#         default=False, nullable=False, server_default=false()
+#     )
+
+# Define other project models below as needed.
 ''',
     "app/schemas.py": '''"""Project request and response schemas."""
 

@@ -352,6 +352,10 @@ The session factories let database-backed authentication such as Basic or API-ke
 
 For the built-in docs login, set `SAFE_GUARD_DOCS_URL = True` in `settings.py`. The app then serves an administrator sign-in page at `/`, redirects unauthenticated requests for `/docs/` or `/openapi.json` to it, and redirects successful logins to Swagger. Create an administrator with `python lenora.py admin` after `python lenora.py migration`; the password prompt is hidden and the framework stores only a password hash. The framework's `AdminUser` and expiring session storage are created by the first migration. These records and sessions use the selected application database, including MongoDB; this docs feature does not use Redis. The session cookie is HttpOnly and expires after `DOCS_SESSION_LIFETIME_SECONDS` (default 3600 seconds). `DOCS_COOKIE_SECURE` follows the ASGI scheme by default; set it to `True` when TLS terminates at a reverse proxy.
 
+The docs gate only handles `/`, `/logout`, the configured Swagger path, and the configured OpenAPI path. Regular application routes do not query the admin or session tables; they pass through a small path check. Opening protected Swagger or OpenAPI does validate the session against the configured database, which is the expected cost of revocable server-side sessions.
+
+To remove the gate, set `SAFE_GUARD_DOCS_URL = False` and restart the app. The admin tables may remain in the database; they are not queried while the feature is disabled.
+
 The sample app exposes the model queries as HTTP routes: `POST /classrooms` creates a classroom, `GET /classrooms` lists them, and `POST /students` accepts an optional `classroom_id`. `POST /students/batch` creates multiple students, `PUT /students/batch` updates multiple students by ID, and `DELETE /students/batch` deletes multiple students by ID. Batch requests are all-or-nothing: unknown IDs, duplicate names, or a protected deletion reject the whole operation. `PUT /students/{student_id}` updates one student; it returns HTTP 404 if the ID does not exist. `GET /students/{student_id}/classroom` returns the related classroom. Other student routes list, search, and check existence. These routes appear in Swagger at `/docs/`.
 
 Batch request examples:
@@ -553,6 +557,24 @@ user = User.create(
 ```
 
 Project-specific database models belong in `app/models.py`; the default framework `User` model is maintained by lenApi and included in the first migration. Authentication is configured as a dependency; the framework does not add login, registration, refresh, or profile routes automatically.
+
+To add project-specific fields to the existing user table, subclass the framework model in `app/models.py`. LenApi treats subclasses of concrete `Model` classes as single-table extensions, so the subclass reuses the parent's table and Alembic detects the extra columns. `server_default` gives existing database rows values when a non-null column is added:
+
+```python
+from sqlalchemy import false
+
+from lenapi import model
+from lenapi.models import User as BaseUser
+
+
+class User(BaseUser):
+    bio = model.TextField(default="", nullable=False, server_default="")
+    is_verified = model.BooleanField(
+        default=False, nullable=False, server_default=false()
+    )
+```
+
+Import the extended `User` from `app.models` in application code and run `python lenora.py migration`. Do not set a second table name for this subclass; it extends the framework's existing `user` table. Ordinary subclasses of the abstract `Model` base still get a table inferred from their class name.
 
 When `settings.AUTHENTICATION = "api_key"`, registration generates a URL-safe API key with 32 bytes of cryptographically secure randomness and returns it once as plain text in the registration response. The `user.api_key` column remains nullable for installations using another authentication mode; in API-key mode, newly registered users get a key automatically. lenApi stores only the key's SHA-256 digest in that column, so the original key cannot be recovered later. Send the returned key on authenticated requests with `X-API-Key: <key>`. The API-key authenticator hashes the supplied key before lookup and returns that user's identity. Existing users need to be issued a key through a key-rotation/provisioning flow before they can use API-key authentication.
 

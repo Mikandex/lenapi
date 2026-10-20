@@ -606,7 +606,12 @@ class Model(DeclarativeBase):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
     @declared_attr.directive
-    def __tablename__(cls) -> str:
+    def __tablename__(cls) -> str | None:
+        # Subclassing a concrete model extends its table (single-table
+        # inheritance). In particular, app developers can extend the
+        # framework User model without defining a second `user` table.
+        if any(getattr(base, "__table__", None) is not None for base in cls.__bases__):
+            return None
         return cls.__name__.lower()
 
     @classmethod
