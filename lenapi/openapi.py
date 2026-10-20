@@ -92,6 +92,14 @@ def build_openapi(app, *, title: str, version: str) -> dict[str, Any]:
                 "summary": route.endpoint.__name__.replace("_", " ").capitalize(),
                 "responses": {"200": {"description": "Successful response"}},
             }
+            if route.tag_name is not None:
+                operation["tags"] = [route.tag_name]
+            if route.auth is not None:
+                route_auth = route.auth.dependency if isinstance(route.auth, Depends) else route.auth
+                schemes = _auth_schemes(route_auth)
+                if schemes:
+                    security_schemes.update(schemes)
+                    operation["security"] = [{name: [] for name in schemes}]
             if route.request_body is not None:
                 operation["requestBody"] = route.request_body
             if route.api_flag:

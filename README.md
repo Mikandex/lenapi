@@ -137,6 +137,30 @@ def list_users():
 app.add_router("/users/", users)  # GET /users/
 ```
 
+Assign a default Swagger tag to a router with `tag_name`. A tag on an individual route overrides the router tag. When neither is provided, the operation omits `tags` and Swagger UI uses its normal default grouping:
+
+```python
+auth = Router(prefix="/auth", tag_name="Authentication")
+
+@auth.post("/login")
+def login():
+    return {"ok": True}  # tagged "Authentication"
+
+@auth.get("/status", tag_name="Health")
+def auth_status():
+    return {"ok": True}  # route tag overrides the router tag
+
+@auth.patch("/profile", tag_name="Authentication")
+def update_profile():
+    return {"updated": True}
+
+app.include_router(auth)
+
+@app.get("/", tag_name="General")
+def home():
+    return {"hello": "world"}
+```
+
 Add an IP-based cooldown to any route with `api_flag=True`. The client IP may call that route once per cooldown window; further requests receive `429 Too Many Requests` and a `Retry-After` header:
 
 ```python
@@ -179,14 +203,14 @@ class Invoice(model.Model):
 The repository root contains the lenApi library. Create an application scaffold and run it separately:
 
 ```bash
-python -m pip install -e '.[server]'
+python -m pip install -e .
 lenora startproject my_api
 cd my_api
 python lenora.py migration
 python lenora.py runserver
 ```
 
-Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LENAPI()` configures the authentication dependency without adding authentication routes. The source tree keeps working applications under `app/`; they are separate from the installable `lenapi` package.
+Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LENAPI()` configures the authentication dependency without adding authentication routes. The framework repository contains the installable `lenapi` package; create an application scaffold separately with `lenora startproject`.
 
 `settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LENAPI()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
 
@@ -194,22 +218,13 @@ Use the installed `lenora` command to create the first project; `python lenora.p
 
 ## Automated tests
 
-Pytest is installed with lenApi, so you can run the library and example application tests directly from the repository root:
+Pytest is installed with lenApi, so you can run the framework test suite from the repository root:
 
 ```bash
 python -m pytest
 ```
 
-The `test`, `generate_test`, `run_test`, and `run_test_output` commands are application commands. Run them from an application directory, where `main.py` and `settings.py` live. `test` generates endpoint checks temporarily, runs them, and writes a CSV report under `outputs/`. `run_test_output` also writes a CSV report.
-
-For the included Student API example, run those commands from `app/student_api`:
-
-```bash
-cd app/student_api
-python lenora.py generate_test
-python lenora.py run_test
-python lenora.py test
-```
+The `test`, `generate_test`, `run_test`, and `run_test_output` commands are application commands. Run them from a generated application directory, where `main.py` and `settings.py` live. `test` generates endpoint checks temporarily, runs them, and writes a CSV report under `outputs/`. `run_test_output` also writes a CSV report.
 
 Request bodies are limited to 10 MiB by default, and lenApi allows up to 30 seconds to receive the body. Configure `MAX_REQUEST_BODY_SIZE` (bytes) and `REQUEST_BODY_TIMEOUT_SECONDS` in `settings.py`; set either to `None` to disable that limit. Oversized bodies receive HTTP 413, and bodies that exceed the receive timeout receive HTTP 408. Direct `Application(...)` instances accept the equivalent `max_request_body_size` and `request_body_timeout` arguments.
 
@@ -399,6 +414,28 @@ from lenapi import Depends
 def protected(user=Depends(app.authenticator)):
     return {"authenticated": True}
 ```
+
+You can protect an entire router with `auth=`, or protect an individual endpoint with the same option. A route-level authenticator overrides the router's default. `authentication(type="jwt")` uses the current project's `settings.py` and built-in `User` model by default; pass `settings=`, `user_model=`, or `app=` to customize it. Authenticated endpoints can also receive the identity with `Depends(authenticate)`:
+
+```python
+from pydantic import BaseModel
+from lenapi import LENAPI, Router, authentication
+
+app = LENAPI()
+authenticate = authentication(type="jwt")
+api = Router(prefix="/api")
+
+class Greeting(BaseModel):
+    name: str
+
+@api.post("/hello", auth=authenticate)
+async def hello(data: Greeting):
+    return {"message": f"Hello, {data.name}!"}
+
+app.include_router(api)
+```
+
+To apply the same requirement to every route in a group, initialize it with `Router(prefix="/api", auth=authenticate)`. Route authentication is enforced before the endpoint runs and is included in the generated OpenAPI security metadata.
 
 The primary authentication setting chooses one method for the scaffold's default protected route: `jwt`, `api_key`, `basic_login`, `opaque_bearer`, or `session`. Session cookies, HMAC, and OIDC can also be attached as additional callable dependencies on selected routes. This lets an app use API keys generally and require a session cookie on a browser route, or require both on one route:
 
@@ -620,7 +657,7 @@ async def upload_photo(request: Request):
     return {"id": photo.id, "image": photo.image}
 ```
 
-The stored path is relative. `LenApi` serves files from `MEDIA_ROOT` under `MEDIA_URL` (default `/media/`), so a saved path such as `photos/<filename>.jpg` is available at `/media/photos/<filename>.jpg`. Set both `MEDIA_ROOT` and `MEDIA_URL` in `settings.py`; media paths are restricted to files inside `MEDIA_ROOT`, and directory listings are not exposed. Request body size limits apply to multipart uploads too.
+The stored path is relative. `LENAPI` serves files from `MEDIA_ROOT` under `MEDIA_URL` (default `/media/`), so a saved path such as `photos/<filename>.jpg` is available at `/media/photos/<filename>.jpg`. Set both `MEDIA_ROOT` and `MEDIA_URL` in `settings.py`; media paths are restricted to files inside `MEDIA_ROOT`, and directory listings are not exposed. Request body size limits apply to multipart uploads too.
 
 ## Webhooks and background work
 
@@ -891,7 +928,7 @@ The engine is disposed on ASGI lifespan shutdown. For response serialization fro
 ## Current shape
 
 - ASGI HTTP request/response handling
-- `@app.get`, `@app.post`, `@app.put`, `@app.delete`, and generic `@app.route`
+- `@app.get`, `@app.post`, `@app.put`, `@app.patch`, `@app.delete`, and generic `@app.route`
 - `{parameter}` path segments and Pydantic-validated path/query types
 - async or sync route functions
 - `Request` access to query parameters, raw body, and JSON body

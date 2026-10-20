@@ -6,6 +6,7 @@ model, rather than putting credential lookup and password handling in
 """
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from importlib import import_module
 
 from .security import (
     APIKeyAuth,
@@ -193,6 +194,25 @@ def authentication_type(auth_type, *, settings, user_model=None, app=None):
     return authenticator
 
 
+def authentication(type="jwt", *, settings=None, user_model=None, app=None):
+    """Create a route authentication dependency from project settings.
+
+    By default, ``settings`` is imported from the current project and the
+    framework's built-in ``User`` model is used. Pass explicit values when
+    configuring authentication outside a generated project.
+    """
+    if settings is None:
+        try:
+            settings = import_module("settings")
+        except ModuleNotFoundError as exc:
+            if exc.name != "settings":
+                raise
+            raise ValueError(
+                "authentication() needs a project settings.py; pass settings= explicitly"
+            ) from exc
+    return authentication_type(type, settings=settings, user_model=user_model, app=app)
+
+
 def install_default_authentication(app, settings):
     """Configure the app's authentication dependency without adding routes."""
     from .models import User
@@ -235,6 +255,7 @@ __all__ = [
     "UserRegistration", "UserPublic", "basic", "api_key", "jwt_auth",
     "session", "opaque_bearer", "hmac", "oidc", "webhook", "configure",
     "authentication_type",
+    "authentication",
     "install_default_authentication",
     "register_user",
 ]

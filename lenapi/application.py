@@ -41,16 +41,22 @@ class Route:
     def __init__(
         self, path: str, methods: set[str], endpoint: Callable, response_model: Any = None,
         *, api_flag: bool = False, cool_time: int = 300, request_body: dict[str, Any] | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None,
     ) -> None:
         if cool_time <= 0:
             raise ValueError("cool_time must be a positive number of seconds")
+        if tag_name is not None and (not isinstance(tag_name, str) or not tag_name.strip()):
+            raise ValueError("tag_name must be a non-empty string or None")
+        if auth is not None and not callable(auth) and not isinstance(auth, Depends):
+            raise TypeError("auth must be a callable authentication dependency, Depends instance, or None")
         self.path = path
         self.methods = methods
         self.endpoint = endpoint
         self.response_model = response_model
         self.request_body = request_body
         self.include_in_schema = include_in_schema
+        self.tag_name = tag_name
+        self.auth = auth
         self.api_flag = api_flag
         self.cool_time = cool_time
         self.regex, self.parameter_names = self._compile_path(path)
@@ -75,8 +81,14 @@ class Route:
 class Router:
     """A group of routes that can be mounted on an Application or another Router."""
 
-    def __init__(self, *, prefix: str = "") -> None:
+    def __init__(self, *, prefix: str = "", tag_name: str | None = None, auth: Any = None) -> None:
+        if tag_name is not None and (not isinstance(tag_name, str) or not tag_name.strip()):
+            raise ValueError("tag_name must be a non-empty string or None")
+        if auth is not None and not callable(auth) and not isinstance(auth, Depends):
+            raise TypeError("auth must be a callable authentication dependency, Depends instance, or None")
         self.prefix = self._normalize_prefix(prefix)
+        self.tag_name = tag_name
+        self.auth = auth
         self.routes: list[Route] = []
         self.websocket_routes: list[Route] = []
 
@@ -96,36 +108,49 @@ class Router:
         self, path: str, *, methods: tuple[str, ...] = ("GET",), response_model: Any = None,
         api_flag: bool = False, cool_time: int = 300,
         request_body: dict[str, Any] | None = None,
-        include_in_schema: bool = True,
+        include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None,
     ):
         def decorator(endpoint: Callable):
             self.routes.append(Route(
                 self.prefix + self._normalize_path(path), {method.upper() for method in methods},
                 endpoint, response_model, api_flag=api_flag, cool_time=cool_time,
                 request_body=request_body, include_in_schema=include_in_schema,
+                tag_name=self.tag_name if tag_name is None else tag_name,
+                auth=self.auth if auth is None else auth,
             ))
             return endpoint
         return decorator
 
     def get(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
-            include_in_schema: bool = True):
+            include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None):
         return self.route(path, methods=("GET",), response_model=response_model, api_flag=api_flag,
-                          cool_time=cool_time, include_in_schema=include_in_schema)
+                          cool_time=cool_time, include_in_schema=include_in_schema, tag_name=tag_name,
+                          auth=auth)
 
     def post(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
-             request_body: dict[str, Any] | None = None, include_in_schema: bool = True):
+             request_body: dict[str, Any] | None = None, include_in_schema: bool = True,
+             tag_name: str | None = None, auth: Any = None):
         return self.route(path, methods=("POST",), response_model=response_model, api_flag=api_flag,
-                          cool_time=cool_time, request_body=request_body, include_in_schema=include_in_schema)
+                          cool_time=cool_time, request_body=request_body, include_in_schema=include_in_schema,
+                          tag_name=tag_name, auth=auth)
 
     def put(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
-            include_in_schema: bool = True):
+            include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None):
         return self.route(path, methods=("PUT",), response_model=response_model, api_flag=api_flag,
-                          cool_time=cool_time, include_in_schema=include_in_schema)
+                          cool_time=cool_time, include_in_schema=include_in_schema, tag_name=tag_name,
+                          auth=auth)
+
+    def patch(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
+              include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None):
+        return self.route(path, methods=("PATCH",), response_model=response_model, api_flag=api_flag,
+                          cool_time=cool_time, include_in_schema=include_in_schema, tag_name=tag_name,
+                          auth=auth)
 
     def delete(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
-               include_in_schema: bool = True):
+               include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None):
         return self.route(path, methods=("DELETE",), response_model=response_model, api_flag=api_flag,
-                          cool_time=cool_time, include_in_schema=include_in_schema)
+                          cool_time=cool_time, include_in_schema=include_in_schema, tag_name=tag_name,
+                          auth=auth)
 
     def websocket(self, path: str):
         """Register an ASGI WebSocket handler on this router."""
@@ -143,6 +168,8 @@ class Router:
                 mount_prefix + route.path, route.methods, route.endpoint, route.response_model,
                 api_flag=route.api_flag, cool_time=route.cool_time,
                 request_body=route.request_body, include_in_schema=route.include_in_schema,
+                tag_name=route.tag_name if route.tag_name is not None else self.tag_name,
+                auth=route.auth if route.auth is not None else self.auth,
             ))
         for route in router.websocket_routes:
             self.websocket_routes.append(Route(
@@ -167,7 +194,8 @@ class Application(Router):
                  ip_flag_backend: str | None = None, redis_url: str | None = None,
                  security_storage: str | None = None,
                  cache_backend: str = "memory",
-                 media_root: str | Path | None = None, media_url: str | None = None) -> None:
+                 media_root: str | Path | None = None, media_url: str | None = None,
+                 tag_name: str | None = None, auth: Any = None) -> None:
         if session_factory is not None and database is not None:
             raise ValueError("Pass either session_factory or database, not both")
         if max_request_body_size is not None and (
@@ -180,7 +208,7 @@ class Application(Router):
             or request_body_timeout <= 0
         ):
             raise ValueError("request_body_timeout must be a positive number or None")
-        super().__init__()
+        super().__init__(tag_name=tag_name, auth=auth)
         self.database = database if database is not None else (
             None if session_factory is not None or async_database is not None else Database()
         )
@@ -326,8 +354,18 @@ class Application(Router):
                 if self.async_session_factory is not None:
                     async_session = self.async_session_factory()
                     async_session_token = set_current_async_session(async_session)
+                dependency_cache: dict[Callable, Any] = {}
+                if route.auth is not None:
+                    auth_dependency = route.auth.dependency if isinstance(route.auth, Depends) else route.auth
+                    auth_kwargs = await self._build_arguments(
+                        auth_dependency, request, raw_params, session, dependency_cache, set(), async_session
+                    )
+                    identity = auth_dependency(**auth_kwargs)
+                    if inspect.isawaitable(identity):
+                        identity = await identity
+                    dependency_cache[auth_dependency] = identity
                 kwargs = await self._build_arguments(
-                    route.endpoint, request, raw_params, session, {}, set(), async_session
+                    route.endpoint, request, raw_params, session, dependency_cache, set(), async_session
                 )
                 result = route.endpoint(**kwargs)
                 if inspect.isawaitable(result):
@@ -590,7 +628,8 @@ class LENAPI(Application):
                  ip_flag_backend: str | None = None, redis_url: str | None = None,
                  security_storage: str | None = None,
                  cache_backend: str | None = None,
-                 media_root: str | Path | None = None, media_url: str | None = None) -> None:
+                 media_root: str | Path | None = None, media_url: str | None = None,
+                 tag_name: str | None = None, auth: Any = None) -> None:
         # Project settings are optional, so importing lenapi outside a project
         # continues to work with the framework defaults.
         try:
@@ -642,6 +681,8 @@ class LENAPI(Application):
             cache_backend=cache_backend or getattr(project_settings, "CACHE_BACKEND", "memory"),
             media_root=media_root if media_root is not None else getattr(project_settings, "MEDIA_ROOT", None),
             media_url=media_url if media_url is not None else getattr(project_settings, "MEDIA_URL", None),
+            tag_name=tag_name,
+            auth=auth,
         )
         if project_settings is not None:
             from .authentication import install_default_authentication

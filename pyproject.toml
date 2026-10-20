@@ -17,13 +17,13 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0,<3",
     "alembic>=1.13,<2",
     "aiosqlite>=0.20",
+    "uvicorn>=0.30,<1",
     "pytest>=8,<9",
 ]
 
 [project.optional-dependencies]
 mysql = ["pymysql>=1.1"]
 postgres = ["psycopg[binary]>=3.1"]
-server = ["uvicorn[standard]>=0.30,<1"]
 redis = ["redis>=5,<7"]
 faker = ["Faker>=30,<41"]
 ai = ["httpx>=0.27,<1"]
@@ -41,6 +41,6 @@ where = ["."]
 include = ["lenapi*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "app/student_api"]
+testpaths = ["tests"]
 python_files = ["test.py", "test_*.py", "*_test.py"]
 addopts = "-ra"

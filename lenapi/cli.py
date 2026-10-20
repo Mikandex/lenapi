@@ -545,7 +545,7 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         try:
             import uvicorn
         except ImportError:
-            parser.error("runserver requires Uvicorn; install lenApi with `pip install '.[server]'`")
+            parser.error("runserver requires Uvicorn; install LenApi with `python -m pip install lenapi`")
         print(f"lenApi server: http://{args.host}:{args.port}", flush=True)
         uvicorn.run(args.app, host=args.host, port=args.port, reload=args.reload)
         return
