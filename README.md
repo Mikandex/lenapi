@@ -568,13 +568,13 @@ from lenapi.models import User as BaseUser
 
 
 class User(BaseUser):
-    bio = model.TextField(default="", nullable=False, server_default="")
+    bio = model.TextField(default="", nullable=True)
     is_verified = model.BooleanField(
         default=False, nullable=False, server_default=false()
     )
 ```
 
-Import the extended `User` from `app.models` in application code and run `python lenora.py migration`. Do not set a second table name for this subclass; it extends the framework's existing `user` table. Ordinary subclasses of the abstract `Model` base still get a table inferred from their class name.
+Import the extended `User` from `app.models` in application code and run `python lenora.py migration`. Do not set a second table name for this subclass; it extends the framework's existing `user` table. `bio` is nullable because MySQL does not support defaults on `TEXT` columns; if existing rows need an empty string instead of `NULL`, add a data backfill to the generated migration. Ordinary subclasses of the abstract `Model` base still get a table inferred from their class name.
 
 When `settings.AUTHENTICATION = "api_key"`, registration generates a URL-safe API key with 32 bytes of cryptographically secure randomness and returns it once as plain text in the registration response. The `user.api_key` column remains nullable for installations using another authentication mode; in API-key mode, newly registered users get a key automatically. lenApi stores only the key's SHA-256 digest in that column, so the original key cannot be recovered later. Send the returned key on authenticated requests with `X-API-Key: <key>`. The API-key authenticator hashes the supplied key before lookup and returns that user's identity. Existing users need to be issued a key through a key-rotation/provisioning flow before they can use API-key authentication.
 

@@ -96,7 +96,7 @@ migration command detects those added columns.
 # from lenapi.models import User as BaseUser
 #
 # class User(BaseUser):
-#     bio = model.TextField(default="", nullable=False, server_default="")
+#     bio = model.TextField(default="", nullable=True)
 #     is_verified = model.BooleanField(
 #         default=False, nullable=False, server_default=false()
 #     )
