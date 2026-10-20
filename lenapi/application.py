@@ -660,12 +660,20 @@ class LENAPI(Application):
                 else:
                     sync_url = make_url(database_url)
                     expected = "postgresql" if database_type in {"postgres", "postgresql"} else database_type
-                    if sync_url.get_backend_name() != expected:
+                    backend, separator, driver = sync_url.drivername.partition("+")
+                    if backend == "postgres":
+                        backend = "postgresql"
+                    if not separator:
+                        driver = {"mysql": "pymysql", "postgresql": "psycopg"}.get(backend, "")
+                    sync_url = sync_url.set(
+                        drivername=f"{backend}+{driver}" if driver else backend
+                    )
+                    if backend != expected:
                         raise ValueError(
-                            f"DATABASE_URL uses '{sync_url.get_backend_name()}', "
+                            f"DATABASE_URL uses '{backend}', "
                             f"but DATABASE_TYPE is '{database_type}'"
                         )
-                    configured_database = Database(database_url)
+                    configured_database = Database(sync_url.render_as_string(hide_password=False))
                     if configured_async_database is None and activate_async:
                         async_drivers = {
                             "sqlite": "sqlite+aiosqlite",

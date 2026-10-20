@@ -1035,7 +1035,8 @@ SECURITY_STORE_TABLE = Table(
     Column("expires_at", Float, nullable=True),
 )
 
-# Persistent background jobs are managed by the normal Alembic migration flow.
+# Persistent background jobs are filtered from ordinary migrations. The
+# background-worker CLI command opts this table into migration when requested.
 BACKGROUND_JOBS_TABLE = Table(
     "lenapi_background_jobs",
     Model.metadata,

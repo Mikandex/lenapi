@@ -305,7 +305,7 @@ await app.cache.delete("profile:42")
 
 ## Durable background jobs
 
-`BackgroundTasks` remains useful for short in-process work after a response. For a worker queue, `BackgroundQueue` supports `database`, `redis`, or `cache`/`memory` backends. Database mode requires the queue table migration; Redis mode requires `pip install '.[redis]'` and Redis persistence configured for the durability you need. The cache/memory backend is process-local and ephemeral: queued jobs are lost when the process exits and cannot be shared with a separate worker process. Jobs on database and Redis backends are delivered at least once; write task handlers to be idempotent.
+`BackgroundTasks` remains useful for short in-process work after a response. For a worker queue, `BackgroundQueue` supports `database`, `redis`, or `cache`/`memory` backends. The database queue table is excluded from ordinary migrations. Export a `queue` or `background_queue` from `main.py`, then run `python lenora.py background-worker`; it creates and applies the queue migration before starting the worker. Redis mode requires `pip install '.[redis]'` and Redis persistence configured for the durability you need. The cache/memory backend is process-local and ephemeral: queued jobs are lost when the process exits and cannot be shared with a separate worker process. Jobs on database and Redis backends are delivered at least once; write task handlers to be idempotent.
 
 ```python
 from lenapi import BackgroundQueue
@@ -322,21 +322,10 @@ async def send_welcome(email: str):
 job_id = await queue.enqueue("send_welcome", "ada@example.com")
 ```
 
-Run a worker in a separate process after applying migrations:
+Export the queue from `main.py` with its task registrations, then start it in a separate process:
 
-```python
-# worker.py
-import asyncio
-from main import app
-from lenapi import BackgroundQueue
-
-queue = BackgroundQueue(app.database)
-
-@queue.task("send_welcome")
-async def send_welcome(email: str):
-    ...
-
-asyncio.run(queue.run_worker())
+```bash
+python lenora.py background-worker
 ```
 
 The API process and worker must register the same task names and handlers. `run_once()` is available for one-job execution in tests or custom worker loops; `status(job_id)` returns the persisted job status.
@@ -696,7 +685,7 @@ async def payments_webhook(
 
 ### MongoDB documents
 
-Install the official PyMongo driver extra with `python -m pip install -e '.[mongodb]'`. Create a `MongoDatabase` using a MongoDB URI and database name, then bind Pydantic document classes to it. The default collection name is the lower-case document class name; set `collection_name` to override it. MongoDB creates collections on first write, so there is no Alembic migration step for them.
+Install the official PyMongo driver extra with `python -m pip install -e '.[mongodb]'`. Create a `MongoDatabase` using a MongoDB URI and database name, then bind Pydantic document classes to it. The default collection name is the lower-case document class name; set `collection_name` to override it. MongoDB creates collections on first write; `migration` can also pre-create empty collections for imported `MongoDocument` classes. Document field changes do not use Alembic schema revisions.
 
 ```python
 from lenapi import LENAPI, MongoDatabase, MongoDocument
@@ -731,7 +720,7 @@ await student.asave()
 await student.adelete()
 ```
 
-`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. To select MongoDB, set `DATABASE_TYPE = "mongodb"` and set `DATABASE_URL` to a Mongo URI whose path contains the database name, such as `mongodb://localhost:27017/my_database`. `ACTIVATE_ASYNC` controls whether LenApi also creates PyMongo's async client. MongoDB uses the official synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
+`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. To select MongoDB, set `DATABASE_TYPE = "mongodb"` and set `DATABASE_URL` to a Mongo URI whose path contains the database name, such as `mongodb://localhost:27017/my_database`. `ACTIVATE_ASYNC` controls whether LenApi also creates PyMongo's async client. `migration` and `migrate` ensure collections exist for imported `MongoDocument` models; document fields are schema-flexible and do not use Alembic revisions. Since MongoDB is not a SQLAlchemy engine, configure `SECURITY_STORAGE` as `"redis"` or `"memory"` when using it. MongoDB uses the official synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
 
 Put application models in `app/models.py` and import that module from `main.py`. The migration command loads `main:app`, so it discovers those model classes before creating a migration. The library's `Model` base supplies an integer `id`:
 
@@ -772,6 +761,8 @@ python lenora.py migration
 ```
 
 After changing models, run the same command again; it creates and applies the next migration. Use `--message "describe change"` to name a migration. Existing unversioned SQLite databases that already match the models are adopted without changing their data. Inside a request, models provide these query helpers:
+
+Inspect migration state with `python lenora.py showmigrations`; it lists each local revision, whether it is applied, and database revision IDs whose files are missing. If the database references a missing revision, `python lenora.py repair-migrations` checks that the live schema exactly matches the current models before stamping the database to the local head. `python lenora.py delete_migrations` prompts for y/n confirmation, then drops all tables and views in the configured database and removes local migration revision files. It is destructive and intended only for a full reset. `python lenora.py clear_migrations` remains limited to an empty database.
 
 ```python
 student = Student.create(person_name="Ifeanyi", course="Python")

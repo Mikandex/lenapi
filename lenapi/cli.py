@@ -39,6 +39,7 @@ MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024
 REQUEST_BODY_TIMEOUT_SECONDS = 30
 # Shared storage for IP flags, sessions, opaque tokens, and HMAC replay checks.
 # Choose "database" (requires migration), "redis", or "memory" (development only).
+# For MongoDB projects, choose "redis" or "memory"; MongoDB is not a SQL security store.
 SECURITY_STORAGE = "database"
 REDIS_URL = "redis://127.0.0.1:6379/0"
 CACHE_BACKEND = "memory"  # "memory", "database", or "redis".
@@ -158,6 +159,11 @@ config = context.config
 def load_app():
     app_path = config.attributes.get("app_import_string", "main:app")
     module_name, _, attribute_path = app_path.partition(":")
+    try:
+        import_module("app.models")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"app", "app.models"}:
+            raise
     app = import_module(module_name)
     for name in attribute_path.split(".") if attribute_path else []:
         app = getattr(app, name)
@@ -172,6 +178,11 @@ def run_migrations_offline():
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        include_object=lambda obj, name, type_, reflected, compare_to: (
+            config.attributes.get("lenapi_include_background_jobs", False)
+            if type_ == "table" and name == "lenapi_background_jobs"
+            else True
+        ),
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -186,6 +197,11 @@ def run_migrations_online():
             connection=connection,
             target_metadata=Model.metadata,
             compare_type=True,
+            include_object=lambda obj, name, type_, reflected, compare_to: (
+                config.attributes.get("lenapi_include_background_jobs", False)
+                if type_ == "table" and name == "lenapi_background_jobs"
+                else True
+            ),
             render_as_batch=connection.dialect.name == "sqlite",
         )
         with context.begin_transaction():
@@ -264,6 +280,26 @@ python_files = test_*.py *_test.py
 }
 
 
+def _run_registered_background_worker(module_name: str, app) -> None:
+    """Run a queue exported by main.py after its storage migration is applied."""
+    module = import_module(module_name)
+    queue = (
+        getattr(module, "background_queue", None)
+        or getattr(module, "queue", None)
+        or getattr(app, "background_queue", None)
+        or getattr(app, "queue", None)
+    )
+    if queue is None:
+        logger.info(
+            "Background queue storage is ready. Export `queue` or `background_queue` from the app module to run handlers."
+        )
+        return
+    if not hasattr(queue, "run_worker"):
+        raise TypeError("the app's queue/background_queue must be a lenApi BackgroundQueue")
+    import asyncio
+    asyncio.run(queue.run_worker())
+
+
 def _main() -> None:
     parser = argparse.ArgumentParser(
         prog=Path(sys.argv[0]).name,
@@ -296,6 +332,25 @@ def _main() -> None:
     migration.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
     migrate = commands.add_parser("migrate", help="apply pending migrations to the database")
     migrate.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
+    background_worker = commands.add_parser(
+        "background-worker", help="migrate durable background queue storage and run a registered worker"
+    )
+    background_worker.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
+    background_worker.add_argument("--message", "-m", default="activate background worker")
+    showmigrations = commands.add_parser("showmigrations", help="show local and applied database migration history")
+    showmigrations.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
+    repair_migrations = commands.add_parser(
+        "repair-migrations", help="repair a missing database revision when the schema matches current models"
+    )
+    repair_migrations.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
+    clear_migrations = commands.add_parser(
+        "clear_migrations", help="clear migration files and version history for an empty database only"
+    )
+    clear_migrations.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
+    delete_migrations = commands.add_parser(
+        "delete_migrations", help="confirm and delete all database tables and local migration revisions"
+    )
+    delete_migrations.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
 
     generate_test = commands.add_parser("generate_test", help="generate pytest endpoint coverage from the app routes")
     generate_test.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
@@ -560,19 +615,295 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         parser.error(f"{ini_path} not found; run this command from your lenApi project directory")
     config = Config(str(ini_path))
     config.attributes["app_import_string"] = args.app
+    # Register project ORM classes before Alembic reads Model.metadata. Do not
+    # rely on main.py importing app.models as a side effect.
+    try:
+        import_module("app.models")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"app", "app.models"}:
+            raise
     module_name, _, attribute_path = args.app.partition(":")
     app = import_module(module_name)
     for attribute in attribute_path.split(".") if attribute_path else []:
         app = getattr(app, attribute)
+
+    if app.mongodb is not None:
+        if args.command == "background-worker":
+            _run_registered_background_worker(module_name, app)
+            return
+        if args.command == "delete_migrations":
+            answer = input("Delete all MongoDB collections and local migration revisions? [y/N]: ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("Cancelled; no collections or migration files were deleted.")
+                import asyncio
+                asyncio.run(app.mongodb.aclose())
+                return
+            import asyncio
+            try:
+                database = app.mongodb.database
+                collection_names = database.list_collection_names()
+                for collection_name in collection_names:
+                    database.drop_collection(collection_name)
+                revisions_dir = Path.cwd() / "migrations" / "versions"
+                for path in revisions_dir.glob("*.py") if revisions_dir.exists() else []:
+                    if path.name != "__init__.py":
+                        path.unlink()
+                logger.info("Deleted %d MongoDB collections and local migration revisions.", len(collection_names))
+            finally:
+                asyncio.run(app.mongodb.aclose())
+            return
+        if args.command == "showmigrations":
+            print("MongoDB does not use Alembic revisions; LenApi initializes imported document collections.")
+            return
+        if args.command in {"repair-migrations", "clear_migrations"}:
+            parser.error("this migration command applies only to SQL databases; MongoDB has no Alembic history")
+        from .mongodb import MongoDocument
+
+        def document_models(base):
+            models = []
+            for document_model in base.__subclasses__():
+                models.append(document_model)
+                models.extend(document_models(document_model))
+            return models
+
+        import asyncio
+        created_collections = []
+        try:
+            existing_collections = set(app.mongodb.database.list_collection_names())
+            for document_model in document_models(MongoDocument):
+                collection_name = document_model._collection_name()
+                if collection_name not in existing_collections:
+                    app.mongodb.database.create_collection(collection_name)
+                    existing_collections.add(collection_name)
+                    created_collections.append(collection_name)
+        finally:
+            asyncio.run(app.mongodb.aclose())
+        if created_collections:
+            logger.info("Created MongoDB collections: %s", ", ".join(sorted(created_collections)))
+        else:
+            logger.info("MongoDB is up to date; no collections created.")
+        return
+
     from alembic.autogenerate import compare_metadata
     from alembic.migration import MigrationContext
     from alembic.script import ScriptDirectory
-    from sqlalchemy import MetaData, create_engine, inspect
+    from sqlalchemy import MetaData, create_engine, inspect, text
     from lenapi import Model
 
     engine = app.database.engine
     revisions = Path.cwd() / "migrations" / "versions"
-    if args.command == "migration":
+    if args.command == "delete_migrations":
+        answer = input("Delete all tables and local migration revisions from this database? [y/N]: ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Cancelled; no tables or migration files were deleted.")
+            return
+        with engine.connect() as connection:
+            inspector = inspect(connection)
+            table_names = set(inspector.get_table_names())
+            view_names = set(inspector.get_view_names())
+            dialect = connection.dialect.name
+            quote = connection.dialect.identifier_preparer.quote
+            if dialect == "mysql":
+                connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=0")
+            elif dialect == "sqlite":
+                connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                table_names = {name for name in table_names if not name.startswith("sqlite_")}
+            try:
+                for name in sorted(view_names):
+                    connection.exec_driver_sql(f"DROP VIEW {quote(name)}")
+                for name in sorted(table_names):
+                    cascade = " CASCADE" if dialect == "postgresql" else ""
+                    connection.exec_driver_sql(f"DROP TABLE {quote(name)}{cascade}")
+                connection.commit()
+            finally:
+                if dialect == "mysql":
+                    connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=1")
+        engine.dispose()
+        if dialect == "sqlite":
+            database_path = engine.url.database
+            if database_path and database_path != ":memory:":
+                db_path = Path(database_path)
+                for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+                    path.unlink(missing_ok=True)
+        for path in revisions.glob("*.py") if revisions.exists() else []:
+            if path.name != "__init__.py":
+                path.unlink()
+        logger.info(
+            "Deleted %d database tables, %d views, and local migration revisions.",
+            len(table_names), len(view_names),
+        )
+        return
+
+    if args.command == "background-worker":
+        config.attributes["lenapi_include_background_jobs"] = True
+    else:
+        with engine.connect() as connection:
+            background_table_exists = "lenapi_background_jobs" in inspect(connection).get_table_names()
+        background_migration_exists = any(
+            "lenapi_background_jobs" in path.read_text(encoding="utf-8")
+            for path in revisions.glob("*.py")
+            if path.name != "__init__.py"
+        ) if revisions.exists() else False
+        config.attributes["lenapi_include_background_jobs"] = (
+            background_table_exists or background_migration_exists
+        )
+
+    def include_migration_object(obj, name, type_, reflected, compare_to):
+        if type_ == "table" and name == "lenapi_background_jobs":
+            return config.attributes.get("lenapi_include_background_jobs", False)
+        return True
+
+    if args.command == "showmigrations":
+        import ast
+
+        local_revisions = []
+        for path in sorted(revisions.glob("*.py")):
+            if path.name == "__init__.py":
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                values = {}
+                for node in tree.body:
+                    if isinstance(node, ast.Assign):
+                        targets = node.targets
+                    elif isinstance(node, ast.AnnAssign):
+                        targets = [node.target]
+                    else:
+                        continue
+                    for target in targets:
+                        if isinstance(target, ast.Name) and target.id in {"revision", "down_revision"}:
+                            values[target.id] = ast.literal_eval(node.value)
+                revision_id = values.get("revision")
+                if revision_id:
+                    doc = ast.get_docstring(tree) or path.stem
+                    parents = values.get("down_revision")
+                    local_revisions.append((str(revision_id), parents, doc, path.name))
+            except (SyntaxError, ValueError) as exc:
+                logger.warning("Could not read migration metadata from %s: %s", path.name, exc)
+        with engine.connect() as connection:
+            current_heads = set(MigrationContext.configure(connection).get_current_heads())
+        known_ids = {revision_id for revision_id, _, _, _ in local_revisions}
+        parent_map = {revision_id: parents for revision_id, parents, _, _ in local_revisions}
+        applied = set()
+        for current in current_heads & known_ids:
+            pending = [current]
+            while pending:
+                revision_id = pending.pop()
+                if revision_id in applied or revision_id not in parent_map:
+                    continue
+                applied.add(revision_id)
+                parents = parent_map[revision_id]
+                if parents is None:
+                    continue
+                pending.extend(parents if isinstance(parents, (tuple, list, set)) else [parents])
+        if not local_revisions:
+            print("No local migration revisions.")
+        for revision_id, parents, doc, filename in local_revisions:
+            state = "[X]" if revision_id in applied else "[ ]"
+            parent_text = ", ".join(parents) if isinstance(parents, (tuple, list, set)) else (parents or "base")
+            print(f"{state} {revision_id} {doc} (down: {parent_text}; {filename})")
+        missing_parents = set()
+        for revision_id, parents, _, _ in local_revisions:
+            if parents is None:
+                continue
+            parent_ids = parents if isinstance(parents, (tuple, list, set)) else [parents]
+            missing_parents.update(parent for parent in parent_ids if parent not in known_ids)
+        for missing in sorted(missing_parents):
+            print(f"[!] {missing} (referenced by a local migration but its file is missing)")
+        for unknown in sorted(current_heads - known_ids):
+            print(f"[!] {unknown} (database references a revision missing from migrations/versions)")
+        if not current_heads:
+            print("Database migration state: no revision recorded.")
+        elif current_heads <= known_ids:
+            print("Database migration state: " + ", ".join(sorted(current_heads)))
+        return
+
+    if args.command == "repair-migrations":
+        script = ScriptDirectory.from_config(config)
+        with engine.connect() as connection:
+            table_names = set(inspect(connection).get_table_names())
+            differences = compare_metadata(
+                MigrationContext.configure(
+                    connection,
+                    opts={"compare_type": True, "include_object": include_migration_object},
+                ),
+                Model.metadata,
+            )
+        if differences:
+            parser.error(
+                "database schema does not match current models; refusing to change migration history. "
+                "Restore the missing revision file or reconcile the schema first. "
+                "If the database is empty, run python lenora.py migration instead."
+            )
+        local_revisions = [
+            path for path in revisions.glob("*.py") if path.name != "__init__.py"
+        ]
+        if not local_revisions:
+            if not table_names:
+                parser.error("database is empty; run python lenora.py migration to create the initial revision")
+            from alembic.autogenerate import render_python_code
+            from alembic.operations.ops import CreateIndexOp, CreateTableOp, UpgradeOps
+            from alembic.util import rev_id
+
+            revision_id = rev_id()
+            operations = []
+            tables = list(Model.metadata.sorted_tables)
+            for table in tables:
+                operations.append(CreateTableOp.from_table(table))
+            for table in tables:
+                operations.extend(
+                    CreateIndexOp.from_index(index)
+                    for index in sorted(table.indexes, key=lambda index: index.name or "")
+                )
+            upgrade_code = render_python_code(UpgradeOps(ops=operations))
+            downgrade_code = "\n".join(
+                f"    op.drop_table({table.name!r})" for table in reversed(tables)
+            ) or "    pass"
+            revisions.mkdir(parents=True, exist_ok=True)
+            baseline = revisions / f"{revision_id}_baseline.py"
+            baseline.write_text(
+                '"""Baseline schema captured from the current model metadata.\n\n'
+                f"Revision ID: {revision_id}\nRevises: None\n\n\n"
+                '"""\nfrom alembic import op\nimport sqlalchemy as sa\n\n'
+                f"revision = {revision_id!r}\ndown_revision = None\n"
+                "branch_labels = None\ndepends_on = None\n\n\n"
+                "def upgrade():\n"
+                f"{upgrade_code}\n\n\n"
+                "def downgrade():\n"
+                f"{downgrade_code}\n",
+                encoding="utf-8",
+            )
+            logger.info("Created baseline migration %s from current models.", baseline.name)
+            head = revision_id
+        else:
+            head = script.get_current_head()
+            if head is None:
+                parser.error("no migration head found; inspect showmigrations and restore missing revision files")
+        command.stamp(config, "head")
+        logger.info("Migration history repaired to %s; schema and data were preserved.", head)
+        return
+
+    if args.command == "clear_migrations":
+        with engine.connect() as connection:
+            table_names = set(inspect(connection).get_table_names())
+        application_tables = table_names - {"alembic_version"}
+        if application_tables:
+            parser.error(
+                "refusing to clear migrations because the database contains application tables; "
+                "use `python lenora.py repair-migrations` for a missing revision when its schema matches models"
+            )
+        if "alembic_version" in table_names:
+            with engine.begin() as connection:
+                connection.execute(text("DROP TABLE alembic_version"))
+        if revisions.exists():
+            for path in revisions.glob("*.py"):
+                if path.name != "__init__.py":
+                    path.unlink()
+        logger.info("Cleared migration files and database history; no application tables existed.")
+        return
+
+    schema_generation = args.command in {"migration", "background-worker"}
+    if schema_generation:
         existing_revisions = [
             path for path in revisions.glob("*.py") if path.name != "__init__.py"
         ]
@@ -622,7 +953,8 @@ def test_http_endpoint_is_registered_and_documented(method, path):
                         with engine.connect() as connection:
                             differences = compare_metadata(
                                 MigrationContext.configure(
-                                    connection, opts={"compare_type": True}
+                                    connection,
+                                    opts={"compare_type": True, "include_object": include_migration_object},
                                 ),
                                 expected_schema,
                             )
@@ -654,11 +986,11 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         }
         if revisions_after_autogenerate == revisions_before_autogenerate:
             logger.info("No new migration detected; database was not migrated.")
+            if args.command == "background-worker":
+                _run_registered_background_worker(module_name, app)
             return
 
     # `migration` generates then applies; `migrate` only applies revisions already created.
-    from sqlalchemy import inspect, text
-
     if not any(path.name != "__init__.py" for path in revisions.glob("*.py")):
         if args.command == "migrate":
             parser.error("no migration revisions found; run `python lenora.py migration` first")
@@ -667,7 +999,7 @@ def test_http_endpoint_is_registered_and_documented(method, path):
 
     # When adopting a pre-migration SQLite file, recognize the earlier
     # pluralized table name and rename it without dropping its existing rows.
-    if args.command == "migration":
+    if schema_generation:
         with engine.begin() as connection:
             inspector = inspect(connection)
             existing = set(inspector.get_table_names())
@@ -687,7 +1019,13 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         table_names = set(inspect(connection).get_table_names())
         existing_tables = table_names - {"alembic_version"}
         if existing_tables and "alembic_version" not in table_names:
-            differences = compare_metadata(MigrationContext.configure(connection, opts={"compare_type": True}), Model.metadata)
+            differences = compare_metadata(
+                MigrationContext.configure(
+                    connection,
+                    opts={"compare_type": True, "include_object": include_migration_object},
+                ),
+                Model.metadata,
+            )
             if differences:
                 parser.error("existing database schema differs from models; review it before applying the initial migration")
             mark_existing_schema = True
@@ -701,14 +1039,18 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     expected_heads = set(script.get_heads())
     if current_heads == expected_heads:
         logger.info("Database is already up to date; no migrations applied.")
+        if args.command == "background-worker":
+            _run_registered_background_worker(module_name, app)
         return
     command.upgrade(config, "head")
+    if args.command == "background-worker":
+        _run_registered_background_worker(module_name, app)
 
 
 def main() -> None:
     """Run the CLI and print an explicit result for migration commands."""
     command_name = sys.argv[1] if len(sys.argv) > 1 else None
-    is_migration = command_name in {"migration", "migrate"}
+    is_migration = command_name in {"migration", "migrate", "background-worker", "showmigrations", "repair-migrations", "clear_migrations", "delete_migrations"}
     if is_migration:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
