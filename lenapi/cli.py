@@ -33,13 +33,16 @@ API_TITLE = "lenApp"
 API_VERSION = "0.1.0"
 DOCS_URL = "/docs/"
 OPENAPI_URL = "/openapi.json"
+SAFE_GUARD_DOCS_URL = False  # Set True to require an admin login for docs and OpenAPI.
+DOCS_SESSION_LIFETIME_SECONDS = 3600
+DOCS_COOKIE_SECURE = None  # None follows the ASGI HTTPS scheme; set True behind a TLS proxy.
 # Limit incoming request bodies to 10 MiB; set to None to disable.
 MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024
 # Maximum time allowed to receive an incoming body; set to None to disable.
 REQUEST_BODY_TIMEOUT_SECONDS = 30
 # Shared storage for IP flags, sessions, opaque tokens, and HMAC replay checks.
 # Choose "database" (requires migration), "redis", or "memory" (development only).
-# For MongoDB projects, choose "redis" or "memory"; MongoDB is not a SQL security store.
+# Database mode uses the selected SQL database or MongoDB backend.
 SECURITY_STORAGE = "database"
 REDIS_URL = "redis://127.0.0.1:6379/0"
 CACHE_BACKEND = "memory"  # "memory", "database", or "redis".
@@ -261,14 +264,14 @@ def downgrade() -> None:
 Project settings are in `settings.py`; project models and schemas belong in
 `app/models.py` and `app/schemas.py`, and routes belong in `main.py`. The
 framework supplies the default `User` model and authentication setup. The
-first migration includes the framework user table automatically.
+first migration includes the framework `User` and `AdminUser` tables.
 
 ```bash
 python lenora.py migration
 python lenora.py runserver
 ```
 
-Migration checks for schema changes and skips the database upgrade when there is no new revision to apply.
+Migration checks for schema changes and skips the database upgrade when there is no new revision to apply. Set `SAFE_GUARD_DOCS_URL = True` in `settings.py` and run `python lenora.py admin` to enable database-backed login for `/docs/`.
 
 The development server uses port 8009. Open `/docs/` for Swagger UI. Run `python lenora.py test` to generate endpoint checks, run the tests, and write a CSV report.
 ''',
@@ -351,6 +354,10 @@ def _main() -> None:
         "delete_migrations", help="confirm and delete all database tables and local migration revisions"
     )
     delete_migrations.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
+    admin_command = commands.add_parser(
+        "admin", help="create an administrator account for private Swagger documentation"
+    )
+    admin_command.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
 
     generate_test = commands.add_parser("generate_test", help="generate pytest endpoint coverage from the app routes")
     generate_test.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
@@ -476,6 +483,7 @@ def load_app():
     app = import_module(module_name)
     for attribute in attribute_path.split(".") if attribute_path else []:
         app = getattr(app, attribute)
+
     return app
 
 
@@ -627,6 +635,29 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     for attribute in attribute_path.split(".") if attribute_path else []:
         app = getattr(app, attribute)
 
+    if args.command == "admin":
+        from getpass import getpass
+
+        username = input("Admin username: ").strip()
+        password = getpass("Password: ")
+        confirm_password = getpass("Confirm password: ")
+        email = input("Email: ").strip()
+        if password != confirm_password:
+            parser.error("passwords do not match")
+        if app.docs_guard is None:
+            parser.error("admin accounts require a configured SQL or MongoDB database")
+        try:
+            app.docs_guard.create_admin(username, email, password)
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print("Administrator account created successfully.")
+        if app.mongodb is not None:
+            import asyncio
+            asyncio.run(app.mongodb.aclose())
+        elif app.database is not None:
+            app.database.close()
+        return
+
     if app.mongodb is not None:
         if args.command == "background-worker":
             _run_registered_background_worker(module_name, app)
@@ -670,12 +701,22 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         created_collections = []
         try:
             existing_collections = set(app.mongodb.database.list_collection_names())
-            for document_model in document_models(MongoDocument):
-                collection_name = document_model._collection_name()
+            collection_names_to_create = {
+                document_model._collection_name()
+                for document_model in document_models(MongoDocument)
+            }
+            collection_names_to_create.update({
+                "admin_user",
+                "lenapi_admin_sessions",
+                "lenapi_security_store",
+            })
+            for collection_name in sorted(collection_names_to_create):
                 if collection_name not in existing_collections:
                     app.mongodb.database.create_collection(collection_name)
                     existing_collections.add(collection_name)
                     created_collections.append(collection_name)
+            app.mongodb.collection("admin_user").create_index("username", unique=True)
+            app.mongodb.collection("admin_user").create_index("email", unique=True)
         finally:
             asyncio.run(app.mongodb.aclose())
         if created_collections:

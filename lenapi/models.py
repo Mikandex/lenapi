@@ -1062,3 +1062,33 @@ class User(Model):
     last_name = StringField(max_length=150, default="")
     password = StringField(max_length=255)
     api_key = StringField(max_length=64, unique=True, nullable=True)
+
+
+class AdminUser(Model):
+    """Framework-owned administrator account for private docs access."""
+
+    __tablename__ = "admin_user"
+
+    username = StringField(max_length=120, unique=True, nullable=False)
+    email = EmailField(max_length=254, unique=True, nullable=False)
+    password = StringField(max_length=255, nullable=False)
+    created_at = FloatField(default=0.0, nullable=False)
+
+
+ADMIN_SESSION_TABLE = Table(
+    "lenapi_admin_sessions",
+    Model.metadata,
+    Column(
+        "session_hash",
+        String(64),
+        primary_key=True,
+    ),
+    Column(
+        "admin_user_id",
+        Integer,
+        ForeignKey("admin_user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    ),
+    Column("expires_at", Float, nullable=False, index=True),
+)

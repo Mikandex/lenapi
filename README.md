@@ -169,7 +169,7 @@ def receive_webhook(payload: dict):
     return {"received": True}
 ```
 
-`cool_time` is in seconds and defaults to 300. IP cooldowns use the shared security backend so they work across server workers. Choose `SECURITY_STORAGE = "database"` or `"redis"` in project `settings.py`. Database mode stores state in the internal `lenapi_security_store` table, which is included in migrations; run `python lenora.py migration` after enabling it. Redis mode uses `REDIS_URL` and requires `pip install 'lenapi[redis]'` plus a running Redis server. The generated settings default to database storage and include `REDIS_URL = "redis://127.0.0.1:6379/0"` for switching to Redis. Set `SECURITY_STORAGE = "memory"` only for single-process development.
+`cool_time` is in seconds and defaults to 300. IP cooldowns use the shared security backend so they work across server workers. Choose `SECURITY_STORAGE = "database"` or `"redis"` in project `settings.py`. Database mode stores state in the internal `lenapi_security_store` table or collection in the selected database, which is initialized by migrations. Redis mode uses `REDIS_URL` and requires `pip install 'lenapi[redis]'` plus a running Redis server. The generated settings default to database storage and include `REDIS_URL = "redis://127.0.0.1:6379/0"` for switching to Redis. Set `SECURITY_STORAGE = "memory"` only for single-process development.
 
 Model helpers include `model.EmailField()`, `model.IPField()`, `model.PhoneField()`, and `model.TextField()`:
 
@@ -295,7 +295,7 @@ For async work, use `async with app.async_database.transaction() as db:` and awa
 
 ## Cache service
 
-`app.cache` is an async JSON-value cache. Set `CACHE_BACKEND` in `settings.py` to `"memory"` (default), `"database"`, or `"redis"`. Database-backed cache uses the shared `lenapi_security_store` table, so run `python lenora.py migration` first. Redis mode uses `REDIS_URL` and requires `pip install '.[redis]'`.
+`app.cache` is an async JSON-value cache. Set `CACHE_BACKEND` in `settings.py` to `"memory"` (default), `"database"`, or `"redis"`. SQL database-backed cache uses the shared `lenapi_security_store` table, so run `python lenora.py migration` first. Redis mode uses `REDIS_URL` and requires `pip install '.[redis]'`.
 
 ```python
 await app.cache.set("profile:42", {"name": "Ada"}, ttl=300)
@@ -349,6 +349,8 @@ app.add_middleware(
 ```
 
 The session factories let database-backed authentication such as Basic or API-key auth query the configured user model. This middleware only protects the documentation endpoints; it does not secure API routes. Omit it to keep the default public docs, or pass another authentication dependency such as JWT or API-key auth.
+
+For the built-in docs login, set `SAFE_GUARD_DOCS_URL = True` in `settings.py`. The app then serves an administrator sign-in page at `/`, redirects unauthenticated requests for `/docs/` or `/openapi.json` to it, and redirects successful logins to Swagger. Create an administrator with `python lenora.py admin` after `python lenora.py migration`; the password prompt is hidden and the framework stores only a password hash. The framework's `AdminUser` and expiring session storage are created by the first migration. These records and sessions use the selected application database, including MongoDB; this docs feature does not use Redis. The session cookie is HttpOnly and expires after `DOCS_SESSION_LIFETIME_SECONDS` (default 3600 seconds). `DOCS_COOKIE_SECURE` follows the ASGI scheme by default; set it to `True` when TLS terminates at a reverse proxy.
 
 The sample app exposes the model queries as HTTP routes: `POST /classrooms` creates a classroom, `GET /classrooms` lists them, and `POST /students` accepts an optional `classroom_id`. `POST /students/batch` creates multiple students, `PUT /students/batch` updates multiple students by ID, and `DELETE /students/batch` deletes multiple students by ID. Batch requests are all-or-nothing: unknown IDs, duplicate names, or a protected deletion reject the whole operation. `PUT /students/{student_id}` updates one student; it returns HTTP 404 if the ID does not exist. `GET /students/{student_id}/classroom` returns the related classroom. Other student routes list, search, and check existence. These routes appear in Swagger at `/docs/`.
 
@@ -738,7 +740,7 @@ await student.asave()
 await student.adelete()
 ```
 
-`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. To select MongoDB, set `DATABASE_TYPE = "mongodb"` and set `DATABASE_URL` to a Mongo URI whose path contains the database name, such as `mongodb://localhost:27017/my_database`. `ACTIVATE_ASYNC` controls whether LenApi also creates PyMongo's async client. `migration` and `migrate` ensure collections exist for imported `MongoDocument` models; document fields are schema-flexible and do not use Alembic revisions. Since MongoDB is not a SQLAlchemy engine, configure `SECURITY_STORAGE` as `"redis"` or `"memory"` when using it. MongoDB uses the official synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
+`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. To select MongoDB, set `DATABASE_TYPE = "mongodb"` and set `DATABASE_URL` to a Mongo URI whose path contains the database name, such as `mongodb://localhost:27017/my_database`. `ACTIVATE_ASYNC` controls whether LenApi also creates PyMongo's async client. `migration` and `migrate` ensure collections exist for imported `MongoDocument` models and framework security/admin state; document fields are schema-flexible and do not use Alembic revisions. `SECURITY_STORAGE = "database"` uses MongoDB for shared security state, while Redis and process memory remain optional choices. MongoDB uses the official synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
 
 Put application models in `app/models.py` and import that module from `main.py`. The migration command loads `main:app`, so it discovers those model classes before creating a migration. The library's `Model` base supplies an integer `id`:
 

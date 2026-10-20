@@ -2,6 +2,7 @@
 
 import inspect
 from importlib import import_module
+import secrets
 import math
 import mimetypes
 import re
@@ -33,6 +34,7 @@ from .security_store import SecurityStoreUnavailable, create_security_store
 from .background import BackgroundTasks
 from .logging import get_logger
 from .service import Cache, WebSocket, WebSocketDisconnect
+from .docs_guard import DocsGuard, render_login_page
 
 
 logger = get_logger("websocket")
@@ -196,7 +198,10 @@ class Application(Router):
                  security_storage: str | None = None,
                  cache_backend: str = "memory",
                  media_root: str | Path | None = None, media_url: str | None = None,
-                 tag_name: str | None = None, auth: Any = None) -> None:
+                 tag_name: str | None = None, auth: Any = None,
+                 safe_guard_docs_url: bool = False,
+                 docs_session_lifetime_seconds: int = 3600,
+                 docs_cookie_secure: bool | None = None) -> None:
         if session_factory is not None and database is not None:
             raise ValueError("Pass either session_factory or database, not both")
         if max_request_body_size is not None and (
@@ -221,6 +226,22 @@ class Application(Router):
         self.version = version
         self.docs_url = docs_url
         self.openapi_url = openapi_url
+        self.safe_guard_docs_url = bool(safe_guard_docs_url)
+        self.docs_session_lifetime_seconds = docs_session_lifetime_seconds
+        self.docs_cookie_secure = docs_cookie_secure
+        if self.safe_guard_docs_url and self.docs_url is None:
+            raise ValueError("SAFE_GUARD_DOCS_URL requires DOCS_URL to be enabled")
+        self.docs_guard = (
+            DocsGuard(
+                database=self.database,
+                mongodb=self.mongodb,
+                session_lifetime_seconds=docs_session_lifetime_seconds,
+            )
+            if self.database is not None or self.mongodb is not None
+            else None
+        )
+        if self.safe_guard_docs_url and self.docs_guard is None:
+            raise ValueError("SAFE_GUARD_DOCS_URL requires a configured SQL or MongoDB database")
         self.media_root = Path(media_root).expanduser().resolve() if media_root is not None else None
         self.media_url = self._normalize_media_url(media_url) if self.media_root is not None and media_url else None
         self.max_request_body_size = max_request_body_size
@@ -234,6 +255,7 @@ class Application(Router):
             self.security_storage,
             engine=self.database.engine if self.database is not None else None,
             redis_url=redis_url,
+            mongodb=self.mongodb,
         )
         self.ip_flag_backend = self.security_storage
         self.cache = Cache(
@@ -271,8 +293,19 @@ class Application(Router):
             return
         path, method = scope.get("path", "/"), scope.get("method", "GET").upper()
         route_scope = scope
+        if self.safe_guard_docs_url:
+            guarded_response = await self._dispatch_docs_guard(scope, receive)
+            if guarded_response is not None:
+                await guarded_response(scope, receive, send)
+                return
         if self.docs_url is not None and self.openapi_url is not None and path in {self.docs_url, self.docs_url.rstrip("/")} and method == "GET":
-            response = Response(swagger_html(self.openapi_url), media_type="text/html; charset=utf-8")
+            page = swagger_html(self.openapi_url)
+            if self.safe_guard_docs_url:
+                signout = '''<form method="post" action="/logout" style="position:fixed;right:18px;top:14px;z-index:9999">
+<input type="hidden" name="csrf_token"><button style="border:1px solid #64748b;background:#fff;border-radius:7px;padding:8px 12px;cursor:pointer">Sign out</button>
+</form><script>(function(){const c=document.cookie.split('; ').find(x=>x.startsWith('lenapi_docs_csrf='));if(c)document.querySelector('form[action="/logout"] input').value=decodeURIComponent(c.split('=').slice(1).join('='));})();</script>'''
+                page = page.replace("</body>", signout + "</body>")
+            response = Response(page, media_type="text/html; charset=utf-8")
             await response(route_scope, receive, send)
             return
         if self.openapi_url is not None and path == self.openapi_url and method == "GET":
@@ -423,6 +456,120 @@ class Application(Router):
         response = JSONResponse({"detail": "Method not allowed" if path_matched else "Not found"},
                                 status_code=405 if path_matched else 404)
         await response(scope, receive, send)
+
+    async def _dispatch_docs_guard(self, scope, receive):
+        """Serve the private docs login page and gate docs/schema requests."""
+        from .request import Request
+
+        path, method = scope.get("path", "/"), scope.get("method", "GET").upper()
+        docs_paths = {
+            normalized
+            for configured in (self.docs_url, self.openapi_url)
+            if configured
+            for normalized in (configured, configured.rstrip("/"))
+        }
+        request = Request(scope, receive, max_body_size=4096, body_timeout=self.request_body_timeout)
+        secure = (
+            self.docs_cookie_secure
+            if self.docs_cookie_secure is not None
+            else scope.get("scheme") == "https"
+        )
+        if path in docs_paths:
+            try:
+                identity = await self.docs_guard.resolve_session(
+                    request.cookies.get("lenapi_docs_session")
+                )
+            except RuntimeError:
+                identity = None
+            if identity is not None:
+                return None
+            return Response(b"", status_code=303, headers={"location": "/"})
+
+        if path == "/" and method == "GET":
+            try:
+                identity = await self.docs_guard.resolve_session(
+                    request.cookies.get("lenapi_docs_session")
+                )
+            except RuntimeError:
+                identity = None
+            if identity is not None:
+                return Response(b"", status_code=303, headers={"location": self.docs_url or "/"})
+            csrf_token = secrets.token_urlsafe(32)
+            try:
+                has_admin = await self._has_docs_admin()
+            except RuntimeError:
+                has_admin = False
+            page = render_login_page(
+                self.title,
+                csrf_token,
+                "Create an admin account with `python lenora.py admin` after running migrations."
+                if not has_admin
+                else None,
+            )
+            response = Response(page, media_type="text/html; charset=utf-8")
+            response.set_cookie(
+                "lenapi_docs_csrf", csrf_token, path="/", secure=secure,
+                httponly=False, samesite="strict",
+            )
+            return response
+
+        if path == "/" and method == "POST":
+            try:
+                form = await request.form()
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            submitted_csrf = form.get("csrf_token", "")
+            cookie_csrf = request.cookies.get("lenapi_docs_csrf", "")
+            if not isinstance(submitted_csrf, str) or not cookie_csrf or not secrets.compare_digest(
+                submitted_csrf, cookie_csrf
+            ):
+                return JSONResponse({"detail": "Invalid login request; reload the page and try again."}, status_code=403)
+            username = form.get("username", "")
+            password = form.get("password", "")
+            if not isinstance(username, str) or not isinstance(password, str):
+                username = password = ""
+            try:
+                identity = await self.docs_guard.authenticate(username, password)
+            except RuntimeError:
+                identity = None
+            if identity is None:
+                csrf_token = secrets.token_urlsafe(32)
+                page = render_login_page(self.title, csrf_token, "The username or password is incorrect.")
+                response = Response(page, status_code=401, media_type="text/html; charset=utf-8")
+                response.set_cookie(
+                    "lenapi_docs_csrf", csrf_token, path="/", secure=secure,
+                    httponly=False, samesite="strict",
+                )
+                return response
+            session_id = await self.docs_guard.create_session(identity["id"])
+            response = Response(b"", status_code=303, headers={"location": self.docs_url or "/"})
+            response.set_cookie(
+                "lenapi_docs_session", session_id,
+                max_age=self.docs_session_lifetime_seconds,
+                path="/", secure=secure, httponly=True, samesite="lax",
+            )
+            return response
+
+        if path == "/logout" and method == "POST":
+            cookie_csrf = request.cookies.get("lenapi_docs_csrf", "")
+            try:
+                form = await request.form()
+            except HTTPException:
+                form = {}
+            submitted_csrf = form.get("csrf_token", "")
+            if not cookie_csrf or not isinstance(submitted_csrf, str) or not secrets.compare_digest(
+                submitted_csrf, cookie_csrf
+            ):
+                return JSONResponse({"detail": "Invalid logout request"}, status_code=403)
+            await self.docs_guard.delete_session(request.cookies.get("lenapi_docs_session"))
+            response = Response(b"", status_code=303, headers={"location": "/"})
+            response.delete_cookie("lenapi_docs_session", path="/")
+            response.delete_cookie("lenapi_docs_csrf", path="/")
+            return response
+        return None
+
+    async def _has_docs_admin(self) -> bool:
+        return await self.docs_guard.has_admin()
 
     async def _handle_websocket(self, scope, receive, send) -> None:
         initial = await receive()
@@ -630,7 +777,10 @@ class LENAPI(Application):
                  security_storage: str | None = None,
                  cache_backend: str | None = None,
                  media_root: str | Path | None = None, media_url: str | None = None,
-                 tag_name: str | None = None, auth: Any = None) -> None:
+                 tag_name: str | None = None, auth: Any = None,
+                 safe_guard_docs_url: bool | None = None,
+                 docs_session_lifetime_seconds: int | None = None,
+                 docs_cookie_secure: bool | None = None) -> None:
         # Project settings are optional, so importing lenapi outside a project
         # continues to work with the framework defaults.
         try:
@@ -729,6 +879,12 @@ class LENAPI(Application):
             media_url=media_url if media_url is not None else getattr(project_settings, "MEDIA_URL", None),
             tag_name=tag_name,
             auth=auth,
+            safe_guard_docs_url=(safe_guard_docs_url if safe_guard_docs_url is not None else
+                                 getattr(project_settings, "SAFE_GUARD_DOCS_URL", False)),
+            docs_session_lifetime_seconds=(docs_session_lifetime_seconds if docs_session_lifetime_seconds is not None else
+                                           getattr(project_settings, "DOCS_SESSION_LIFETIME_SECONDS", 3600)),
+            docs_cookie_secure=(docs_cookie_secure if docs_cookie_secure is not None else
+                                getattr(project_settings, "DOCS_COOKIE_SECURE", None)),
         )
         if project_settings is not None:
             from .authentication import install_default_authentication

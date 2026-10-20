@@ -178,9 +178,90 @@ class RedisSecurityStore:
         await self.client.aclose()
 
 
-def create_security_store(backend: str, *, engine=None, redis_url: str | None = None):
+class MongoSecurityStore:
+    """Persist shared security state in a collection in the selected MongoDB."""
+
+    def __init__(self, mongodb) -> None:
+        self.mongodb = mongodb
+        self.collection = mongodb.collection("lenapi_security_store")
+
+    @staticmethod
+    def _key(key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    def _get(self, key: str) -> str | None:
+        digest = self._key(key)
+        row = self.collection.find_one({"_id": digest})
+        if row is None:
+            return None
+        expires_at = row.get("expires_at")
+        if expires_at is not None and expires_at <= time.time():
+            self.collection.delete_one({"_id": digest})
+            return None
+        return row.get("value")
+
+    def _set(self, key: str, value: str, ttl: int | None = None) -> None:
+        if ttl is not None and ttl <= 0:
+            raise ValueError("ttl must be a positive number of seconds")
+        expires_at = time.time() + ttl if ttl is not None else None
+        self.collection.update_one(
+            {"_id": self._key(key)},
+            {"$set": {"value": value, "expires_at": expires_at}},
+            upsert=True,
+        )
+
+    def _delete(self, key: str) -> None:
+        self.collection.delete_one({"_id": self._key(key)})
+
+    def _claim(self, key: str, ttl: int) -> int:
+        if ttl <= 0:
+            raise ValueError("ttl must be a positive number of seconds")
+        digest = self._key(key)
+        now = time.time()
+        self.collection.delete_one({"_id": digest, "expires_at": {"$lte": now}})
+        try:
+            self.collection.insert_one({
+                "_id": digest,
+                "value": "1",
+                "expires_at": now + ttl,
+            })
+            return 0
+        except Exception:
+            row = self.collection.find_one({"_id": digest})
+            if row is None or row.get("expires_at") is None:
+                raise
+            return max(1, int(row["expires_at"] - time.time() + 0.999))
+
+    async def get(self, key: str) -> str | None:
+        try:
+            return await asyncio.to_thread(self._get, key)
+        except Exception as exc:
+            raise SecurityStoreUnavailable("MongoDB security storage is unavailable") from exc
+
+    async def set(self, key: str, value: str, *, ttl: int | None = None) -> None:
+        try:
+            await asyncio.to_thread(self._set, key, value, ttl)
+        except Exception as exc:
+            raise SecurityStoreUnavailable("MongoDB security storage is unavailable") from exc
+
+    async def delete(self, key: str) -> None:
+        try:
+            await asyncio.to_thread(self._delete, key)
+        except Exception as exc:
+            raise SecurityStoreUnavailable("MongoDB security storage is unavailable") from exc
+
+    async def claim(self, key: str, ttl: int) -> int:
+        try:
+            return await asyncio.to_thread(self._claim, key, ttl)
+        except Exception as exc:
+            raise SecurityStoreUnavailable("MongoDB security storage is unavailable") from exc
+
+
+def create_security_store(backend: str, *, engine=None, redis_url: str | None = None, mongodb=None):
     backend = backend.lower()
     if backend == "database":
+        if mongodb is not None:
+            return MongoSecurityStore(mongodb)
         if engine is None:
             raise ValueError("Database security storage requires an application Database")
         return DatabaseSecurityStore(engine)

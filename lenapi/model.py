@@ -7,6 +7,7 @@ Import this module with ``from lenapi import model`` and declare fields as
 from .models import (
     AutoField,
     Avg,
+    AdminUser,
     BigIntField,
     BigIntegerField,
     BooleanField,
@@ -45,7 +46,7 @@ from .models import (
 Json = JSONField
 
 __all__ = [
-    "Model", "AutoField", "IntegerField", "BigIntField", "BigIntegerField", "DecimalField", "StringField", "EmailField", "IPField", "PhoneField", "TextField",
+    "Model", "AdminUser", "AutoField", "IntegerField", "BigIntField", "BigIntegerField", "DecimalField", "StringField", "EmailField", "IPField", "PhoneField", "TextField",
     "Email_field", "IP_field", "Phone_field", "TExtfield",
     "BooleanField", "FloatField", "DateTimeField", "JSONField", "Json", "UUIDField", "ImageField",
     "Count", "Sum", "Min", "Max", "Avg",
