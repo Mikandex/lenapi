@@ -332,6 +332,24 @@ The API process and worker must register the same task names and handlers. `run_
 
 Swagger UI is available at [http://127.0.0.1:8009/docs/](http://127.0.0.1:8009/docs/), and the generated OpenAPI document is at [http://127.0.0.1:8009/openapi.json](http://127.0.0.1:8009/openapi.json). These are enabled by default. Set `API_TITLE`, `API_VERSION`, `DOCS_URL`, and `OPENAPI_URL` in `settings.py` to configure the Swagger metadata and paths, or override them directly with `LENAPI(title="My API", version="1.0.0", docs_url="/docs/", openapi_url="/openapi.json")`.
 
+Protect both the Swagger page and its OpenAPI JSON with `DocsAuthMiddleware`. It accepts the same callable authentication dependencies used by routes; pass the configured docs paths so customized URLs are protected too:
+
+```python
+from lenapi import LENAPI, DocsAuthMiddleware, authentication
+
+app = LENAPI()
+docs_auth = authentication("basic_login")
+app.add_middleware(
+    DocsAuthMiddleware,
+    auth=docs_auth,
+    paths=(app.docs_url, app.openapi_url),
+    session_factory=app.session_factory,
+    async_session_factory=app.async_session_factory,
+)
+```
+
+The session factories let database-backed authentication such as Basic or API-key auth query the configured user model. This middleware only protects the documentation endpoints; it does not secure API routes. Omit it to keep the default public docs, or pass another authentication dependency such as JWT or API-key auth.
+
 The sample app exposes the model queries as HTTP routes: `POST /classrooms` creates a classroom, `GET /classrooms` lists them, and `POST /students` accepts an optional `classroom_id`. `POST /students/batch` creates multiple students, `PUT /students/batch` updates multiple students by ID, and `DELETE /students/batch` deletes multiple students by ID. Batch requests are all-or-nothing: unknown IDs, duplicate names, or a protected deletion reject the whole operation. `PUT /students/{student_id}` updates one student; it returns HTTP 404 if the ID does not exist. `GET /students/{student_id}/classroom` returns the related classroom. Other student routes list, search, and check existence. These routes appear in Swagger at `/docs/`.
 
 Batch request examples:

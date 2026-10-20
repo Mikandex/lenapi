@@ -43,7 +43,7 @@ from .models import (
     protected,
 )
 from .request import Request, UploadFile
-from .middleware import CORSMiddleware, RequestIDMiddleware, TimingMiddleware
+from .middleware import CORSMiddleware, DocsAuthMiddleware, RequestIDMiddleware, TimingMiddleware
 from .service import Cache, Faker, Ollama, OpenAI, WebSocket, WebSocketDisconnect
 from .payments import Flutterwave, Nomba, PaymentPlugin, Payments, Paystack, Stripe, payment_provider, register_payment_provider
 from .response import HTTPException, JSONResponse, Response

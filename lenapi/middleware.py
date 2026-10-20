@@ -2,7 +2,12 @@
 
 import secrets
 import time
+import inspect
 from collections.abc import Iterable
+
+from .request import Request
+from .response import HTTPException, JSONResponse
+from .models import reset_current_async_session, reset_current_session, set_current_async_session, set_current_session
 
 
 class RequestIDMiddleware:
@@ -57,6 +62,79 @@ class TimingMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_timing)
+
+
+class DocsAuthMiddleware:
+    """Require an authentication dependency for the documentation endpoints.
+
+    Pass an authenticator from ``lenapi.authentication`` and the docs paths
+    configured on the application, for example::
+
+        app.add_middleware(
+            DocsAuthMiddleware,
+            auth=authentication("basic_login"),
+            paths=(app.docs_url, app.openapi_url),
+        )
+    """
+
+    def __init__(
+        self,
+        app,
+        *,
+        auth,
+        paths=('/docs/', '/openapi.json'),
+        session_factory=None,
+        async_session_factory=None,
+    ) -> None:
+        if auth is None or not callable(auth):
+            raise TypeError("DocsAuthMiddleware requires a callable authentication dependency")
+        self.app = app
+        self.auth = auth.dependency if hasattr(auth, "dependency") else auth
+        self.paths = {
+            normalized
+            for path in paths
+            if path
+            for normalized in (path, path.rstrip("/"))
+        }
+        self.session_factory = session_factory
+        self.async_session_factory = async_session_factory
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path", "/") not in self.paths:
+            return await self.app(scope, receive, send)
+
+        request = Request(scope, receive, max_body_size=0, body_timeout=1)
+        session = self.session_factory() if self.session_factory is not None else None
+        async_session = (
+            self.async_session_factory() if self.async_session_factory is not None else None
+        )
+        session_token = set_current_session(session) if session is not None else None
+        async_session_token = (
+            set_current_async_session(async_session) if async_session is not None else None
+        )
+        try:
+            identity = self.auth(request)
+            if inspect.isawaitable(identity):
+                identity = await identity
+            if identity is None or identity is False:
+                raise HTTPException(401, "Authentication required")
+        except HTTPException as exc:
+            response = JSONResponse(
+                {"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers
+            )
+            await response(scope, receive, send)
+            return
+        finally:
+            if session_token is not None:
+                reset_current_session(session_token)
+            if async_session_token is not None:
+                reset_current_async_session(async_session_token)
+            if session is not None:
+                session.close()
+            if async_session is not None:
+                await async_session.close()
+
+        await self.app(scope, receive, send)
 
 
 class CORSMiddleware:
