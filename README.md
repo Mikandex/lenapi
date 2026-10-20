@@ -226,7 +226,7 @@ The `test`, `generate_test`, `run_test`, and `run_test_output` commands are appl
 
 Request bodies are limited to 10 MiB by default, and lenApi allows up to 30 seconds to receive the body. Configure `MAX_REQUEST_BODY_SIZE` (bytes) and `REQUEST_BODY_TIMEOUT_SECONDS` in `settings.py`; set either to `None` to disable that limit. Oversized bodies receive HTTP 413, and bodies that exceed the receive timeout receive HTTP 408. Direct `Application(...)` instances accept the equivalent `max_request_body_size` and `request_body_timeout` arguments.
 
-The runserver command looks for `app` in the current application's `main.py`. It watches application files and reloads the server when code changes. The default port is `8009`. Change `PORT` in application `settings.py`, set `LENAPI_PORT`, or pass `--port` to `runserver`, for example `python lenora.py runserver --port 8010`. Host and app can also be changed with `--host` and `--app package.module:variable`; disable reload with `--no-reload`. Installing the package also provides the `lenora runserver` command.
+The runserver command looks for `app` in the current application's `main.py`. It watches application files and reloads the server when code changes. The default port is `8009`. Change `PORT` in application `settings.py` or pass `--port` to `runserver`, for example `python lenora.py runserver --port 8010`. Host and app can also be changed with `--host` and `--app package.module:variable`; disable reload with `--no-reload`. Installing the package also provides the `lenora runserver` command.
 
 ## Async database access
 

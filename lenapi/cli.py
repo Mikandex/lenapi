@@ -44,7 +44,7 @@ REDIS_URL = "redis://127.0.0.1:6379/0"
 CACHE_BACKEND = "memory"  # "memory", "database", or "redis".
 # runserver uses these values; blank HOST falls back to 127.0.0.1.
 HOST = ""
-PORT = int(os.getenv("LENAPI_PORT", "8009"))
+PORT = 8009
 DATABASE_TYPE = "sqlite"  # "sqlite", "mysql", "postgresql", or "mongodb".
 DATABASE_URL = f"sqlite:///{BASE_DIR / 'lenapi.db'}"
 ACTIVATE_ASYNC = True  # Async access uses the same database and URL as sync access.
@@ -331,7 +331,7 @@ def _main() -> None:
         if (Path.cwd() / "settings.py").is_file():
             project_settings = import_module("settings")
         args.host = args.host or getattr(project_settings, "HOST", "") or DEFAULT_HOST
-        args.port = args.port or int(os.getenv("LENAPI_PORT", getattr(project_settings, "PORT", DEFAULT_PORT)))
+        args.port = args.port or int(getattr(project_settings, "PORT", DEFAULT_PORT))
 
     if args.command == "startproject":
         if not args.name.isidentifier():
