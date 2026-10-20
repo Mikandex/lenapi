@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, ClassVar
+from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,23 +25,29 @@ class MongoDatabase:
     """
 
     def __init__(self, uri: str | None = None, database_name: str | None = None,
-                 *, client=None, async_client=None, **client_options) -> None:
+                 *, client=None, async_client=None, async_enabled: bool = True,
+                 **client_options) -> None:
         self.uri = uri or os.getenv("MONGODB_URI")
-        self.database_name = database_name or os.getenv("MONGODB_DATABASE")
         if not self.uri:
             raise ValueError("Pass uri or set MONGODB_URI")
+        parsed_database = unquote(urlsplit(self.uri).path.lstrip("/").split("/", 1)[0])
+        self.database_name = database_name or os.getenv("MONGODB_DATABASE") or parsed_database
         if not self.database_name:
-            raise ValueError("Pass database_name or set MONGODB_DATABASE")
+            raise ValueError("The MongoDB DATABASE_URL must include a database name in its URI path")
         MongoClient = AsyncMongoClient = None
-        if client is None or async_client is None:
+        if client is None or (async_enabled and async_client is None):
             try:
                 from pymongo import AsyncMongoClient, MongoClient
             except ImportError as exc:
                 raise ImportError("MongoDB support requires `pip install 'lenapi[mongodb]'`") from exc
         self.client = client if client is not None else MongoClient(self.uri, **client_options)
-        self.async_client = async_client if async_client is not None else AsyncMongoClient(self.uri, **client_options)
+        self.async_enabled = async_enabled
+        self.async_client = (
+            async_client if async_client is not None else
+            AsyncMongoClient(self.uri, **client_options) if async_enabled else None
+        )
         self.database = self.client[self.database_name]
-        self.async_database = self.async_client[self.database_name]
+        self.async_database = self.async_client[self.database_name] if self.async_client is not None else None
 
     def collection(self, name: str):
         """Return a synchronous PyMongo collection."""
@@ -48,6 +55,8 @@ class MongoDatabase:
 
     def acollection(self, name: str):
         """Return an asynchronous PyMongo collection."""
+        if self.async_database is None:
+            raise RuntimeError("Async MongoDB access is disabled; set ACTIVATE_ASYNC = True")
         return self.async_database[name]
 
     def ping(self) -> bool:
@@ -56,6 +65,8 @@ class MongoDatabase:
 
     async def aping(self) -> bool:
         """Check connectivity asynchronously."""
+        if self.async_client is None:
+            raise RuntimeError("Async MongoDB access is disabled; set ACTIVATE_ASYNC = True")
         result = await self.async_client.admin.command("ping")
         return result.get("ok") == 1.0
 
@@ -66,7 +77,8 @@ class MongoDatabase:
     async def aclose(self) -> None:
         """Close both clients; await this from ASGI shutdown or async code."""
         self.client.close()
-        await self.async_client.close()
+        if self.async_client is not None:
+            await self.async_client.close()
 
     def __enter__(self):
         return self

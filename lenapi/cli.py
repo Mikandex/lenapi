@@ -42,13 +42,12 @@ REQUEST_BODY_TIMEOUT_SECONDS = 30
 SECURITY_STORAGE = "database"
 REDIS_URL = "redis://127.0.0.1:6379/0"
 CACHE_BACKEND = "memory"  # "memory", "database", or "redis".
-# runserver uses these values; CLI flags override them.
-HOST = os.getenv("LENAPI_HOST", "127.0.0.1")
+# runserver uses these values; blank HOST falls back to 127.0.0.1.
+HOST = ""
 PORT = int(os.getenv("LENAPI_PORT", "8009"))
-DATABASE_URL = os.getenv("LENAPI_DATABASE_URL", f"sqlite:///{BASE_DIR / 'lenapi.db'}")
-ASYNC_DATABASE_URL = os.getenv("LENAPI_ASYNC_DATABASE_URL")
-MONGODB_URI = os.getenv("MONGODB_URI")
-MONGODB_DATABASE = os.getenv("MONGODB_DATABASE")
+DATABASE_TYPE = "sqlite"  # "sqlite", "mysql", "postgresql", or "mongodb".
+DATABASE_URL = f"sqlite:///{BASE_DIR / 'lenapi.db'}"
+ACTIVATE_ASYNC = True  # Async access uses the same database and URL as sync access.
 MEDIA_ROOT = BASE_DIR / "media"
 MEDIA_URL = "/media/"
 # Choose one primary method: "jwt", "api_key", "basic_login", "opaque_bearer", or "session".
@@ -331,7 +330,7 @@ def _main() -> None:
         project_settings = None
         if (Path.cwd() / "settings.py").is_file():
             project_settings = import_module("settings")
-        args.host = args.host or os.getenv("LENAPI_HOST") or getattr(project_settings, "HOST", DEFAULT_HOST)
+        args.host = args.host or getattr(project_settings, "HOST", "") or DEFAULT_HOST
         args.port = args.port or int(os.getenv("LENAPI_PORT", getattr(project_settings, "PORT", DEFAULT_PORT)))
 
     if args.command == "startproject":

@@ -212,9 +212,7 @@ python lenora.py runserver
 
 Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LENAPI()` configures the authentication dependency without adding authentication routes. The framework repository contains the installable `lenapi` package; create an application scaffold separately with `lenora startproject`.
 
-`settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LENAPI()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
-
-`settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database URL, token settings, and shared security storage. `app = LENAPI()` loads these project settings automatically, including the title displayed by Swagger. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. Override the host, port, or SQLite URL with `LENAPI_HOST`, `LENAPI_PORT`, and `LENAPI_DATABASE_URL` environment variables.
+`settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database selection, token settings, and shared security storage. `HOST = ""` uses `127.0.0.1`; set `HOST` directly to bind another address. `app = LENAPI()` loads project settings automatically. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. `DATABASE_TYPE` chooses one backend (`sqlite`, `mysql`, `postgresql`, or `mongodb`), and `DATABASE_URL` configures it. `ACTIVATE_ASYNC` enables asynchronous access using the same database URL. The default database is SQLite.
 
 ## Automated tests
 
@@ -234,7 +232,7 @@ The runserver command looks for `app` in the current application's `main.py`. It
 
 Routes can be `async def`, and lenApi can inject a SQLAlchemy `AsyncSession` when configured with an `AsyncDatabase`. The standard lenApi installation includes SQLAlchemy's `asyncio` extra (including `greenlet`) and `aiosqlite`, so async SQLite is ready to use. For async PostgreSQL or MySQL, install the corresponding optional driver extra.
 
-Then configure both URLs in `settings.py`: `DATABASE_URL` is the synchronous URL used by migrations, while `ASYNC_DATABASE_URL` is used for awaited database requests. They should point to the same database. For SQLite, use `sqlite:///...` and `sqlite+aiosqlite:///...` respectively.
+Set `ACTIVATE_ASYNC = True` in `settings.py` to enable awaited database requests alongside synchronous access. Both use `DATABASE_URL`; LenApi selects the async SQLAlchemy driver automatically. SQLite is ready by default. For MySQL install `pip install 'lenapi[mysql,async-mysql]'`; for PostgreSQL install `pip install 'lenapi[postgres,async-postgres]'`.
 
 ```python
 from sqlalchemy import select
@@ -733,7 +731,7 @@ await student.asave()
 await student.adelete()
 ```
 
-`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. Configure `MONGODB_URI` and `MONGODB_DATABASE` in `settings.py` to have `LENAPI()` configure `app.mongodb` automatically. MongoDB uses the official PyMongo synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
+`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. To select MongoDB, set `DATABASE_TYPE = "mongodb"` and set `DATABASE_URL` to a Mongo URI whose path contains the database name, such as `mongodb://localhost:27017/my_database`. `ACTIVATE_ASYNC` controls whether LenApi also creates PyMongo's async client. MongoDB uses the official synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
 
 Put application models in `app/models.py` and import that module from `main.py`. The migration command loads `main:app`, so it discovers those model classes before creating a migration. The library's `Model` base supplies an integer `id`:
 

@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .request import Request
@@ -209,7 +210,7 @@ class Application(Router):
         ):
             raise ValueError("request_body_timeout must be a positive number or None")
         super().__init__(tag_name=tag_name, auth=auth)
-        self.database = database if database is not None else (
+        self.database = None if database is False else database if database is not None else (
             None if session_factory is not None or async_database is not None else Database()
         )
         self.session_factory = session_factory or (self.database.session_factory if self.database is not None else None)
@@ -640,23 +641,60 @@ class LENAPI(Application):
             project_settings = None
 
         configured_database = database
-        if configured_database is None and session_factory is None and project_settings is not None:
-            database_url = getattr(project_settings, "DATABASE_URL", None)
-            if database_url:
-                configured_database = Database(database_url)
-
         configured_async_database = async_database
-        if configured_async_database is None and project_settings is not None:
-            async_database_url = getattr(project_settings, "ASYNC_DATABASE_URL", None)
-            if async_database_url:
-                configured_async_database = AsyncDatabase(async_database_url)
-
         configured_mongodb = mongodb
-        if configured_mongodb is None and project_settings is not None:
-            mongodb_uri = getattr(project_settings, "MONGODB_URI", None)
-            mongodb_name = getattr(project_settings, "MONGODB_DATABASE", None)
-            if mongodb_uri and mongodb_name:
-                configured_mongodb = MongoDatabase(mongodb_uri, mongodb_name)
+        if project_settings is not None:
+            database_type = str(getattr(project_settings, "DATABASE_TYPE", "sqlite")).lower()
+            database_url = getattr(project_settings, "DATABASE_URL", None)
+            activate_async = bool(getattr(project_settings, "ACTIVATE_ASYNC", True))
+
+            if database_type not in {"sqlite", "mysql", "postgres", "postgresql", "mongodb"}:
+                raise ValueError(
+                    "DATABASE_TYPE must be 'sqlite', 'mysql', 'postgresql', or 'mongodb'"
+                )
+            if configured_database is None and configured_mongodb is None and session_factory is None:
+                if not database_url:
+                    raise ValueError("Set DATABASE_URL in settings.py")
+                if database_type == "mongodb":
+                    configured_mongodb = MongoDatabase(database_url, async_enabled=activate_async)
+                else:
+                    sync_url = make_url(database_url)
+                    expected = "postgresql" if database_type in {"postgres", "postgresql"} else database_type
+                    if sync_url.get_backend_name() != expected:
+                        raise ValueError(
+                            f"DATABASE_URL uses '{sync_url.get_backend_name()}', "
+                            f"but DATABASE_TYPE is '{database_type}'"
+                        )
+                    configured_database = Database(database_url)
+                    if configured_async_database is None and activate_async:
+                        async_drivers = {
+                            "sqlite": "sqlite+aiosqlite",
+                            "mysql": "mysql+asyncmy",
+                            "postgresql": "postgresql+asyncpg",
+                        }
+                        async_url = sync_url.set(
+                            drivername=async_drivers[expected]
+                        )
+                        try:
+                            configured_async_database = AsyncDatabase(async_url.render_as_string(hide_password=False))
+                        except (ImportError, ModuleNotFoundError) as exc:
+                            extras = {
+                                "mysql": "async-mysql",
+                                "postgresql": "async-postgres",
+                            }
+                            extra = extras.get(expected)
+                            if extra:
+                                raise ImportError(
+                                    f"Async {expected} access requires `pip install 'lenapi[{extra}]'`"
+                                ) from exc
+                            raise
+            elif configured_mongodb is None and database_type == "mongodb" and database_url:
+                configured_mongodb = MongoDatabase(database_url, async_enabled=activate_async)
+
+        # MongoDB is the selected application database; do not also create an
+        # implicit SQLite engine through Application's standalone default.
+        if configured_mongodb is not None and configured_database is None and session_factory is None:
+            configured_database = False
 
         super().__init__(
             session_factory=session_factory,
