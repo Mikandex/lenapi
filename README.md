@@ -74,17 +74,29 @@ from lenapi import LENAPI, WebSocketService
 
 app = LENAPI()
 chat = WebSocketService(
-    path="/ws/chat",
+    path="/ws/chat/{room_id}",
     type="chat",  # "video", "chat_video", "text_message", "json_message", or "bytes"
     auth=authenticate,
     allowed_origins=["https://myapp.com"],
     max_message_size=64_000,
+    max_connections=6,  # optional; None means no limit for chat rooms
     heartbeat_seconds=30,
 )
 app.include_router(chat.router())
 ```
 
-The relay broadcasts each message to the connected clients in its room. For chat, send a JSON object such as `{"type": "chat.message", "text": "Hello"}`. The heartbeat uses JSON `{"type":"lenapi.ping"}` and expects `{"type":"lenapi.pong"}`. Origins are checked against the handshake's `Origin` header. The default room is shared by clients on that service; use `?room=general` to separate rooms. The built-in room manager is process-local, so multi-worker deployments need a shared pub/sub backend. Browser clients should use cookie-based auth or a custom WebSocket authenticator because the browser WebSocket API cannot set arbitrary request headers.
+The relay broadcasts each message to the connected clients in its room. For chat, send a JSON object such as `{"type": "chat.message", "text": "Hello"}`. The heartbeat uses JSON `{"type":"lenapi.ping"}` and expects `{"type":"lenapi.pong"}`. Origins are checked against the handshake's `Origin` header. A `{room_id}` path parameter or `?room=general` query parameter selects a room; without one, clients use the shared default room. `max_connections` can cap room membership. The built-in room manager is process-local, so multi-worker deployments need a shared pub/sub backend. Browser clients should use cookie-based auth or a custom WebSocket authenticator because the browser WebSocket API cannot set arbitrary request headers.
+
+Create an invite ID with a normal HTTP endpoint, then share the WebSocket path with participants. The room is joined when the first client connects; the ID itself is not persisted by the service.
+
+```python
+from uuid import uuid4
+
+@app.post("/rooms")
+def create_room():
+    room_id = uuid4().hex
+    return {"room_id": room_id, "websocket_path": f"/ws/chat/{room_id}"}
+```
 
 Use the optional Faker service to generate realistic sample data. From the lenApi repository root, install it with `python -m pip install -e '.[faker]'`:
 

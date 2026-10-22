@@ -171,6 +171,7 @@ class WebSocketService:
         auth=None,
         allowed_origins: list[str] | tuple[str, ...] | None = None,
         max_message_size: int = 64_000,
+        max_connections: int | None = None,
         heartbeat_seconds: float | None = 30,
     ) -> None:
         if not isinstance(path, str) or not path.startswith("/"):
@@ -183,6 +184,12 @@ class WebSocketService:
             raise ValueError(f"Unsupported WebSocket type '{type}'. Choose from: {choices}")
         if isinstance(max_message_size, bool) or not isinstance(max_message_size, int) or max_message_size <= 0:
             raise ValueError("max_message_size must be a positive integer")
+        if max_connections is not None and (
+            isinstance(max_connections, bool)
+            or not isinstance(max_connections, int)
+            or max_connections <= 0
+        ):
+            raise ValueError("max_connections must be a positive integer or None")
         if heartbeat_seconds is not None and (
             isinstance(heartbeat_seconds, bool)
             or not isinstance(heartbeat_seconds, (int, float))
@@ -202,6 +209,7 @@ class WebSocketService:
         self.auth = auth
         self.allowed_origins = origins
         self.max_message_size = max_message_size
+        self.max_connections = max_connections
         self.heartbeat_seconds = float(heartbeat_seconds) if heartbeat_seconds is not None else None
         self._rooms: dict[str, set[WebSocketConnection]] = {}
         self._lock = asyncio.Lock()
@@ -255,7 +263,10 @@ class WebSocketService:
         connection = WebSocketConnection(self, websocket, room, identity)
         async with self._lock:
             peers = self._rooms.setdefault(room, set())
-            if self.type in {"video", "chat_video"} and len(peers) >= 2:
+            connection_limit = self.max_connections
+            if connection_limit is None and self.type in {"video", "chat_video"}:
+                connection_limit = 2
+            if connection_limit is not None and len(peers) >= connection_limit:
                 room_full = True
                 existing_peers = []
             else:
