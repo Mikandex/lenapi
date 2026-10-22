@@ -32,17 +32,15 @@ app.include_router(social_auth.router(), prefix="/api", tag_name="Social Auth")
 Use lenApi's standard-library logger in application code. `logger` is the default `lenapi` logger; `get_logger()` returns it or a namespaced child logger:
 
 ```python
-import logging
 from lenapi import get_logger, logger
 
-logging.basicConfig(level=logging.INFO)
 logger.info("Application started")
 
 auth_logger = get_logger("auth")
 auth_logger.warning("Login attempt rejected")
 ```
 
-The logger follows Python's normal logging configuration, so developers can set levels, handlers, and formats with the `logging` module.
+LenApi prints `INFO` and higher by default. You can change the level or add your own handlers with Python's standard `logging` module.
 
 ## WebSockets
 
