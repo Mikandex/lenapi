@@ -38,6 +38,8 @@ OPENAPI_URL = "/openapi.json"
 SAFE_GUARD_DOCS_URL = False  # Set True to require an admin login for docs and OpenAPI.
 DOCS_SESSION_LIFETIME_SECONDS = 3600
 DOCS_COOKIE_SECURE = None  # None follows the ASGI HTTPS scheme; set True behind a TLS proxy.
+DOCS_LOGIN_MAX_ATTEMPTS = 5  # Failed docs sign-ins allowed per client IP in the time window.
+DOCS_LOGIN_WINDOW_SECONDS = 300
 # Limit incoming request bodies to 10 MiB; set to None to disable.
 MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024
 # Maximum time allowed to receive an incoming body; set to None to disable.
