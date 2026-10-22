@@ -23,6 +23,12 @@ async def hello(data: GreetingInput):
 app.include_router(api)
 ```
 
+Set a Swagger tag for every route when mounting a router with `tag_name`; it overrides tags set on the router or individual decorators:
+
+```python
+app.include_router(social_auth.router(), prefix="/api", tag_name="Social Auth")
+```
+
 Use lenApi's standard-library logger in application code. `logger` is the default `lenapi` logger; `get_logger()` returns it or a namespaced child logger:
 
 ```python
@@ -481,7 +487,7 @@ def federated_private(identity=Depends(provider_token)):
 
 ## Social login
 
-`SocialAuth` generates provider login and callback routes for Google, GitHub, and LinkedIn. Configure each provider's client ID, client secret, and exact callback URI in the generated `settings.py` (or load them from environment variables). The generated settings leave credentials blank. Register each callback URI with the matching provider.
+`SocialAuth` generates provider login and callback routes for Google, GitHub, and LinkedIn. X and Facebook are temporarily disabled; if either is listed in `providers`, it is ignored, so no login or callback route is generated for it. Other unknown provider names remain configuration errors. Configure each available provider's client ID, client secret, and exact callback URI in the generated `settings.py` (or load them from environment variables). The generated settings leave credentials blank. Register each callback URI with the matching provider.
 
 ```python
 from lenapi import LENAPI

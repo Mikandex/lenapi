@@ -168,14 +168,19 @@ class Router:
             return endpoint
         return decorator
 
-    def include_router(self, router: "Router", *, prefix: str = "") -> None:
+    def include_router(
+        self, router: "Router", *, prefix: str = "", tag_name: str | None = None
+    ) -> None:
+        if tag_name is not None and (not isinstance(tag_name, str) or not tag_name.strip()):
+            raise ValueError("tag_name must be a non-empty string or None")
         mount_prefix = self._normalize_prefix(prefix)
         for route in router.routes:
             self.routes.append(Route(
                 mount_prefix + route.path, route.methods, route.endpoint, route.response_model,
                 api_flag=route.api_flag, cool_time=route.cool_time,
                 request_body=route.request_body, include_in_schema=route.include_in_schema,
-                tag_name=route.tag_name if route.tag_name is not None else self.tag_name,
+                tag_name=(tag_name if tag_name is not None else
+                          route.tag_name if route.tag_name is not None else self.tag_name),
                 auth=route.auth if route.auth is not None else self.auth,
             ))
         for route in router.websocket_routes:
@@ -183,9 +188,11 @@ class Router:
                 mount_prefix + route.path, {"WEBSOCKET"}, route.endpoint
             ))
 
-    def add_router(self, prefix: str, router: "Router") -> None:
+    def add_router(
+        self, prefix: str, router: "Router", *, tag_name: str | None = None
+    ) -> None:
         """Mount a router using Django Ninja style: ``app.add_router('/users/', router)``."""
-        self.include_router(router, prefix=prefix)
+        self.include_router(router, prefix=prefix, tag_name=tag_name)
 
 
 class Application(Router):

@@ -30,7 +30,8 @@ class SocialAuth:
     """
 
     _PROVIDERS = {"google", "github", "linkedin"}
-    _ALIASES = {}
+    _DISABLED_PROVIDERS = {"x", "facebook"}
+    _ALIASES = {"twitter": "x"}
 
     def __init__(
         self,
@@ -48,16 +49,20 @@ class SocialAuth:
         except TypeError as exc:
             raise TypeError("providers must be a list or tuple of provider names") from exc
         normalized = []
+        ignored_disabled_provider = False
         for value in requested:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError("provider names must be non-empty strings")
             provider = self._ALIASES.get(value.strip().lower(), value.strip().lower())
+            if provider in self._DISABLED_PROVIDERS:
+                ignored_disabled_provider = True
+                continue
             if provider not in self._PROVIDERS:
                 supported = ", ".join(sorted(self._PROVIDERS))
                 raise ValueError(f"Unsupported social provider '{value}'. Choose from: {supported}")
             if provider not in normalized:
                 normalized.append(provider)
-        if not normalized:
+        if not normalized and not ignored_disabled_provider:
             raise ValueError("SocialAuth requires at least one provider")
         self.providers = tuple(normalized)
         self.auto_register = bool(auto_register)
