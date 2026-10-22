@@ -3,11 +3,188 @@
 import secrets
 import time
 import inspect
+import zlib
 from collections.abc import Iterable
 
 from .request import Request
 from .response import HTTPException, JSONResponse
 from .models import reset_current_async_session, reset_current_session, set_current_async_session, set_current_session
+
+
+class GZipMiddleware:
+    """Compress eligible HTTP response bodies for clients that accept gzip.
+
+    Buffers only until ``minimum_size`` is reached. Larger responses are then
+    compressed as a stream. Compression uses Python's standard library and
+    does not add a Starlette dependency.
+    """
+
+    _COMPRESSIBLE_TYPES = (
+        "text/",
+        "application/json",
+        "application/javascript",
+        "application/x-javascript",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/atom+xml",
+        "application/rss+xml",
+        "application/wasm",
+        "image/svg+xml",
+    )
+
+    def __init__(self, app, *, minimum_size: int = 500, compresslevel: int = 6) -> None:
+        if isinstance(minimum_size, bool) or not isinstance(minimum_size, int) or minimum_size < 0:
+            raise ValueError("minimum_size must be a non-negative integer")
+        if isinstance(compresslevel, bool) or not isinstance(compresslevel, int) or not 0 <= compresslevel <= 9:
+            raise ValueError("compresslevel must be an integer from 0 to 9")
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+
+    @staticmethod
+    def _accepts_gzip(headers: dict[bytes, bytes]) -> bool:
+        encodings = headers.get(b"accept-encoding", b"").decode("latin-1")
+        explicit_gzip = None
+        wildcard = None
+        for item in encodings.split(","):
+            pieces = [part.strip() for part in item.split(";")]
+            name = pieces[0].lower()
+            quality = 1.0
+            for parameter in pieces[1:]:
+                key, separator, value = parameter.partition("=")
+                if separator and key.strip().lower() == "q":
+                    try:
+                        quality = float(value.strip())
+                    except ValueError:
+                        quality = 0.0
+                    break
+            if name == "gzip":
+                explicit_gzip = quality
+            elif name == "*":
+                wildcard = quality
+        return (explicit_gzip if explicit_gzip is not None else wildcard or 0.0) > 0
+
+    @classmethod
+    def _compressible(cls, headers: dict[bytes, bytes]) -> bool:
+        content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower().decode(
+            "latin-1"
+        )
+        return (
+            content_type.startswith("application/")
+            and content_type.endswith(("+json", "+xml"))
+        ) or any(
+            content_type == media_type or media_type.endswith("/") and content_type.startswith(media_type)
+            for media_type in cls._COMPRESSIBLE_TYPES
+        )
+
+    @staticmethod
+    def _append_vary(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+        result = []
+        vary_values = []
+        for name, value in headers:
+            if name.lower() == b"vary":
+                vary_values.extend(part.strip() for part in value.split(b",") if part.strip())
+            else:
+                result.append((name, value))
+        if not any(value.lower() == b"*" for value in vary_values) and not any(
+            value.lower() == b"accept-encoding" for value in vary_values
+        ):
+            vary_values.append(b"Accept-Encoding")
+        if vary_values:
+            result.append((b"vary", b", ".join(vary_values)))
+        return result
+
+    @staticmethod
+    def _gzip_headers(message: dict) -> dict:
+        headers = [
+            (name, value)
+            for name, value in message.get("headers", [])
+            if name.lower() not in {b"content-length", b"content-encoding"}
+        ]
+        headers = GZipMiddleware._append_vary(headers)
+        headers.append((b"content-encoding", b"gzip"))
+        return {**message, "headers": headers}
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        request_headers = {name.lower(): value for name, value in scope.get("headers", [])}
+        accepts_gzip = self._accepts_gzip(request_headers)
+        response_start = None
+        response_headers = {}
+        body_buffer = bytearray()
+        compressor = None
+        compressing = False
+        passthrough = False
+
+        async def send_with_gzip(message):
+            nonlocal response_start, response_headers, body_buffer, compressor
+            nonlocal compressing, passthrough
+            message_type = message["type"]
+
+            if message_type == "http.response.start":
+                response_start = message
+                response_headers = {
+                    name.lower(): value for name, value in message.get("headers", [])
+                }
+                status = message.get("status", 200)
+                cache_control = response_headers.get(b"cache-control", b"").lower()
+                passthrough = (
+                    not accepts_gzip
+                    or not self._compressible(response_headers)
+                    or b"content-encoding" in response_headers
+                    or b"content-range" in response_headers
+                    or b"no-transform" in cache_control
+                    or scope.get("method", "GET").upper() == "HEAD"
+                    or status in {204, 206, 304}
+                )
+                if passthrough:
+                    headers = list(message.get("headers", []))
+                    if self._compressible(response_headers):
+                        headers = self._append_vary(headers)
+                    await send({**message, "headers": headers})
+                return
+
+            if message_type != "http.response.body" or response_start is None:
+                await send(message)
+                return
+
+            if passthrough:
+                await send(message)
+                return
+
+            body = message.get("body", b"")
+            more_body = message.get("more_body", False)
+            if not compressing:
+                body_buffer.extend(body)
+                if len(body_buffer) < self.minimum_size and more_body:
+                    return
+                if len(body_buffer) < self.minimum_size:
+                    headers = list(response_start.get("headers", []))
+                    await send({**response_start, "headers": self._append_vary(headers)})
+                    await send({**message, "body": bytes(body_buffer)})
+                    body_buffer.clear()
+                    return
+
+                compressing = True
+                compressor = zlib.compressobj(self.compresslevel, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+                await send(self._gzip_headers(response_start))
+                compressed = compressor.compress(bytes(body_buffer))
+                body_buffer.clear()
+                if not more_body:
+                    compressed += compressor.flush(zlib.Z_FINISH)
+                    compressor = None
+                await send({**message, "body": compressed})
+                return
+
+            compressed = compressor.compress(body)
+            if not more_body:
+                compressed += compressor.flush(zlib.Z_FINISH)
+                compressor = None
+            await send({**message, "body": compressed})
+
+        await self.app(scope, receive, send_with_gzip)
 
 
 class RequestIDMiddleware:

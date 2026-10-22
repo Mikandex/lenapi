@@ -4,7 +4,7 @@ import hashlib
 import asyncio
 import time
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import Integer, case, cast, delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .models import SECURITY_STORE_TABLE
@@ -104,6 +104,43 @@ class DatabaseSecurityStore:
                 ).scalar_one_or_none()
             return max(1, int(expires_at - time.time() + 0.999)) if expires_at is not None else 0
 
+    def _increment(self, key: str, window_seconds: int) -> tuple[int, int]:
+        if isinstance(window_seconds, bool) or not isinstance(window_seconds, int) or window_seconds <= 0:
+            raise ValueError("window_seconds must be a positive integer")
+        digest = self._key(key)
+        now = time.time()
+        expires = now + window_seconds
+        expired = SECURITY_STORE_TABLE.c.expires_at <= now
+        updates = {
+            "value": case((expired, "1"), else_=cast(SECURITY_STORE_TABLE.c.value, Integer) + 1),
+            "expires_at": case((expired, expires), else_=SECURITY_STORE_TABLE.c.expires_at),
+        }
+        dialect = self.engine.dialect.name
+        if dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+            statement = dialect_insert(SECURITY_STORE_TABLE).values(
+                key=digest, value="1", expires_at=expires
+            ).on_conflict_do_update(index_elements=["key"], set_=updates)
+        elif dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+            statement = dialect_insert(SECURITY_STORE_TABLE).values(
+                key=digest, value="1", expires_at=expires
+            ).on_conflict_do_update(index_elements=["key"], set_=updates)
+        elif dialect == "mysql":
+            from sqlalchemy.dialects.mysql import insert as dialect_insert
+            statement = dialect_insert(SECURITY_STORE_TABLE).values(
+                key=digest, value="1", expires_at=expires
+            ).on_duplicate_key_update(**updates)
+        else:
+            raise ValueError(f"Database rate limiting is not supported for dialect '{dialect}'")
+        with self.engine.begin() as connection:
+            connection.execute(statement)
+            row = connection.execute(
+                select(SECURITY_STORE_TABLE.c.value, SECURITY_STORE_TABLE.c.expires_at)
+                .where(SECURITY_STORE_TABLE.c.key == digest)
+            ).one()
+        return int(row.value), max(1, int(row.expires_at - time.time() + 0.999))
+
     async def get(self, key: str) -> str | None:
         try:
             return await asyncio.to_thread(self._get, key)
@@ -125,6 +162,12 @@ class DatabaseSecurityStore:
     async def claim(self, key: str, ttl: int) -> int:
         try:
             return await asyncio.to_thread(self._claim, key, ttl)
+        except Exception as exc:
+            raise SecurityStoreUnavailable("Database security storage is unavailable") from exc
+
+    async def increment(self, key: str, window_seconds: int) -> tuple[int, int]:
+        try:
+            return await asyncio.to_thread(self._increment, key, window_seconds)
         except Exception as exc:
             raise SecurityStoreUnavailable("Database security storage is unavailable") from exc
 
@@ -171,6 +214,22 @@ class RedisSecurityStore:
             if await self.client.set(redis_key, "1", ex=ttl, nx=True):
                 return 0
             return max(1, await self.client.ttl(redis_key))
+        except Exception as exc:
+            raise SecurityStoreUnavailable("Redis security storage is unavailable") from exc
+
+    async def increment(self, key: str, window_seconds: int) -> tuple[int, int]:
+        if isinstance(window_seconds, bool) or not isinstance(window_seconds, int) or window_seconds <= 0:
+            raise ValueError("window_seconds must be a positive integer")
+        script = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return {count, redis.call('TTL', KEYS[1])}
+"""
+        try:
+            count, remaining = await self.client.eval(
+                script, 1, self._key(key), window_seconds
+            )
+            return int(count), max(1, int(remaining))
         except Exception as exc:
             raise SecurityStoreUnavailable("Redis security storage is unavailable") from exc
 
@@ -232,6 +291,30 @@ class MongoSecurityStore:
                 raise
             return max(1, int(row["expires_at"] - time.time() + 0.999))
 
+    def _increment(self, key: str, window_seconds: int) -> tuple[int, int]:
+        if isinstance(window_seconds, bool) or not isinstance(window_seconds, int) or window_seconds <= 0:
+            raise ValueError("window_seconds must be a positive integer")
+        now = time.time()
+        expired = {"$lte": [{"$ifNull": ["$expires_at", 0]}, now]}
+        self.collection.update_one(
+            {"_id": self._key(key)},
+            [{"$set": {
+                "value": {"$toString": {"$cond": [
+                    expired,
+                    1,
+                    {"$add": [{"$convert": {
+                        "input": "$value", "to": "int", "onError": 0, "onNull": 0
+                    }}, 1]},
+                ]}},
+                "expires_at": {"$cond": [expired, now + window_seconds, "$expires_at"]},
+            }}],
+            upsert=True,
+        )
+        row = self.collection.find_one({"_id": self._key(key)})
+        if row is None:
+            raise RuntimeError("MongoDB rate counter was not stored")
+        return int(row["value"]), max(1, int(row["expires_at"] - time.time() + 0.999))
+
     async def get(self, key: str) -> str | None:
         try:
             return await asyncio.to_thread(self._get, key)
@@ -253,6 +336,12 @@ class MongoSecurityStore:
     async def claim(self, key: str, ttl: int) -> int:
         try:
             return await asyncio.to_thread(self._claim, key, ttl)
+        except Exception as exc:
+            raise SecurityStoreUnavailable("MongoDB security storage is unavailable") from exc
+
+    async def increment(self, key: str, window_seconds: int) -> tuple[int, int]:
+        try:
+            return await asyncio.to_thread(self._increment, key, window_seconds)
         except Exception as exc:
             raise SecurityStoreUnavailable("MongoDB security storage is unavailable") from exc
 

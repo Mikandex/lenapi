@@ -107,6 +107,15 @@ def build_openapi(app, *, title: str, version: str) -> dict[str, Any]:
                     "key": "client_ip",
                     "cool_time_seconds": route.cool_time,
                 }
+            if route.throttle:
+                operation["x-lenapi-rate-limits"] = [
+                    {
+                        "scope": limit.scope,
+                        "requests": limit.count,
+                        "window_seconds": limit.window_seconds,
+                    }
+                    for limit in route.throttle
+                ]
             parameters = []
             request_body = operation.get("requestBody")
             for name, parameter in inspect.signature(route.endpoint).parameters.items():

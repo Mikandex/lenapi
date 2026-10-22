@@ -232,7 +232,34 @@ def receive_webhook(payload: dict):
     return {"received": True}
 ```
 
-`cool_time` is in seconds and defaults to 300. IP cooldowns use the shared security backend so they work across server workers. Choose `SECURITY_STORAGE = "database"` or `"redis"` in project `settings.py`. Database mode stores state in the internal `lenapi_security_store` table or collection in the selected database, which is initialized by migrations. Redis mode uses `REDIS_URL` and requires `pip install 'lenapi[redis]'` plus a running Redis server. The generated settings default to database storage and include `REDIS_URL = "redis://127.0.0.1:6379/0"` for switching to Redis. Set `SECURITY_STORAGE = "memory"` only for single-process development.
+`cool_time` is in seconds and defaults to 300. IP cooldowns use the configured security backend. For request quotas, configure independent limits by scope:
+
+```python
+from lenapi import LENAPI, Router
+
+app = LENAPI(throttle={
+    "ip": "300/minute",                 # all requests, before authentication
+    "anonymous": "30/minute",           # public requests and failed route authentication
+    "authenticated": "600/minute",      # requests authenticated by route auth=
+})
+
+api = Router(prefix="/api")
+# `authenticate` is your configured JWT, API-key, session, or other auth dependency.
+
+@api.get("/public", throttle={"anonymous": "10/minute"})
+def public_data():
+    return {"ok": True}
+
+@api.get("/account", auth=authenticate)
+def account():
+    return {"private": True}
+
+app.include_router(api)
+```
+
+Rate strings accept seconds, minutes, hours, or days, for example `"10/second"`, `"60/minute"`, and `"1000/day"`. Throttling uses a fixed window that starts with the first request. `ip` counts every request from the client address, including attempts with invalid credentials. `anonymous` counts public calls and failed route-level authentication by IP. `authenticated` counts successful route-level authentication by a stable identity returned from `auth=`. Route and router `throttle=` values override inherited limits; an empty mapping disables inherited limits for that route or router. Endpoint-only auth declared with `Depends(...)` does not supply the identity to the throttle; attach it with `auth=` when you want authenticated quotas.
+
+When a quota is exceeded, LenAPI returns `429 Too Many Requests` with `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers. Quota counters use the same security backend as IP cooldowns. Choose `SECURITY_STORAGE = "database"` or `"redis"` in project `settings.py`. Database mode stores state in the internal `lenapi_security_store` table or MongoDB collection, initialized by migrations. Redis mode uses `REDIS_URL` and requires `pip install 'lenapi[redis]'` plus a running Redis server. The generated settings default to database storage and include `REDIS_URL = "redis://127.0.0.1:6379/0"` for switching to Redis. Shared database or Redis storage coordinates limits across workers. `SECURITY_STORAGE = "memory"` keeps counters in each process, so use it only for single-process development. LenAPI uses the ASGI connection's client address and does not trust forwarded-IP headers automatically; configure trusted proxy handling at your deployment edge before relying on IP quotas behind a proxy.
 
 Model helpers include `model.EmailField()`, `model.IPField()`, `model.PhoneField()`, and `model.TextField()`:
 
@@ -332,19 +359,40 @@ deleted_count = await Student.adelete(id=student.id)
 Add ASGI middleware with `app.add_middleware`. Middleware is applied in registration order, with the first middleware added wrapping the rest:
 
 ```python
-from lenapi import CORSMiddleware, RequestIDMiddleware, TimingMiddleware
+from lenapi import LENAPI
+from lenapi.security import authentication
+from lenapi.middleware import (
+    CORSMiddleware,
+    DocsAuthMiddleware,
+    GZipMiddleware,
+    RequestIDMiddleware,
+    TimingMiddleware,
+)
+import settings
 
+app = LENAPI()
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(TimingMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://frontend.example"],
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["authorization", "content-type"],
 )
+
+# Optional: protect only Swagger and OpenAPI.
+docs_auth = authentication("basic_login", settings=settings, app=app)
+app.add_middleware(
+    DocsAuthMiddleware,
+    auth=docs_auth,
+    paths=(app.docs_url, app.openapi_url),
+    session_factory=app.session_factory,
+    async_session_factory=app.async_session_factory,
+)
 ```
 
-Custom middleware follows the ASGI callable contract: `Middleware(app, **options)` and `await app(scope, receive, send)`. Request IDs and elapsed time are returned in `X-Request-ID` and `X-Process-Time-Ms`.
+`GZipMiddleware` uses Python's standard library, compresses eligible response types when the request accepts gzip, and streams responses after buffering up to `minimum_size` (500 bytes by default). It adds `Content-Encoding: gzip` and `Vary: Accept-Encoding`, skips already-encoded and partial responses, and supports `compresslevel` from 0 to 9. It does not require Starlette. Custom middleware follows the ASGI callable contract: `Middleware(app, **options)` and `await app(scope, receive, send)`. Request IDs and elapsed time are returned in `X-Request-ID` and `X-Process-Time-Ms`.
 
 ## Database transactions
 

@@ -50,6 +50,8 @@ REQUEST_BODY_TIMEOUT_SECONDS = 30
 SECURITY_STORAGE = "database"
 REDIS_URL = "redis://127.0.0.1:6379/0"
 CACHE_BACKEND = "memory"  # "memory", "database", or "redis".
+# Optional fixed-window request quotas. Scopes: "ip", "anonymous", "authenticated".
+THROTTLE_RATES = {}  # Example: {"anonymous": "60/minute", "authenticated": "300/minute"}
 # runserver uses these values; blank HOST falls back to 127.0.0.1.
 HOST = ""
 PORT = 8009

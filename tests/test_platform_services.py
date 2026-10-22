@@ -1,7 +1,9 @@
 """Tests for middleware, database transactions, job queues, and cache services."""
 
 import asyncio
+import gzip
 import importlib.util
+import json
 
 import pytest
 from sqlalchemy import text
@@ -17,6 +19,7 @@ from lenapi import (
     RequestIDMiddleware,
     TimingMiddleware,
 )
+from lenapi.middleware import GZipMiddleware
 from lenapi.models import Model
 from lenapi.model import IntegerField, StringField
 from lenapi.models import reset_current_session, set_current_session
@@ -155,6 +158,52 @@ def test_cors_middleware_handles_preflight_and_allowed_origins():
     )
     assert status == 200
     assert headers[b"access-control-allow-origin"] == b"https://client.example"
+
+
+def test_gzip_middleware_compresses_eligible_response_for_gzip_client():
+    app = Application(security_storage="memory")
+    app.add_middleware(GZipMiddleware, minimum_size=100)
+
+    @app.get("/payload")
+    def payload():
+        return {"message": "hello " * 40}
+
+    status, headers, messages = request(
+        app, "/payload", headers=[(b"accept-encoding", b"gzip")]
+    )
+    response_body = b"".join(
+        message.get("body", b"")
+        for message in messages
+        if message["type"] == "http.response.body"
+    )
+
+    assert status == 200
+    assert headers[b"content-encoding"] == b"gzip"
+    assert b"accept-encoding" in headers[b"vary"].lower()
+    assert json.loads(gzip.decompress(response_body)) == {"message": "hello " * 40}
+
+
+def test_gzip_middleware_respects_q_zero_and_minimum_size():
+    app = Application(security_storage="memory")
+    app.add_middleware(GZipMiddleware, minimum_size=100)
+
+    @app.get("/small")
+    def small():
+        return {"ok": True}
+
+    status, headers, messages = request(
+        app, "/small", headers=[(b"accept-encoding", b"gzip;q=0")]
+    )
+    response_body = b"".join(
+        message.get("body", b"")
+        for message in messages
+        if message["type"] == "http.response.body"
+    )
+
+    assert status == 200
+    assert b"content-encoding" not in headers
+    assert b"accept-encoding" in headers[b"vary"].lower()
+    assert json.loads(response_body) == {"ok": True}
 
 
 def test_sync_database_transaction_commits_or_rolls_back(tmp_path):

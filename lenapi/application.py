@@ -2,6 +2,7 @@
 
 import inspect
 from importlib import import_module
+import hashlib
 import secrets
 import math
 import mimetypes
@@ -35,6 +36,7 @@ from .background import BackgroundTasks
 from .logging import get_logger
 from .service import Cache, WebSocket, WebSocketDisconnect
 from .docs_guard import DocsGuard, render_login_page
+from .throttling import RateLimit, normalize_throttle
 
 
 logger = get_logger("websocket")
@@ -45,6 +47,7 @@ class Route:
         self, path: str, methods: set[str], endpoint: Callable, response_model: Any = None,
         *, api_flag: bool = False, cool_time: int = 300, request_body: dict[str, Any] | None = None,
         include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None,
+        throttle: tuple[RateLimit, ...] | None = None,
     ) -> None:
         if cool_time <= 0:
             raise ValueError("cool_time must be a positive number of seconds")
@@ -60,6 +63,7 @@ class Route:
         self.include_in_schema = include_in_schema
         self.tag_name = tag_name
         self.auth = auth
+        self.throttle = throttle
         self.api_flag = api_flag
         self.cool_time = cool_time
         self.regex, self.parameter_names = self._compile_path(path)
@@ -88,7 +92,8 @@ class Route:
 class Router:
     """A group of routes that can be mounted on an Application or another Router."""
 
-    def __init__(self, *, prefix: str = "", tag_name: str | None = None, auth: Any = None) -> None:
+    def __init__(self, *, prefix: str = "", tag_name: str | None = None, auth: Any = None,
+                 throttle: dict[str, str] | None = None) -> None:
         if tag_name is not None and (not isinstance(tag_name, str) or not tag_name.strip()):
             raise ValueError("tag_name must be a non-empty string or None")
         if auth is not None and not callable(auth) and not isinstance(auth, Depends):
@@ -96,6 +101,7 @@ class Router:
         self.prefix = self._normalize_prefix(prefix)
         self.tag_name = tag_name
         self.auth = auth
+        self.throttle = normalize_throttle(throttle)
         self.routes: list[Route] = []
         self.websocket_routes: list[Route] = []
 
@@ -116,6 +122,7 @@ class Router:
         api_flag: bool = False, cool_time: int = 300,
         request_body: dict[str, Any] | None = None,
         include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None,
+        throttle: dict[str, str] | None = None,
     ):
         def decorator(endpoint: Callable):
             self.routes.append(Route(
@@ -124,40 +131,45 @@ class Router:
                 request_body=request_body, include_in_schema=include_in_schema,
                 tag_name=self.tag_name if tag_name is None else tag_name,
                 auth=self.auth if auth is None else auth,
+                throttle=self.throttle if throttle is None else normalize_throttle(throttle),
             ))
             return endpoint
         return decorator
 
     def get(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
-            include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None):
+            include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None,
+            throttle: dict[str, str] | None = None):
         return self.route(path, methods=("GET",), response_model=response_model, api_flag=api_flag,
                           cool_time=cool_time, include_in_schema=include_in_schema, tag_name=tag_name,
-                          auth=auth)
+                          auth=auth, throttle=throttle)
 
     def post(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
              request_body: dict[str, Any] | None = None, include_in_schema: bool = True,
-             tag_name: str | None = None, auth: Any = None):
+             tag_name: str | None = None, auth: Any = None, throttle: dict[str, str] | None = None):
         return self.route(path, methods=("POST",), response_model=response_model, api_flag=api_flag,
                           cool_time=cool_time, request_body=request_body, include_in_schema=include_in_schema,
-                          tag_name=tag_name, auth=auth)
+                          tag_name=tag_name, auth=auth, throttle=throttle)
 
     def put(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
-            include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None):
+            include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None,
+            throttle: dict[str, str] | None = None):
         return self.route(path, methods=("PUT",), response_model=response_model, api_flag=api_flag,
                           cool_time=cool_time, include_in_schema=include_in_schema, tag_name=tag_name,
-                          auth=auth)
+                          auth=auth, throttle=throttle)
 
     def patch(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
-              include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None):
+              include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None,
+              throttle: dict[str, str] | None = None):
         return self.route(path, methods=("PATCH",), response_model=response_model, api_flag=api_flag,
                           cool_time=cool_time, include_in_schema=include_in_schema, tag_name=tag_name,
-                          auth=auth)
+                          auth=auth, throttle=throttle)
 
     def delete(self, path: str, *, response_model: Any = None, api_flag: bool = False, cool_time: int = 300,
-               include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None):
+               include_in_schema: bool = True, tag_name: str | None = None, auth: Any = None,
+               throttle: dict[str, str] | None = None):
         return self.route(path, methods=("DELETE",), response_model=response_model, api_flag=api_flag,
                           cool_time=cool_time, include_in_schema=include_in_schema, tag_name=tag_name,
-                          auth=auth)
+                          auth=auth, throttle=throttle)
 
     def websocket(self, path: str):
         """Register an ASGI WebSocket handler on this router."""
@@ -182,6 +194,7 @@ class Router:
                 tag_name=(tag_name if tag_name is not None else
                           route.tag_name if route.tag_name is not None else self.tag_name),
                 auth=route.auth if route.auth is not None else self.auth,
+                throttle=route.throttle if route.throttle is not None else self.throttle,
             ))
         for route in router.websocket_routes:
             self.websocket_routes.append(Route(
@@ -210,6 +223,7 @@ class Application(Router):
                  cache_backend: str = "memory",
                  media_root: str | Path | None = None, media_url: str | None = None,
                  tag_name: str | None = None, auth: Any = None,
+                 throttle: dict[str, str] | None = None,
                  safe_guard_docs_url: bool = False,
                  docs_session_lifetime_seconds: int = 3600,
                  docs_cookie_secure: bool | None = None,
@@ -231,7 +245,7 @@ class Application(Router):
                             ("docs_login_window_seconds", docs_login_window_seconds)):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        super().__init__(tag_name=tag_name, auth=auth)
+        super().__init__(tag_name=tag_name, auth=auth, throttle=throttle)
         self.database = None if database is False else database if database is not None else (
             None if session_factory is not None or async_database is not None else Database()
         )
@@ -274,6 +288,7 @@ class Application(Router):
         self.max_request_body_size = max_request_body_size
         self.request_body_timeout = float(request_body_timeout) if request_body_timeout is not None else None
         self._throttle_until: dict[tuple[str, str], float] = {}
+        self._rate_limit_counters: dict[str, tuple[float, int]] = {}
         self._throttle_lock = threading.Lock()
         self.user_middleware: list[tuple[type, dict[str, Any]]] = []
         self._middleware_stack = None
@@ -420,36 +435,54 @@ class Application(Router):
                     async_session = self.async_session_factory()
                     async_session_token = set_current_async_session(async_session)
                 dependency_cache: dict[Callable, Any] = {}
-                if route.auth is not None:
-                    auth_dependency = route.auth.dependency if isinstance(route.auth, Depends) else route.auth
-                    auth_kwargs = await self._build_arguments(
-                        auth_dependency, request, raw_params, session, dependency_cache, set(), async_session
-                    )
-                    identity = auth_dependency(**auth_kwargs)
-                    if inspect.isawaitable(identity):
-                        identity = await identity
-                    dependency_cache[auth_dependency] = identity
-                kwargs = await self._build_arguments(
-                    route.endpoint, request, raw_params, session, dependency_cache, set(), async_session
+                response = None
+                pre_auth_scopes = {"ip"}
+                if route.auth is None:
+                    pre_auth_scopes.add("anonymous")
+                response = await self._enforce_rate_limits(
+                    route, request, None, scopes=pre_auth_scopes
                 )
-                result = route.endpoint(**kwargs)
-                if inspect.isawaitable(result):
-                    result = await result
-                if isinstance(result, Response):
-                    response = result
-                else:
-                    if route.response_model is not None:
-                        try:
-                            result = TypeAdapter(route.response_model).validate_python(
-                                result, from_attributes=True
-                            )
-                            result = TypeAdapter(route.response_model).dump_python(result, mode="json")
-                        except ValidationError as exc:
-                            response = JSONResponse({"detail": "Invalid response data"}, status_code=500)
-                            await response(route_scope, receive, send)
-
-                            return
-                    response = JSONResponse(result)
+                if response is None and route.auth is not None:
+                    auth_dependency = route.auth.dependency if isinstance(route.auth, Depends) else route.auth
+                    try:
+                        auth_kwargs = await self._build_arguments(
+                            auth_dependency, request, raw_params, session, dependency_cache, set(), async_session
+                        )
+                        identity = auth_dependency(**auth_kwargs)
+                        if inspect.isawaitable(identity):
+                            identity = await identity
+                    except HTTPException:
+                        response = await self._enforce_rate_limits(
+                            route, request, None, scopes={"anonymous"}
+                        )
+                        if response is None:
+                            raise
+                    else:
+                        dependency_cache[auth_dependency] = identity
+                        response = await self._enforce_rate_limits(
+                            route, request, identity, scopes={"authenticated"}
+                        )
+                if response is None:
+                    kwargs = await self._build_arguments(
+                        route.endpoint, request, raw_params, session, dependency_cache, set(), async_session
+                    )
+                    result = route.endpoint(**kwargs)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    if isinstance(result, Response):
+                        response = result
+                    else:
+                        if route.response_model is not None:
+                            try:
+                                result = TypeAdapter(route.response_model).validate_python(
+                                    result, from_attributes=True
+                                )
+                                result = TypeAdapter(route.response_model).dump_python(result, mode="json")
+                            except ValidationError:
+                                response = JSONResponse({"detail": "Invalid response data"}, status_code=500)
+                                await response(route_scope, receive, send)
+                                return
+                        response = JSONResponse(result)
             except ValidationError:
                 response = JSONResponse({"error": "Invalid request"}, status_code=422)
             except MultipleResultsFound:
@@ -725,6 +758,75 @@ class Application(Router):
                 return 0
             return math.ceil(retry_after)
 
+    @staticmethod
+    def _authenticated_principal(identity: Any) -> str:
+        """Get a stable principal identifier from an already verified identity."""
+        if isinstance(identity, dict):
+            for name in ("sub", "user_id", "id", "pk", "username", "email"):
+                value = identity.get(name)
+                if value is not None and str(value):
+                    return f"{name}:{value}"
+            if identity.get("auth_method"):
+                return f"auth_method:{identity['auth_method']}"
+            return "authenticated:shared"
+        if isinstance(identity, (str, int)) and not isinstance(identity, bool):
+            return f"identity:{identity}"
+        for name in ("sub", "user_id", "id", "pk", "username", "email"):
+            value = getattr(identity, name, None)
+            if value is not None and str(value):
+                return f"{name}:{value}"
+        return f"type:{type(identity).__module__}.{type(identity).__qualname__}"
+
+    async def _claim_rate_limit(self, key: str, window_seconds: int) -> tuple[int, int]:
+        if self.security_store is not None:
+            return await self.security_store.increment(key, window_seconds)
+        now = time.monotonic()
+        with self._throttle_lock:
+            if len(self._rate_limit_counters) >= 8192:
+                self._rate_limit_counters = {
+                    item: record for item, record in self._rate_limit_counters.items()
+                    if record[0] > now
+                }
+            record = self._rate_limit_counters.get(key)
+            if record is None or record[0] <= now:
+                if len(self._rate_limit_counters) >= 8192 and key not in self._rate_limit_counters:
+                    return 1, window_seconds
+                self._rate_limit_counters[key] = (now + window_seconds, 1)
+                return 1, window_seconds
+            expires_at, count = record
+            count += 1
+            self._rate_limit_counters[key] = (expires_at, count)
+            return count, max(1, math.ceil(expires_at - now))
+
+    async def _enforce_rate_limits(
+        self, route: Route, request: Request, identity: Any, *, scopes: set[str]
+    ) -> Response | None:
+        for limit in route.throttle or ():
+            if limit.scope not in scopes:
+                continue
+            if limit.scope == "authenticated":
+                if identity is None or identity is False:
+                    continue
+                principal = self._authenticated_principal(identity)
+            else:
+                if limit.scope == "anonymous" and identity is not None:
+                    continue
+                principal = request.client_ip or "unknown"
+            raw_key = f"rate_limit:{request.method.upper()}:{route.path}:{limit.scope}:{principal}"
+            key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+            count, retry_after = await self._claim_rate_limit(key, limit.window_seconds)
+            if count > limit.count:
+                return JSONResponse(
+                    {"detail": "Too many requests"},
+                    status_code=429,
+                    headers={
+                        "Retry-After": str(max(1, retry_after)),
+                        "X-RateLimit-Limit": str(limit.count),
+                        "X-RateLimit-Remaining": "0",
+                    },
+                )
+        return None
+
 
     @staticmethod
     def _needs_session(endpoint: Callable) -> bool:
@@ -849,6 +951,7 @@ class LENAPI(Application):
                  cache_backend: str | None = None,
                  media_root: str | Path | None = None, media_url: str | None = None,
                  tag_name: str | None = None, auth: Any = None,
+                 throttle: dict[str, str] | None = None,
                  safe_guard_docs_url: bool | None = None,
                  docs_session_lifetime_seconds: int | None = None,
                  docs_cookie_secure: bool | None = None,
@@ -952,6 +1055,8 @@ class LENAPI(Application):
             media_url=media_url if media_url is not None else getattr(project_settings, "MEDIA_URL", None),
             tag_name=tag_name,
             auth=auth,
+            throttle=(throttle if throttle is not None else
+                      getattr(project_settings, "THROTTLE_RATES", None)),
             safe_guard_docs_url=(safe_guard_docs_url if safe_guard_docs_url is not None else
                                  getattr(project_settings, "SAFE_GUARD_DOCS_URL", False)),
             docs_session_lifetime_seconds=(docs_session_lifetime_seconds if docs_session_lifetime_seconds is not None else
