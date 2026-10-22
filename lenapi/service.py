@@ -1,10 +1,17 @@
 """Optional services for WebSockets, caching, background jobs, and AI APIs."""
 
+import asyncio
+import inspect
 import json
 import math
 import threading
 import time
 from typing import Any
+from urllib.parse import parse_qs
+
+from .dependencies import Depends
+from .request import Request
+from .response import HTTPException
 
 
 class WebSocketDisconnect(Exception):
@@ -107,6 +114,237 @@ class WebSocket:
     def _ensure_accepted(self) -> None:
         if not self.accepted or self.closed:
             raise RuntimeError("Accept the WebSocket before sending data")
+
+
+class WebSocketConnection:
+    """One connected client managed by :class:`WebSocketService`."""
+
+    def __init__(self, service: "WebSocketService", websocket: WebSocket,
+                 room: str, identity: Any = None) -> None:
+        self.service = service
+        self.websocket = websocket
+        self.room = room
+        self.identity = identity
+
+    async def send_text(self, data: str) -> None:
+        await self.websocket.send_text(data)
+
+    async def send_bytes(self, data: bytes) -> None:
+        await self.websocket.send_bytes(data)
+
+    async def send_json(self, data: Any) -> None:
+        await self.websocket.send_json(data)
+
+    async def broadcast_text(self, data: str) -> None:
+        await self.service._broadcast(self.room, "text", data)
+
+    async def broadcast_bytes(self, data: bytes) -> None:
+        await self.service._broadcast(self.room, "bytes", data)
+
+    async def broadcast_json(self, data: Any) -> None:
+        await self.service._broadcast(self.room, "json", data)
+
+    async def close(self, code: int = 1000, reason: str | None = None) -> None:
+        await self.websocket.close(code=code, reason=reason)
+
+
+class WebSocketService:
+    """Ready-to-mount WebSocket chat and signaling service.
+
+    ``type`` selects the accepted message shape: ``chat``, ``video``,
+    ``chat_video``, ``text_message``, ``json_message``, or ``bytes``. Chat,
+    video, and combined modes relay JSON dictionaries between clients sharing
+    a room. A room can be selected by a ``{room_id}`` path parameter or a
+    ``?room=...`` query parameter. This built-in relay uses process-local
+    memory; multi-worker deployments need a shared pub/sub backend.
+    """
+
+    _TYPES = {"chat", "video", "chat_video", "text_message", "json_message", "bytes"}
+    _ALIASES = {"chat&video": "chat_video", "text": "text_message", "json": "json_message",
+                "byte": "bytes", "binary": "bytes"}
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        type: str = "chat",
+        auth=None,
+        allowed_origins: list[str] | tuple[str, ...] | None = None,
+        max_message_size: int = 64_000,
+        heartbeat_seconds: float | None = 30,
+    ) -> None:
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError("path must be an absolute WebSocket path")
+        if not isinstance(type, str) or not type.strip():
+            raise ValueError("type must be a non-empty string")
+        message_type = self._ALIASES.get(type.strip().lower(), type.strip().lower())
+        if message_type not in self._TYPES:
+            choices = ", ".join(sorted(self._TYPES))
+            raise ValueError(f"Unsupported WebSocket type '{type}'. Choose from: {choices}")
+        if isinstance(max_message_size, bool) or not isinstance(max_message_size, int) or max_message_size <= 0:
+            raise ValueError("max_message_size must be a positive integer")
+        if heartbeat_seconds is not None and (
+            isinstance(heartbeat_seconds, bool)
+            or not isinstance(heartbeat_seconds, (int, float))
+            or heartbeat_seconds <= 0
+        ):
+            raise ValueError("heartbeat_seconds must be positive or None")
+        if auth is not None and not callable(auth) and not isinstance(auth, Depends):
+            raise TypeError("auth must be a callable authentication dependency or Depends instance")
+        origins = None if allowed_origins is None else tuple(allowed_origins)
+        if isinstance(allowed_origins, str):
+            raise TypeError("allowed_origins must be a list or tuple of origins")
+        if origins is not None and any(not isinstance(origin, str) or not origin.strip() for origin in origins):
+            raise ValueError("allowed_origins must contain non-empty origin strings")
+
+        self.path = path
+        self.type = message_type
+        self.auth = auth
+        self.allowed_origins = origins
+        self.max_message_size = max_message_size
+        self.heartbeat_seconds = float(heartbeat_seconds) if heartbeat_seconds is not None else None
+        self._rooms: dict[str, set[WebSocketConnection]] = {}
+        self._lock = asyncio.Lock()
+
+    def router(self):
+        """Return a Router with this service's WebSocket endpoint."""
+        from .application import Router
+
+        router = Router()
+        router.websocket(self.path)(self._handle_connection)
+        return router
+
+    async def _authenticate(self, websocket: WebSocket):
+        if self.auth is None:
+            return None
+        dependency = self.auth.dependency if isinstance(self.auth, Depends) else self.auth
+        scope = dict(websocket.scope)
+        scope.update({"type": "http", "method": "GET", "path": scope.get("path", self.path)})
+
+        async def empty_body():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = Request(scope, empty_body, max_body_size=0, body_timeout=1)
+        identity = dependency(request)
+        if inspect.isawaitable(identity):
+            identity = await identity
+        if identity is None or identity is False:
+            raise HTTPException(401, "WebSocket authentication failed")
+        return identity
+
+    def _room_name(self, websocket: WebSocket) -> str:
+        path_room = websocket.path_params.get("room_id")
+        query_room = parse_qs(websocket.query_string).get("room", [None])[0]
+        return str(path_room or query_room or "default")
+
+    async def _handle_connection(self, websocket: WebSocket) -> None:
+        origin = websocket.headers.get("origin")
+        if self.allowed_origins is not None and origin is not None:
+            if "*" not in self.allowed_origins and origin not in self.allowed_origins:
+                await websocket.close(code=4403, reason="WebSocket origin is not allowed")
+                return
+        try:
+            identity = await self._authenticate(websocket)
+        except HTTPException as exc:
+            code = 4403 if exc.status_code == 403 else 4401
+            await websocket.close(code=code, reason=str(exc.detail)[:123])
+            return
+
+        room = self._room_name(websocket)
+        await websocket.accept()
+        connection = WebSocketConnection(self, websocket, room, identity)
+        async with self._lock:
+            self._rooms.setdefault(room, set()).add(connection)
+        try:
+            while True:
+                message = await self._receive_message(websocket)
+                if message is None:  # heartbeat response
+                    continue
+                kind, payload = message
+                await self._broadcast(room, kind, payload)
+        except WebSocketDisconnect:
+            pass
+        except (ValueError, TypeError, json.JSONDecodeError):
+            await websocket.close(code=1003, reason="Invalid WebSocket message")
+        finally:
+            async with self._lock:
+                peers = self._rooms.get(room)
+                if peers is not None:
+                    peers.discard(connection)
+                    if not peers:
+                        self._rooms.pop(room, None)
+
+    async def _receive_message(self, websocket: WebSocket):
+        try:
+            if self.heartbeat_seconds is None:
+                message = await websocket.receive()
+            else:
+                message = await asyncio.wait_for(websocket.receive(), timeout=self.heartbeat_seconds)
+        except asyncio.TimeoutError:
+            await websocket.send_json({"type": "lenapi.ping"})
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=self.heartbeat_seconds)
+            except asyncio.TimeoutError:
+                await websocket.close(code=1001, reason="WebSocket heartbeat timed out")
+                raise WebSocketDisconnect(1001)
+
+        data = message.get("bytes")
+        text = message.get("text")
+        size = len(data) if data is not None else len(text.encode("utf-8")) if text is not None else 0
+        if size > self.max_message_size:
+            await websocket.close(code=1009, reason="WebSocket message is too large")
+            raise WebSocketDisconnect(1009)
+        if text is not None and text == '{"type":"lenapi.pong"}':
+            return None
+
+        if self.type == "bytes":
+            if data is None:
+                raise TypeError("This WebSocket service accepts binary messages only")
+            return "bytes", data
+        if self.type == "text_message":
+            if text is None:
+                raise TypeError("This WebSocket service accepts text messages only")
+            return "text", text
+        if text is None:
+            raise TypeError("This WebSocket service expects JSON text messages")
+        payload = json.loads(text)
+        if isinstance(payload, dict) and payload.get("type") == "lenapi.pong":
+            return None
+        if self.type in {"chat", "video", "chat_video"} and not isinstance(payload, dict):
+            raise TypeError("Chat and video messages must be JSON objects")
+        if self.type == "video" and payload.get("type") not in {"offer", "answer", "candidate"}:
+            raise TypeError("Video messages must be WebRTC offer, answer, or candidate events")
+        if self.type == "chat_video" and payload.get("type") not in {
+            "chat.message", "offer", "answer", "candidate"
+        }:
+            raise TypeError("Combined chat/video messages must be chat or WebRTC signaling events")
+        return "json", payload
+
+    async def _broadcast(self, room: str, kind: str, payload: Any) -> None:
+        async with self._lock:
+            peers = list(self._rooms.get(room, ()))
+        results = await asyncio.gather(
+            *(self._send_to_peer(peer, kind, payload) for peer in peers),
+            return_exceptions=True,
+        )
+        disconnected = [peer for peer, result in zip(peers, results) if isinstance(result, Exception)]
+        if disconnected:
+            async with self._lock:
+                for peer in disconnected:
+                    room_peers = self._rooms.get(room)
+                    if room_peers is not None:
+                        room_peers.discard(peer)
+                        if not room_peers:
+                            self._rooms.pop(room, None)
+
+    @staticmethod
+    async def _send_to_peer(peer: WebSocketConnection, kind: str, payload: Any) -> None:
+        if kind == "text":
+            await peer.send_text(payload)
+        elif kind == "bytes":
+            await peer.send_bytes(payload)
+        else:
+            await peer.send_json(payload)
 
 
 class Faker:
