@@ -254,7 +254,28 @@ class WebSocketService:
         await websocket.accept()
         connection = WebSocketConnection(self, websocket, room, identity)
         async with self._lock:
-            self._rooms.setdefault(room, set()).add(connection)
+            peers = self._rooms.setdefault(room, set())
+            if self.type in {"video", "chat_video"} and len(peers) >= 2:
+                room_full = True
+                existing_peers = []
+            else:
+                room_full = False
+                existing_peers = list(peers)
+                peers.add(connection)
+        if room_full:
+            await websocket.send_json({"type": "error", "message": "This call room is full."})
+            await websocket.close(code=1008, reason="Call room is full")
+            return
+        if self.type in {"video", "chat_video"}:
+            if existing_peers:
+                for peer in existing_peers:
+                    try:
+                        await peer.send_json({"type": "peer_joined"})
+                    except (WebSocketDisconnect, OSError, RuntimeError):
+                        pass
+                await websocket.send_json({"type": "joined"})
+            else:
+                await websocket.send_json({"type": "waiting"})
         try:
             while True:
                 message = await self._receive_message(websocket)
@@ -271,8 +292,17 @@ class WebSocketService:
                 peers = self._rooms.get(room)
                 if peers is not None:
                     peers.discard(connection)
+                    remaining = list(peers)
                     if not peers:
                         self._rooms.pop(room, None)
+                else:
+                    remaining = []
+            if self.type in {"video", "chat_video"}:
+                for peer in remaining:
+                    try:
+                        await peer.send_json({"type": "peer_left"})
+                    except (WebSocketDisconnect, OSError, RuntimeError):
+                        pass
 
     async def _receive_message(self, websocket: WebSocket):
         try:
