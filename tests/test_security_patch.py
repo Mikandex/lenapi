@@ -1,7 +1,51 @@
 import asyncio
+import importlib
 from urllib.parse import urlencode
 
 from lenapi import Application, Database, WebSocketService
+
+
+def test_authentication_public_api_is_available_from_security_module():
+    from lenapi.security import (
+        SocialAuth,
+        UserPublic,
+        UserRegistration,
+        api_key,
+        authentication,
+        authentication_type,
+        basic,
+        configure,
+        hmac,
+        install_default_authentication,
+        jwt_auth,
+        oidc,
+        opaque_bearer,
+        register_user,
+        session,
+        webhook,
+    )
+
+    authentication_module = importlib.import_module("lenapi.authentication")
+    social_auth_module = importlib.import_module("lenapi.auth")
+    assert SocialAuth is social_auth_module.SocialAuth
+    for exported_name in (
+        "UserPublic", "UserRegistration", "api_key", "authentication",
+        "authentication_type", "basic", "configure", "hmac",
+        "install_default_authentication", "jwt_auth", "oidc",
+        "opaque_bearer", "register_user", "session", "webhook",
+    ):
+        assert locals()[exported_name] is getattr(authentication_module, exported_name)
+
+
+def test_top_level_auth_imports_remain_compatible():
+    from lenapi import SocialAuth, authentication, hmac_auth
+    from lenapi.security import SocialAuth as SecuritySocialAuth
+    from lenapi.security import authentication as security_authentication
+    from lenapi.security import hmac_auth as security_hmac_auth
+
+    assert SocialAuth is SecuritySocialAuth
+    assert authentication is security_authentication
+    assert hmac_auth is security_hmac_auth
 
 
 class FakeWebSocket:
