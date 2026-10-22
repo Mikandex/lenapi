@@ -128,18 +128,30 @@ The service delegates Faker providers such as `name()`, `email()`, and `address(
 Install the optional HTTP client with `python -m pip install -e '.[ai]'`. Both clients are async, return the provider's JSON response, and support async context management so connections close cleanly:
 
 ```python
-from lenapi.service import OpenAI, Ollama
+import asyncio
+from lenapi import OpenAI, Ollama
 
-async with OpenAI(model="gpt-4.1-mini") as openai:
-    answer = await openai.responses("Explain LenApi in one sentence.")
+async def main():
+    async with OpenAI(
+        model="gpt-4.1-mini",
+        base_url="https://api.openai.com/v1",
+    ) as openai:
+        answer = await openai.responses("Explain LenApi in one sentence.")
+        print(answer.get("output_text", answer))
 
-async with Ollama(model="llama3.2") as ollama:
-    answer = await ollama.chat([
-        {"role": "user", "content": "Explain LenApi in one sentence."},
-    ])
+    async with Ollama(
+        model="llama3.2",
+        base_url="http://127.0.0.1:11434",
+    ) as ollama:
+        answer = await ollama.chat([
+            {"role": "user", "content": "Explain LenApi in one sentence."},
+        ])
+        print(answer["message"]["content"])
+
+asyncio.run(main())
 ```
 
-`OpenAI` reads `OPENAI_API_KEY` from the environment unless `api_key=` is passed directly. It supports the Responses API, chat completions, and embeddings. `Ollama` defaults to `http://127.0.0.1:11434` and supports chat, prompt generation, and embeddings; set `base_url=` to use another Ollama host. Ollama must be running and the requested model must be available there. These calls are non-streaming and raise HTTPX errors for unsuccessful provider responses. The OpenAI Responses API is the recommended starting point for new projects; chat completions are included for compatibility. ([OpenAI API](https://platform.openai.com/docs/api-reference/responses), [Ollama chat API](https://docs.ollama.com/api/chat), [Ollama generate API](https://docs.ollama.com/api/generate))
+`OpenAI` reads `OPENAI_API_KEY` from the environment unless `api_key=` is passed directly. Its `base_url` defaults to `https://api.openai.com/v1`; override it for an OpenAI-compatible endpoint. It supports the Responses API, chat completions, and embeddings. `Ollama` defaults to `http://127.0.0.1:11434`; set `base_url=` to use another Ollama host. Ollama must be running and the requested model must be available there. These calls are non-streaming and raise HTTPX errors for unsuccessful provider responses. The OpenAI Responses API is the recommended starting point for new projects; chat completions are included for compatibility. ([OpenAI API](https://platform.openai.com/docs/api-reference/responses), [Ollama chat API](https://docs.ollama.com/api/chat), [Ollama generate API](https://docs.ollama.com/api/generate))
 
 ## Payment provider plugins
 
