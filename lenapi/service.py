@@ -102,6 +102,15 @@ class WebSocket:
     async def send_json(self, data: Any) -> None:
         await self.send_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
+    async def send(self, data: Any) -> None:
+        """Send text, bytes, or a JSON-compatible value."""
+        if isinstance(data, bytes):
+            await self.send_bytes(data)
+        elif isinstance(data, str):
+            await self.send_text(data)
+        else:
+            await self.send_json(data)
+
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
         if self.closed:
             return
@@ -110,6 +119,10 @@ class WebSocket:
             message["reason"] = reason
         await self._send(message)
         self.closed = True
+
+    async def disconnect(self, code: int = 1000, reason: str | None = None) -> None:
+        """Close this connection; alias for :meth:`close`."""
+        await self.close(code=code, reason=reason)
 
     def _ensure_accepted(self) -> None:
         if not self.accepted or self.closed:
@@ -135,6 +148,10 @@ class WebSocketConnection:
     async def send_json(self, data: Any) -> None:
         await self.websocket.send_json(data)
 
+    async def send(self, data: Any) -> None:
+        """Send text, bytes, or a JSON-compatible value to this client."""
+        await self.websocket.send(data)
+
     async def broadcast_text(self, data: str) -> None:
         await self.service._broadcast(self.room, "text", data)
 
@@ -146,6 +163,9 @@ class WebSocketConnection:
 
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
         await self.websocket.close(code=code, reason=reason)
+
+    async def disconnect(self, code: int = 1000, reason: str | None = None) -> None:
+        await self.websocket.disconnect(code=code, reason=reason)
 
 
 class WebSocketService:
@@ -361,7 +381,50 @@ class WebSocketService:
             raise TypeError("Combined chat/video messages must be chat or WebRTC signaling events")
         return "json", payload
 
-    async def _broadcast(self, room: str, kind: str, payload: Any) -> None:
+    async def send(self, room_id: str, data: Any) -> int:
+        """Send data to all connected clients in a room; return delivered count."""
+        if not isinstance(room_id, str) or not room_id:
+            raise ValueError("room_id must be a non-empty string")
+        if self.type == "bytes":
+            if not isinstance(data, bytes):
+                raise TypeError("This WebSocket service accepts binary messages only")
+            kind, payload = "bytes", data
+            size = len(data)
+        elif self.type == "text_message":
+            if not isinstance(data, str):
+                raise TypeError("This WebSocket service accepts text messages only")
+            kind, payload = "text", data
+            size = len(data.encode("utf-8"))
+        else:
+            if self.type in {"chat", "video", "chat_video"} and not isinstance(data, dict):
+                raise TypeError("Chat and video messages must be JSON objects")
+            if self.type == "video" and data.get("type") not in {"offer", "answer", "candidate"}:
+                raise TypeError("Video messages must be WebRTC offer, answer, or candidate events")
+            if self.type == "chat_video" and data.get("type") not in {
+                "chat.message", "offer", "answer", "candidate"
+            }:
+                raise TypeError("Combined chat/video messages must be chat or WebRTC signaling events")
+            kind, payload = "json", data
+            size = len(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if size > self.max_message_size:
+            raise ValueError("WebSocket message is too large")
+        return await self._broadcast(room_id, kind, payload)
+
+    async def disconnect(
+        self, room_id: str, *, code: int = 1000, reason: str | None = None
+    ) -> int:
+        """Disconnect all clients in a room and return the number addressed."""
+        if not isinstance(room_id, str) or not room_id:
+            raise ValueError("room_id must be a non-empty string")
+        async with self._lock:
+            peers = list(self._rooms.get(room_id, ()))
+        await asyncio.gather(
+            *(peer.disconnect(code=code, reason=reason) for peer in peers),
+            return_exceptions=True,
+        )
+        return len(peers)
+
+    async def _broadcast(self, room: str, kind: str, payload: Any) -> int:
         async with self._lock:
             peers = list(self._rooms.get(room, ()))
         results = await asyncio.gather(
@@ -377,6 +440,7 @@ class WebSocketService:
                         room_peers.discard(peer)
                         if not room_peers:
                             self._rooms.pop(room, None)
+        return len(peers) - len(disconnected)
 
     @staticmethod
     async def _send_to_peer(peer: WebSocketConnection, kind: str, payload: Any) -> None:

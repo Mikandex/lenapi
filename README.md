@@ -91,12 +91,27 @@ Create an invite ID with a normal HTTP endpoint, then share the WebSocket path w
 
 ```python
 from uuid import uuid4
+from pydantic import BaseModel
+
+class ChatMessage(BaseModel):
+    type: str
+    text: str
 
 @app.post("/rooms")
 def create_room():
     room_id = uuid4().hex
     return {"room_id": room_id, "websocket_path": f"/ws/chat/{room_id}"}
+
+@app.post("/rooms/{room_id}/messages")
+async def publish_message(room_id: str, data: ChatMessage):
+    delivered = await chat.send(room_id, data.model_dump())
+    return {"room_id": room_id, "delivered": delivered}
 ```
+
+`WebSocketService.send(room_id, data)` sends to all clients currently connected
+to that room and returns the delivery count. `WebSocketService.disconnect(room_id)`
+closes every connection in the room. A POST route can call these methods, but
+WebSocket `accept()` still belongs inside the WebSocket handshake handler.
 
 Use the optional Faker service to generate realistic sample data. From the lenApi repository root, install it with `python -m pip install -e '.[faker]'`:
 
