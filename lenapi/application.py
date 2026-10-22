@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .request import Request
+from .request import Request, reset_current_request, set_current_request
 from .response import HTTPException, JSONResponse, Response
 from .dependencies import Depends
 from .openapi import build_openapi, swagger_html
@@ -78,6 +78,10 @@ class Route:
 
     def match(self, path: str) -> dict[str, str] | None:
         match = self.regex.match(path)
+        if match is None and path != "/" and path.endswith("/"):
+            # Route declarations normalize trailing slashes, but accept the
+            # trailing-slash form too (for example, OAuth redirect URIs).
+            match = self.regex.match(path[:-1])
         return None if match is None else dict(zip(self.parameter_names, match.groups()))
 
 
@@ -390,6 +394,7 @@ class Application(Router):
             async_session = None
             session_token = None
             async_session_token = None
+            request_token = set_current_request(request)
             try:
                 if self.session_factory is not None:
                     session = self.session_factory()
@@ -450,6 +455,7 @@ class Application(Router):
             except (TypeError, ValueError, KeyError):
                 response = JSONResponse({"error": "Invalid request"}, status_code=422)
             finally:
+                reset_current_request(request_token)
                 if session_token is not None:
                     reset_current_session(session_token)
                 if async_session_token is not None:
@@ -732,13 +738,21 @@ class Application(Router):
                     resolving.remove(dependency)
                 values[name] = cache[dependency]
                 continue
-            if name == "request" and annotation in (Request, inspect.Parameter.empty):
+            if name == "request" and (
+                annotation in (Request, inspect.Parameter.empty)
+                or (isinstance(annotation, str) and annotation.rsplit(".", 1)[-1] == "Request")
+            ):
                 values[name] = request
                 continue
             if annotation is BackgroundTasks:
                 values[name] = request.background_tasks
                 continue
-            if session is not None and annotation.__module__.startswith("sqlalchemy") and annotation.__name__ == "Session":
+            if (
+                session is not None
+                and isinstance(annotation, type)
+                and annotation.__module__.startswith("sqlalchemy")
+                and annotation.__name__ == "Session"
+            ):
                 values[name] = session
                 continue
             if async_session is not None and (

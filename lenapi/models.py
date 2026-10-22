@@ -2,9 +2,10 @@
 
 from typing import Any
 from contextvars import ContextVar
+import math
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, Numeric, String, Table, Text, Uuid, and_, delete, func, inspect, or_, select
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, Numeric, String, Table, Text, Uuid, UniqueConstraint, and_, delete, func, inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, mapped_column, relationship
 
@@ -91,12 +92,29 @@ def _async_session(session=None):
     return session
 
 
-class _QueryResults(list):
-    """List of model rows with bulk delete support."""
-
-    def __init__(self, model, rows):
+class _ResultList(list):
+    """List of model query results with optional pagination metadata."""
+    def __init__(self, model, rows, *, pagination=None):
         super().__init__(rows)
         self.model = model
+        self.pagination = pagination
+
+    @property
+    def total_count(self):
+        return None if self.pagination is None else self.pagination["total_count"]
+
+    @property
+    def page_count(self):
+        return None if self.pagination is None else self.pagination["page_count"]
+
+    @property
+    def total_pages(self):
+        """Alias for page_count, provided for clarity in API responses."""
+        return self.page_count
+
+
+class _QueryResults(_ResultList):
+    """Synchronous list of model rows with bulk delete support."""
 
     def delete(self) -> int:
         session = _session()
@@ -106,6 +124,10 @@ class _QueryResults(list):
             session.delete(row)
         session.commit()
         return len(self)
+
+
+class _AsyncQueryResults(_ResultList):
+    """Async query results; deletion must go through the async queryset."""
 
 
 class _QuerySet:
@@ -259,17 +281,42 @@ class _QuerySet:
         """Count rows matching this query."""
         return self.aggregate(count=Count(field))["count"]
 
+    def _pagination_metadata(self, total_count):
+        limit = self._limit
+        offset = self._offset
+        page_count = math.ceil(total_count / limit) if limit else None
+        page = (offset // limit) + 1 if limit else None
+        has_next = bool(limit and offset + limit < total_count)
+        has_previous = offset > 0
+        return {
+            "total_count": total_count,
+            "page_count": page_count,
+            "total_pages": page_count,
+            "page": page,
+            "limit": limit,
+            "offset": offset,
+            "has_next": has_next,
+            "has_previous": has_previous,
+            "next_offset": offset + limit if has_next else None,
+            "previous_offset": max(0, offset - limit) if has_previous and limit else None,
+        }
+
     def all(self, *, limit=None, offset=None):
         if limit is not None:
             self.limit(limit)
         if offset is not None:
             self.offset(offset)
         result = _session().execute(self._statement())
+        pagination = None
+        if self._limit is not None or self._offset:
+            pagination = self._pagination_metadata(self.count())
         if not self.columns:
-            return _QueryResults(self.model, result.scalars().all())
+            return _QueryResults(self.model, result.scalars().all(), pagination=pagination)
         if len(self.columns) == 1:
-            return _QueryResults(self.model, result.scalars().all())
-        return _QueryResults(self.model, [dict(row._mapping) for row in result])
+            return _QueryResults(self.model, result.scalars().all(), pagination=pagination)
+        return _QueryResults(
+            self.model, [dict(row._mapping) for row in result], pagination=pagination
+        )
 
     def first(self):
         result = _session().execute(self._statement())
@@ -369,9 +416,14 @@ class _AsyncQuerySet(_QuerySet):
         if offset is not None:
             self.offset(offset)
         result = await _async_session(session).execute(self._statement())
+        pagination = None
+        if self._limit is not None or self._offset:
+            pagination = self._pagination_metadata(await self.count(session=session))
         if not self.columns or len(self.columns) == 1:
-            return result.scalars().all()
-        return [dict(row._mapping) for row in result]
+            return _AsyncQueryResults(self.model, result.scalars().all(), pagination=pagination)
+        return _AsyncQueryResults(
+            self.model, [dict(row._mapping) for row in result], pagination=pagination
+        )
 
     async def aggregate(self, *, group_by=None, session=None, **aggregates):
         result = await _async_session(session).execute(self._aggregate_statement(group_by, aggregates))
@@ -1038,6 +1090,19 @@ SECURITY_STORE_TABLE = Table(
     Column("key", String(64), primary_key=True),
     Column("value", Text, nullable=True),
     Column("expires_at", Float, nullable=True),
+)
+
+# Maps stable external provider subjects to framework users for SocialAuth.
+# This table is framework-owned and included in normal migrations.
+SOCIAL_ACCOUNT_TABLE = Table(
+    "lenapi_social_accounts",
+    Model.metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("provider", String(32), nullable=False),
+    Column("subject", String(255), nullable=False),
+    Column("user_id", ForeignKey("user.id", ondelete="CASCADE"), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    UniqueConstraint("provider", "subject", name="uq_lenapi_social_provider_subject"),
 )
 
 # Persistent background jobs are filtered from ordinary migrations. The

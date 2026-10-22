@@ -1,6 +1,7 @@
 """Convenient access to an incoming ASGI request."""
 
 import asyncio
+from contextvars import ContextVar, Token
 import json
 from email import policy
 from email.parser import BytesParser
@@ -11,6 +12,26 @@ import uuid
 from urllib.parse import parse_qs
 
 from .response import HTTPException
+
+
+_current_request: ContextVar["Request | None"] = ContextVar("lenapi_current_request", default=None)
+
+
+def set_current_request(request: "Request") -> Token:
+    """Make the active request available to framework-managed callbacks."""
+    return _current_request.set(request)
+
+
+def reset_current_request(token: Token) -> None:
+    _current_request.reset(token)
+
+
+def get_current_request() -> "Request":
+    """Return the active request inside a dispatched route."""
+    request = _current_request.get()
+    if request is None:
+        raise RuntimeError("There is no active LenApi request in this context")
+    return request
 
 
 class UploadFile:

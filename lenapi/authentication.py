@@ -28,7 +28,6 @@ class UserRegistration(BaseModel):
     """Default request schema for registering a project user."""
 
     username: str = Field(min_length=1, max_length=120)
-    email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=254)
     first_name: str = Field(default="", max_length=150)
     last_name: str = Field(default="", max_length=150)
     password: str = Field(min_length=8, max_length=128)
@@ -48,7 +47,6 @@ class UserPublic(BaseModel):
 
     id: int
     username: str
-    email: str | None
     first_name: str
     last_name: str
     api_key: str | None = None
@@ -227,28 +225,37 @@ def install_default_authentication(app, settings):
 
 
 def register_user(user_model=None, data=None, *, authentication="jwt"):
-    """Create a user, hash its password, and return a one-time API key if used."""
+    """Create a user, hash its password, and return a one-time API key if used.
+
+    Apps may define a custom registration schema with an ``email`` field. When
+    provided, that value is passed through to models that expose an email column.
+    """
     if user_model is None:
         from .models import User
 
         user_model = User
     raw_key = make_api_key() if authentication == "api_key" else None
-    user = user_model.create(
+    values = dict(
         username=data.username,
-        email=data.email,
         first_name=data.first_name,
         last_name=data.last_name,
         password=make_password(data.password),
         api_key=hash_api_key(raw_key) if raw_key is not None else None,
     )
-    return {
+    email = getattr(data, "email", None)
+    if email is not None and "email" in user_model.__table__.columns:
+        values["email"] = email
+    user = user_model.create(**values)
+    result = {
         "id": user.id,
         "username": user.username,
-        "email": user.email,
         "first_name": user.first_name,
         "last_name": user.last_name,
         "api_key": raw_key,
     }
+    if email is not None and "email" in user_model.__table__.columns:
+        result["email"] = user.email
+    return result
 
 
 __all__ = [

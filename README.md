@@ -477,7 +477,33 @@ def federated_private(identity=Depends(provider_token)):
     return {"identity": identity}
 ```
 
-`SECURITY_STORAGE` selects the shared store used by IP flags, sessions, opaque bearer tokens, and HMAC nonce replay checks. The store exposes async `get(key)`, `set(key, value, ttl=...)`, `delete(key)`, and atomic `claim(key, ttl)` methods. For a login flow, create a random session ID, store the JSON-serialized identity as `await app.security_store.set(f"session:{session_id}", json.dumps(identity), ttl=3600)`, and set it in a cookie with `Response.set_cookie(..., httponly=True, secure=True, samesite="lax")`. Opaque bearer tokens can be stored similarly under `opaque_bearer:{token}`. `oidc_token_lookup(token)` must validate the provider's issuer, audience, signature, and expiry using its supported OIDC library. lenApi supplies the dependency helpers; the app owns the login/callback and credential lifecycle. These extra dependencies can be combined with the primary auth dependency when a route requires both.
+`SECURITY_STORAGE` selects the shared store used by IP flags, sessions, opaque bearer tokens, and HMAC nonce replay checks. The store exposes async `get(key)`, `set(key, value, ttl=...)`, `delete(key)`, and atomic `claim(key, ttl)` methods. For a custom login flow, create a random session ID, store the JSON-serialized identity as `await app.security_store.set(f"session:{session_id}", json.dumps(identity), ttl=3600)`, and set it in a cookie with `Response.set_cookie(..., httponly=True, secure=True, samesite="lax")`. Opaque bearer tokens can be stored similarly under `opaque_bearer:{token}`. `oidc_token_lookup(token)` must validate the provider's issuer, audience, signature, and expiry using its supported OIDC library.
+
+## Social login
+
+`SocialAuth` generates provider login and callback routes for Google, GitHub, and LinkedIn. Configure each provider's client ID, client secret, and exact callback URI in the generated `settings.py` (or load them from environment variables). The generated settings leave credentials blank. Register each callback URI with the matching provider.
+
+```python
+from lenapi import LENAPI
+from lenapi.auth import SocialAuth
+
+auth = SocialAuth(
+    providers=["google", "github", "linkedin"],
+    auto_register=True,
+    jwt_enabled=True,
+)
+
+app = LENAPI()
+app.include_router(auth.router(), prefix="/auth")
+```
+
+This mounts routes such as `/auth/google/login` and `/auth/google/callback` only on the app that includes the router. The callback exchanges the provider code, validates the OAuth state (and PKCE where supported), fetches the provider profile, and returns a LenApi bearer token when `jwt_enabled=True`. It does not return the provider's access token.
+
+With `auto_register=True`, LenApi creates a framework `User` (or an `app.models.User` subclass) on the first successful provider login and stores the provider subject mapping in the framework-managed `lenapi_social_accounts` table. Run `python lenora.py migration` and `python lenora.py migrate` before first use. Only verified provider emails are copied to the local user. If a verified email is already attached to a different account, sign-in returns `409`; LenApi will not silently link accounts by email.
+
+The scaffold includes blank settings for `GOOGLE_*`, `GITHUB_*`, and `LINKEDIN_*` client ID, client secret, redirect URI, and cookie security values. Keep client secrets in environment variables or a local ignored `.env` file.
+
+Use `SocialAuth` for the built-in Google, GitHub, and LinkedIn authorization-code flows; retain a custom flow when your provider or account-linking rules need different behavior.
 
 For HMAC, configure `HMAC_SECRET` with at least 32 bytes, then clients can generate the header signature with `hmac_request_signature(secret, method, path, timestamp, body, nonce=nonce)` and send it with `X-LenAPI-Timestamp`, `X-LenAPI-Nonce`, and `X-LenAPI-Signature`. Signatures older than the configured tolerance and repeated nonces are rejected. The replay cache is process-local; multi-worker deployments should replace it with a shared nonce store.
 
@@ -543,7 +569,7 @@ Safe methods do not require the header; state-changing methods do. `SameSite` is
 
 `API_KEY` is generated uniquely for each new project. The scaffold's Basic/JWT credential callback looks up `User` in the database and verifies its hashed `password`. Use `make_password(password)` to hash a password and `check_password(password, stored_password)` to verify it; the latter returns a boolean. Never store plaintext passwords. The older `hash_password()` and `verify_password()` names remain available as aliases. Use HTTPS for Basic credentials and bearer/API key requests outside local development.
 
-The framework provides `lenapi.User` with `username`, `email`, `first_name`, `last_name`, `password`, and `api_key` fields. When a trusted provisioning flow creates a user directly, store the password hash:
+The framework provides `lenapi.User` with `username`, nullable `email`, `first_name`, `last_name`, `password`, and `api_key` fields. The default `UserRegistration` request asks for `username`, `first_name`, `last_name`, `password`, and `confirm_password`; email is not required or included in the default registration response. Apps that want to collect email can define a custom registration schema and pass its email value through `register_user()`. When a trusted provisioning flow creates a user directly, store the password hash:
 
 ```python
 from lenapi import User, make_password
@@ -858,7 +884,21 @@ Delete a unique matching record with `Student.get(person_name="Ifeanyi").delete(
 
 `Student.get.all()` and `Student.filter(...).all()` return list-like collections. Collections support `.delete()` for their loaded rows, but not `.save()`; save an individual instance after changing it. Only `Student.all().delete()` drops the table.
 
-Paginate list queries with `.all(limit=..., offset=...)`, or chain `.limit(...).offset(...).all()`. `Student.get.all(limit=20, offset=40)` paginates model manager results, and `Student.all(limit=20, offset=40).all()` paginates a full-table query. Limits and offsets must be non-negative integers.
+Paginate list queries with `.all(limit=..., offset=...)`, or chain `.limit(...).offset(...).all()`. The returned list remains usable as before and now carries a `.pagination` dictionary plus `.total_count`, `.page_count`, and `.total_pages` properties. Metadata includes the total matching rows, current page, page count, limit, offset, and next/previous-page information. `Student.get.all(limit=20, offset=40)` and `Student.all(limit=20, offset=40).all()` support the same metadata. Limits and offsets must be non-negative integers.
+
+```python
+page = Student.filter(course="Python").all(limit=20, offset=40)
+students = list(page)
+page_count = page.page_count
+total_students = page.total_count
+
+# Include pagination metadata in an API response. Use your response schema to
+# validate/serialize each model instance before returning it from a route.
+return {
+    "results": [StudentOutput.model_validate(row).model_dump(mode="json") for row in page],
+    "pagination": page.pagination,
+}
+```
 
 Update a record by assigning fields on a unique lookup result and saving it:
 

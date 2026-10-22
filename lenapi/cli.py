@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
 from .logging import logger
 
 
@@ -27,6 +28,7 @@ PROJECT_FILES = {
 
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 API_TITLE = "lenApp"
@@ -59,6 +61,20 @@ MEDIA_URL = "/media/"
 AUTHENTICATION = "jwt"
 BASIC_AUTH_FIELD = "username"  # Basic login field on User: username, email, phone, etc.
 API_KEY = "__LENAPI_GENERATED_API_KEY__"
+# Optional Google OpenID Connect settings. Leave blank to disable Google login.
+# Developers may set values here or load them from their preferred env manager.
+GOOGLE_CLIENT_ID = ""
+GOOGLE_CLIENT_SECRET = ""
+GOOGLE_REDIRECT_URI = ""
+GOOGLE_COOKIE_SECURE = urlparse(GOOGLE_REDIRECT_URI).scheme == "https"
+GITHUB_CLIENT_ID = ""
+GITHUB_CLIENT_SECRET = ""
+GITHUB_REDIRECT_URI = ""
+GITHUB_COOKIE_SECURE = urlparse(GITHUB_REDIRECT_URI).scheme == "https"
+LINKEDIN_CLIENT_ID = ""
+LINKEDIN_CLIENT_SECRET = ""
+LINKEDIN_REDIRECT_URI = ""
+LINKEDIN_COOKIE_SECURE = urlparse(LINKEDIN_REDIRECT_URI).scheme == "https"
 # Keep this generated key private. Rotate it to invalidate existing tokens.
 SECRET_KEY = "__LENAPI_GENERATED_SECRET_KEY__"
 TOKEN = {
