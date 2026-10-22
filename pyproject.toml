@@ -8,7 +8,7 @@ version = "0.1.1"
 description = "A small, typed ASGI web framework"
 authors = [
     {name = "Ifeanyi M. Onovo", email = "ifeanyi@maekandex.com.ng"},
-    {company_name = "Maekandex Communication Limitation"},
+    {name = "Maekandex Communication Limitation"},
 ]
 readme = "README.md"
 requires-python = ">=3.10"

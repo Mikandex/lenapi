@@ -198,6 +198,7 @@ class WebSocketService:
         allowed_origins: list[str] | tuple[str, ...] | None = None,
         max_message_size: int = 64_000,
         max_connections: int | None = None,
+        max_total_connections: int | None = 100,
         heartbeat_seconds: float | None = 30,
     ) -> None:
         if not isinstance(path, str) or not path.startswith("/"):
@@ -216,6 +217,12 @@ class WebSocketService:
             or max_connections <= 0
         ):
             raise ValueError("max_connections must be a positive integer or None")
+        if max_total_connections is not None and (
+            isinstance(max_total_connections, bool)
+            or not isinstance(max_total_connections, int)
+            or max_total_connections <= 0
+        ):
+            raise ValueError("max_total_connections must be a positive integer or None")
         if heartbeat_seconds is not None and (
             isinstance(heartbeat_seconds, bool)
             or not isinstance(heartbeat_seconds, (int, float))
@@ -236,6 +243,7 @@ class WebSocketService:
         self.allowed_origins = origins
         self.max_message_size = max_message_size
         self.max_connections = max_connections
+        self.max_total_connections = max_total_connections
         self.heartbeat_seconds = float(heartbeat_seconds) if heartbeat_seconds is not None else None
         self._rooms: dict[str, set[WebSocketConnection]] = {}
         self._lock = asyncio.Lock()
@@ -273,8 +281,8 @@ class WebSocketService:
 
     async def _handle_connection(self, websocket: WebSocket) -> None:
         origin = websocket.headers.get("origin")
-        if self.allowed_origins is not None and origin is not None:
-            if "*" not in self.allowed_origins and origin not in self.allowed_origins:
+        if self.allowed_origins is not None:
+            if origin is None or ("*" not in self.allowed_origins and origin not in self.allowed_origins):
                 await websocket.close(code=4403, reason="WebSocket origin is not allowed")
                 return
         try:
@@ -285,23 +293,31 @@ class WebSocketService:
             return
 
         room = self._room_name(websocket)
-        await websocket.accept()
         connection = WebSocketConnection(self, websocket, room, identity)
         async with self._lock:
-            peers = self._rooms.setdefault(room, set())
+            active_connections = sum(len(peers) for peers in self._rooms.values())
+            peers = self._rooms.get(room, set())
             connection_limit = self.max_connections
             if connection_limit is None and self.type in {"video", "chat_video"}:
                 connection_limit = 2
-            if connection_limit is not None and len(peers) >= connection_limit:
+            if self.max_total_connections is not None and active_connections >= self.max_total_connections:
                 room_full = True
                 existing_peers = []
+                close_reason = "WebSocket connection limit reached"
+                close_code = 1013
+            elif connection_limit is not None and len(peers) >= connection_limit:
+                room_full = True
+                existing_peers = []
+                close_reason = "Call room is full"
+                close_code = 1008
             else:
                 room_full = False
                 existing_peers = list(peers)
+                await websocket.accept()
+                peers = self._rooms.setdefault(room, peers)
                 peers.add(connection)
         if room_full:
-            await websocket.send_json({"type": "error", "message": "This call room is full."})
-            await websocket.close(code=1008, reason="Call room is full")
+            await websocket.close(code=close_code, reason=close_reason)
             return
         if self.type in {"video", "chat_video"}:
             if existing_peers:

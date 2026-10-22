@@ -212,7 +212,9 @@ class Application(Router):
                  tag_name: str | None = None, auth: Any = None,
                  safe_guard_docs_url: bool = False,
                  docs_session_lifetime_seconds: int = 3600,
-                 docs_cookie_secure: bool | None = None) -> None:
+                 docs_cookie_secure: bool | None = None,
+                 docs_login_max_attempts: int = 5,
+                 docs_login_window_seconds: int = 300) -> None:
         if session_factory is not None and database is not None:
             raise ValueError("Pass either session_factory or database, not both")
         if max_request_body_size is not None and (
@@ -225,6 +227,10 @@ class Application(Router):
             or request_body_timeout <= 0
         ):
             raise ValueError("request_body_timeout must be a positive number or None")
+        for name, value in (("docs_login_max_attempts", docs_login_max_attempts),
+                            ("docs_login_window_seconds", docs_login_window_seconds)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         super().__init__(tag_name=tag_name, auth=auth)
         self.database = None if database is False else database if database is not None else (
             None if session_factory is not None or async_database is not None else Database()
@@ -246,6 +252,10 @@ class Application(Router):
         }
         self.docs_session_lifetime_seconds = docs_session_lifetime_seconds
         self.docs_cookie_secure = docs_cookie_secure
+        self.docs_login_max_attempts = docs_login_max_attempts
+        self.docs_login_window_seconds = docs_login_window_seconds
+        self._docs_login_attempts: dict[str, tuple[float, int]] = {}
+        self._docs_login_lock = threading.Lock()
         if self.safe_guard_docs_url and self.docs_url is None:
             raise ValueError("SAFE_GUARD_DOCS_URL requires DOCS_URL to be enabled")
         self.docs_guard = (
@@ -540,6 +550,13 @@ class Application(Router):
                 submitted_csrf, cookie_csrf
             ):
                 return JSONResponse({"detail": "Invalid login request; reload the page and try again."}, status_code=403)
+            retry_after = self._claim_docs_login(request.client_ip or "unknown")
+            if retry_after:
+                return JSONResponse(
+                    {"detail": "Too many login attempts. Try again later."},
+                    status_code=429,
+                    headers={"retry-after": str(retry_after)},
+                )
             username = form.get("username", "")
             password = form.get("password", "")
             if not isinstance(username, str) or not isinstance(password, str):
@@ -557,6 +574,7 @@ class Application(Router):
                     httponly=False, samesite="strict",
                 )
                 return response
+            self._clear_docs_login_attempts(request.client_ip or "unknown")
             session_id = await self.docs_guard.create_session(identity["id"])
             response = Response(b"", status_code=303, headers={"location": self.docs_url or "/"})
             response.set_cookie(
@@ -583,6 +601,35 @@ class Application(Router):
             response.delete_cookie("lenapi_docs_csrf", path="/")
             return response
         return None
+
+    def _claim_docs_login(self, client_ip: str) -> int:
+        """Bound docs-login password guesses per client IP in this worker."""
+        now = time.monotonic()
+        with self._docs_login_lock:
+            if len(self._docs_login_attempts) >= 4096:
+                self._docs_login_attempts = {
+                    key: value for key, value in self._docs_login_attempts.items()
+                    if now - value[0] < self.docs_login_window_seconds
+                }
+            record = self._docs_login_attempts.get(client_ip)
+            if record is not None:
+                started, attempts = record
+                elapsed = now - started
+                if elapsed >= self.docs_login_window_seconds:
+                    record = None
+                elif attempts >= self.docs_login_max_attempts:
+                    return max(1, math.ceil(self.docs_login_window_seconds - elapsed))
+            if record is None:
+                if len(self._docs_login_attempts) >= 4096 and client_ip not in self._docs_login_attempts:
+                    return self.docs_login_window_seconds
+                self._docs_login_attempts[client_ip] = (now, 1)
+            else:
+                self._docs_login_attempts[client_ip] = (record[0], record[1] + 1)
+        return 0
+
+    def _clear_docs_login_attempts(self, client_ip: str) -> None:
+        with self._docs_login_lock:
+            self._docs_login_attempts.pop(client_ip, None)
 
     async def _has_docs_admin(self) -> bool:
         return await self.docs_guard.has_admin()
@@ -804,7 +851,9 @@ class LENAPI(Application):
                  tag_name: str | None = None, auth: Any = None,
                  safe_guard_docs_url: bool | None = None,
                  docs_session_lifetime_seconds: int | None = None,
-                 docs_cookie_secure: bool | None = None) -> None:
+                 docs_cookie_secure: bool | None = None,
+                 docs_login_max_attempts: int | None = None,
+                 docs_login_window_seconds: int | None = None) -> None:
         # Project settings are optional, so importing lenapi outside a project
         # continues to work with the framework defaults.
         try:
@@ -909,6 +958,10 @@ class LENAPI(Application):
                                            getattr(project_settings, "DOCS_SESSION_LIFETIME_SECONDS", 3600)),
             docs_cookie_secure=(docs_cookie_secure if docs_cookie_secure is not None else
                                 getattr(project_settings, "DOCS_COOKIE_SECURE", None)),
+            docs_login_max_attempts=(docs_login_max_attempts if docs_login_max_attempts is not None else
+                                     getattr(project_settings, "DOCS_LOGIN_MAX_ATTEMPTS", 5)),
+            docs_login_window_seconds=(docs_login_window_seconds if docs_login_window_seconds is not None else
+                                       getattr(project_settings, "DOCS_LOGIN_WINDOW_SECONDS", 300)),
         )
         if project_settings is not None:
             from .authentication import install_default_authentication
