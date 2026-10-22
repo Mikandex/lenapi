@@ -67,7 +67,7 @@ async def room_socket(websocket: WebSocket, room_id: int):
 
 `WebSocket` supports text, bytes, and JSON messages, explicit acceptance, and close codes. WebSocket paths can also be registered on a `Router` and mounted with `include_router()` or `add_router()`.
 
-For a ready-made room relay, use `WebSocketService`. Chat, video, and combined chat/video use JSON message objects; video modes relay WebRTC `offer`, `answer`, and `candidate` messages, while audio/video media stays peer-to-peer through WebRTC. `text_message` and `bytes` relay those payload types directly. Rooms can be selected with a `{room_id}` path parameter or `?room=...` query parameter.
+For a ready-made room relay, use `WebSocketService`. The primary types are `chat`, `video`, `json`, `message`, and `byte`; `chat_video` is also available for combined chat and video signaling. Chat/video use JSON message objects, video relays WebRTC `offer`, `answer`, and `candidate` messages, `json` accepts JSON values, `message` relays text, and `byte` relays binary data. Rooms can be selected with a `{room_id}` path parameter or `?room=...` query parameter. The `json`, `message`, and `byte` types can use fixed paths without a room ID.
 
 ```python
 from lenapi import LENAPI, WebSocketService
@@ -75,7 +75,7 @@ from lenapi import LENAPI, WebSocketService
 app = LENAPI()
 chat = WebSocketService(
     path="/ws/chat/{room_id}",
-    type="chat",  # also "video", "json", "chat_video", "text_message", or "bytes"
+    type="chat",  # "video", "json", "message", or "byte"
     auth=authenticate,
     allowed_origins=["https://myapp.com"],
     max_message_size=64_000,

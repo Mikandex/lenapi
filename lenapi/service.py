@@ -180,8 +180,14 @@ class WebSocketService:
     """
 
     _TYPES = {"chat", "video", "chat_video", "text_message", "json_message", "bytes"}
-    _ALIASES = {"chat&video": "chat_video", "text": "text_message", "json": "json_message",
-                "byte": "bytes", "binary": "bytes"}
+    _ALIASES = {
+        "chat&video": "chat_video",
+        "text": "text_message",
+        "message": "text_message",
+        "json": "json_message",
+        "byte": "bytes",
+        "binary": "bytes",
+    }
 
     def __init__(
         self,
@@ -200,7 +206,7 @@ class WebSocketService:
             raise ValueError("type must be a non-empty string")
         message_type = self._ALIASES.get(type.strip().lower(), type.strip().lower())
         if message_type not in self._TYPES:
-            choices = ", ".join(sorted(self._TYPES))
+            choices = "chat, video, json, message, byte (also chat_video)"
             raise ValueError(f"Unsupported WebSocket type '{type}'. Choose from: {choices}")
         if isinstance(max_message_size, bool) or not isinstance(max_message_size, int) or max_message_size <= 0:
             raise ValueError("max_message_size must be a positive integer")
