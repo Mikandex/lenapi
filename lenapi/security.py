@@ -3,7 +3,7 @@
 import base64
 import binascii
 import hashlib
-import hmac
+import hmac as _hmac
 import inspect
 import json
 import re
@@ -59,7 +59,7 @@ def verify_password(password: str, encoded_password: str) -> bool:
             if len(salt) != 16 or len(expected) != 64:
                 return False
             actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=64)
-            return hmac.compare_digest(actual, expected)
+            return _hmac.compare_digest(actual, expected)
         algorithm, iterations_text, salt, expected = encoded_password.split("$", 3)
         iterations = int(iterations_text)
         if algorithm != "pbkdf2_sha256" or not 1 <= iterations <= 5_000_000:
@@ -70,7 +70,7 @@ def verify_password(password: str, encoded_password: str) -> bool:
             "sha256", password.encode("utf-8"), salt.encode("ascii"), iterations
         )
         actual_encoded = base64.b64encode(actual).decode("ascii").strip()
-        return hmac.compare_digest(actual_encoded, expected)
+        return _hmac.compare_digest(actual_encoded, expected)
     except (ValueError, TypeError, UnicodeEncodeError):
         return False
 
@@ -176,7 +176,7 @@ class JWTAuth:
         head = _encode_segment(json.dumps(header, separators=(",", ":")).encode("utf-8"))
         body = _encode_segment(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         signing_input = f"{head}.{body}".encode("ascii")
-        signature = hmac.new(self.secret_key, signing_input, hashlib.sha256).digest()
+        signature = _hmac.new(self.secret_key, signing_input, hashlib.sha256).digest()
         return f"{head}.{body}.{_encode_segment(signature)}"
 
     def refresh_access_token(self, refresh_token: str) -> str:
@@ -253,8 +253,8 @@ class JWTAuth:
             if not isinstance(payload, dict):
                 raise ValueError("Token payload must be an object")
             signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
-            expected = hmac.new(self.secret_key, signing_input, hashlib.sha256).digest()
-            if not hmac.compare_digest(signature, expected):
+            expected = _hmac.new(self.secret_key, signing_input, hashlib.sha256).digest()
+            if not _hmac.compare_digest(signature, expected):
                 raise ValueError("Invalid token signature")
             expiration = payload.get("exp")
             if isinstance(expiration, bool) or not isinstance(expiration, (int, float)):
@@ -322,7 +322,7 @@ class APIKeyAuth:
                 identity = await identity
             if identity is not None and identity is not False:
                 return identity
-        elif supplied and hmac.compare_digest(supplied.encode("utf-8"), self.api_key):
+        elif supplied and _hmac.compare_digest(supplied.encode("utf-8"), self.api_key):
             return {"auth_method": "api_key"}
         raise HTTPException(401, "Invalid or missing API key", headers={"WWW-Authenticate": "ApiKey"})
 
@@ -462,8 +462,8 @@ class WebhookAuth:
             if abs(time.time() - event_time) > self.tolerance_seconds:
                 raise HTTPException(401, "Webhook signature has expired")
             signed_content = timestamp.encode("ascii") + b"." + body
-        expected = hmac.new(self.secret, signed_content, hashlib.sha256).hexdigest()
-        if not signature or not hmac.compare_digest(signature, expected):
+        expected = _hmac.new(self.secret, signed_content, hashlib.sha256).hexdigest()
+        if not signature or not _hmac.compare_digest(signature, expected):
             raise HTTPException(401, "Invalid webhook signature")
 
         event_id = headers.get(self.event_id_header, "") if self.event_id_header else ""
@@ -524,7 +524,7 @@ class CSRFProtect:
 
     def generate_token(self) -> str:
         nonce = secrets.token_urlsafe(32)
-        signature = hmac.new(self.secret, nonce.encode("ascii"), hashlib.sha256).hexdigest()
+        signature = _hmac.new(self.secret, nonce.encode("ascii"), hashlib.sha256).hexdigest()
         return f"{nonce}.{signature}"
 
     def set_cookie(self, response: Response, *, max_age: int = 3600) -> str:
@@ -549,10 +549,10 @@ class CSRFProtect:
         nonce, separator, supplied_signature = cookie_token.rpartition(".")
         if not separator or not nonce or not header_token:
             raise HTTPException(403, "CSRF token required")
-        expected_signature = hmac.new(self.secret, nonce.encode("ascii"), hashlib.sha256).hexdigest()
+        expected_signature = _hmac.new(self.secret, nonce.encode("ascii"), hashlib.sha256).hexdigest()
         if (
-            not hmac.compare_digest(cookie_token, header_token)
-            or not hmac.compare_digest(supplied_signature, expected_signature)
+            not _hmac.compare_digest(cookie_token, header_token)
+            or not _hmac.compare_digest(supplied_signature, expected_signature)
         ):
             raise HTTPException(403, "Invalid CSRF token")
         return True
@@ -565,7 +565,7 @@ def hmac_request_signature(
     key = secret.encode("utf-8") if isinstance(secret, str) else secret
     body_digest = hashlib.sha256(body).hexdigest()
     message = f"{timestamp}\n{method.upper()}\n{path}\n{body_digest}\n{nonce}".encode("utf-8")
-    return hmac.new(key, message, hashlib.sha256).hexdigest()
+    return _hmac.new(key, message, hashlib.sha256).hexdigest()
 
 
 class HMACAuth:
@@ -599,7 +599,7 @@ class HMACAuth:
         query = request.scope.get("query_string", b"").decode("latin-1")
         path = request.path + (f"?{query}" if query else "")
         expected = hmac_request_signature(self.secret, request.method, path, timestamp, body, nonce=nonce)
-        if not hmac.compare_digest(supplied, expected):
+        if not _hmac.compare_digest(supplied, expected):
             raise HTTPException(401, "Invalid signed request", headers={"WWW-Authenticate": "HMAC"})
         if self.nonce_store is not None:
             used = self.nonce_store.claim(f"hmac_nonce:{nonce}", self.tolerance_seconds)
@@ -669,3 +669,51 @@ def create_authenticator(
             raise ValueError("oidc authentication requires oidc_token_lookup")
         return OIDCAuth(lookup)
     raise ValueError("Unknown AUTHENTICATION mode")
+
+
+# Authentication's public API is gathered here so applications can discover
+# every auth mechanism through ``lenapi.security``.  The higher-level factories
+# and social login implementation live in focused modules; load them lazily to
+# avoid a circular import (those modules use the primitives above).
+_AUTHENTICATION_EXPORTS = {
+    "UserRegistration",
+    "UserPublic",
+    "basic",
+    "api_key",
+    "jwt_auth",
+    "session",
+    "opaque_bearer",
+    "hmac",
+    "oidc",
+    "webhook",
+    "configure",
+    "authentication_type",
+    "authentication",
+    "install_default_authentication",
+    "register_user",
+}
+_SOCIAL_AUTH_EXPORTS = {"SocialAuth"}
+
+
+def __getattr__(name: str):
+    """Lazily expose all authentication APIs from this module."""
+    if name in _AUTHENTICATION_EXPORTS:
+        from importlib import import_module
+
+        return getattr(import_module(".authentication", __package__), name)
+    if name in _SOCIAL_AUTH_EXPORTS:
+        from importlib import import_module
+
+        return getattr(import_module(".auth", __package__), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "JWTAuth", "APIKeyAuth", "BasicAuth", "CSRFProtect", "SessionAuth",
+    "OpaqueBearerAuth", "HMACAuth", "OIDCAuth", "WebhookAuth",
+    "hash_password", "verify_password", "make_password", "check_password",
+    "make_api_key", "hash_api_key", "hmac_request_signature",
+    "session_auth", "opaque_bearer_auth", "hmac_auth", "oidc_auth",
+    "webhook_auth", "create_authenticator", *sorted(_AUTHENTICATION_EXPORTS),
+    *sorted(_SOCIAL_AUTH_EXPORTS),
+]

@@ -400,7 +400,8 @@ Swagger UI is available at [http://127.0.0.1:8009/docs/](http://127.0.0.1:8009/d
 Protect both the Swagger page and its OpenAPI JSON with `DocsAuthMiddleware`. It accepts the same callable authentication dependencies used by routes; pass the configured docs paths so customized URLs are protected too:
 
 ```python
-from lenapi import LENAPI, DocsAuthMiddleware, authentication
+from lenapi import LENAPI, DocsAuthMiddleware
+from lenapi.security import authentication
 
 app = LENAPI()
 docs_auth = authentication("basic_login")
@@ -495,7 +496,8 @@ You can protect an entire router with `auth=`, or protect an individual endpoint
 
 ```python
 from pydantic import BaseModel
-from lenapi import LENAPI, Router, authentication
+from lenapi import LENAPI, Router
+from lenapi.security import authentication
 
 app = LENAPI()
 authenticate = authentication(type="jwt")
@@ -516,7 +518,8 @@ To apply the same requirement to every route in a group, initialize it with `Rou
 The primary authentication setting chooses one method for the scaffold's default protected route: `jwt`, `api_key`, `basic_login`, `opaque_bearer`, or `session`. Session cookies, HMAC, and OIDC can also be attached as additional callable dependencies on selected routes. This lets an app use API keys generally and require a session cookie on a browser route, or require both on one route:
 
 ```python
-from lenapi import Depends, hmac_auth, oidc_auth, opaque_bearer_auth, session_auth
+from lenapi import Depends
+from lenapi.security import hmac_auth, oidc_auth, opaque_bearer_auth, session_auth
 
 session = session_auth(store=app.security_store, cookie_name="session_id")
 stored_token = opaque_bearer_auth(store=app.security_store)
@@ -548,7 +551,7 @@ def federated_private(identity=Depends(provider_token)):
 
 ```python
 from lenapi import LENAPI
-from lenapi.auth import SocialAuth
+from lenapi.security import SocialAuth
 
 auth = SocialAuth(
     providers=["google", "github", "linkedin"],
@@ -613,7 +616,8 @@ def read_document(document=Depends(document_access)):
 Create a `CSRFProtect` instance with a secret of at least 32 bytes. Provide its signed token in a readable cookie, then require the same token in `X-CSRF-Token` on write requests. Apply it alongside authentication to routes that accept browser cookies:
 
 ```python
-from lenapi import CSRFProtect, Depends, JSONResponse
+from lenapi import Depends, JSONResponse
+from lenapi.security import CSRFProtect
 
 csrf = CSRFProtect(settings.SECRET_KEY, secure=True, samesite="lax")
 
@@ -635,7 +639,8 @@ Safe methods do not require the header; state-changing methods do. `SameSite` is
 The framework provides `lenapi.User` with `username`, nullable `email`, `first_name`, `last_name`, `password`, and `api_key` fields. The default `UserRegistration` request asks for `username`, `first_name`, `last_name`, `password`, and `confirm_password`; email is not required or included in the default registration response. Apps that want to collect email can define a custom registration schema and pass its email value through `register_user()`. When a trusted provisioning flow creates a user directly, store the password hash:
 
 ```python
-from lenapi import User, make_password
+from lenapi import User
+from lenapi.security import make_password
 
 # In a registration handler, after validating the submitted password:
 user = User.create(
@@ -721,7 +726,8 @@ Cookies are convenient for browser clients; native apps and server-to-server cli
 ```python
 import os
 
-from lenapi import Depends, JWTAuth
+from lenapi import Depends
+from lenapi.security import JWTAuth
 
 jwt_auth = JWTAuth(
     secret_key=os.environ["LENAPI_JWT_SECRET"],
@@ -785,7 +791,8 @@ Webhook senders retry deliveries, so verify the provider signature and deduplica
 
 ```python
 from typing import Any
-from lenapi import BackgroundTasks, Body, Depends, webhook_auth
+from lenapi import BackgroundTasks, Body, Depends
+from lenapi.security import webhook_auth
 
 webhook = webhook_auth(
     settings.WEBHOOK_SECRET,
