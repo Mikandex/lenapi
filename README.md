@@ -294,7 +294,7 @@ class Invoice(model.Model):
     amount = model.DecimalField(max_digits=12, decimal_places=2)
 ```
 
-`model.UUIDField()` stores a native UUID and generates a UUID4 by default. `model.ImageField(upload_to="avatars")` stores a relative file path in the database; the upload bytes are saved through `Request.form()` and `UploadFile.save_image()`. The generated project setting `MEDIA_ROOT` defaults to `BASE_DIR / "media"`.
+`model.UUIDField()` stores a native UUID and generates a UUID4 by default. `model.ImageField(upload_to="avatars")` stores a relative file path in the database; upload bytes are written beneath `MEDIA_ROOT` by `UploadFile.save()` or `UploadFile.save_image()`. The generated project setting `MEDIA_ROOT` defaults to `BASE_DIR / "media"`.
 
 The repository root contains the lenApi library. Create an application scaffold and run it separately:
 
@@ -307,6 +307,8 @@ python lenora.py run
 ```
 
 Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LENAPI()` configures the authentication dependency without adding authentication routes. The framework repository contains the installable `lenapi` package; create an application scaffold separately with `lenora startproject`.
+
+If `settings.py` is accidentally deleted, run `python lenora.py repair-settings` from the project directory. It recreates the generated defaults only when the file is missing and refuses to overwrite an existing settings file. The recreated file gets fresh `SECRET_KEY` and `API_KEY` values; review it before starting the app. The old `SECRET_KEY` cannot be recovered, so tokens signed with that key will no longer validate.
 
 Run `python lenora.py apikey` inside a project to set `AUTHENTICATION = "api_key"`, add the `APIKey` model to `app/models.py` when it is missing, and generate/apply its migration. The command is safe to repeat; it leaves an existing model in place and applies no migration when the database is already current. The table stores each key's hash, owning user, active state, creation time, and revocation time; never store the raw key there.
 
@@ -617,6 +619,10 @@ def federated_private(identity=Depends(provider_token)):
 `SocialAuth` generates provider login and callback routes for Google, GitHub, and LinkedIn. X and Facebook are temporarily disabled; if either is listed in `providers`, it is ignored, so no login or callback route is generated for it. Other unknown provider names remain configuration errors. Configure each available provider's client ID, client secret, and exact callback URI in the generated `settings.py` (or load them from environment variables). The generated settings leave credentials blank. Register each callback URI with the matching provider.
 
 ```python
+# settings.py — replace with the exact origin serving your frontend.
+SOCIAL_AUTH_ALLOWED_ORIGINS = ["https://myapp.com"]
+
+# main.py
 from lenapi import LENAPI
 from lenapi.security import SocialAuth
 
@@ -631,6 +637,8 @@ app.include_router(auth.router(), prefix="/auth")
 ```
 
 This mounts routes such as `/auth/google/login` and `/auth/google/callback` only on the app that includes the router. The callback exchanges the provider code, validates the OAuth state (and PKCE where supported), fetches the provider profile, and returns a LenApi bearer token when `jwt_enabled=True`. It does not return the provider's access token.
+
+`allowed_origins` can also be passed directly to `SocialAuth`; otherwise it reads `SOCIAL_AUTH_ALLOWED_ORIGINS` from `settings.py`. When a browser sends an `Origin` header to a provider login route, LenApi requires an exact match in this list and returns `403` otherwise. Replace `https://myapp.com` with the exact origin serving your frontend. Top-level navigations can omit `Origin`; those still rely on the required, random, browser-cookie-bound OAuth `state` check on callback. Do not treat the origin allowlist as a replacement for OAuth state validation, HTTPS, or correct provider callback URL registration. The provider callback itself is not checked against the browser `Origin` header because providers may omit it or send a different origin.
 
 With `auto_register=True`, LenApi creates a framework `User` (or an `app.models.User` subclass) on the first successful provider login and stores the provider subject mapping in the framework-managed `lenapi_social_accounts` table. Run `python lenora.py migration` and `python lenora.py migrate` before first use. Only verified provider emails are copied to the local user. If a verified email is already attached to a different account, sign-in returns `409`; LenApi will not silently link accounts by email.
 
@@ -827,28 +835,24 @@ async def receive_event(payload: Any = Body()):
     return payload
 ```
 
-For image uploads, send `multipart/form-data` and read the `UploadFile` from `Request.form()`. `save_image()` accepts JPEG, PNG, GIF, WebP, or BMP only, checks the file signature against its content type, uses a generated safe filename by default, refuses to overwrite existing files when a filename is supplied, and returns the filename to store in the model:
+Declare an upload as `image: UploadFile = File(...)`. The `File(...)` marker means required; LenAPI parses the multipart request and generates Swagger's file chooser from the annotation. `save("photos")` resolves to `MEDIA_ROOT/photos`, validates image content, creates a safe generated name, and returns that stored name. Set `keep_filename=True` to keep the sanitized uploaded name; an existing file is never overwritten. Use `list[UploadFile] = File(...)` to accept multiple files:
 
 ```python
-from pathlib import Path
-from lenapi import Request, UploadFile, model
+from lenapi import File, UploadFile, model
 import settings
 
 class Photo(model.Model):
     image = model.ImageField(upload_to="photos")
 
 @app.post("/photos")
-async def upload_photo(request: Request):
-    form = await request.form()
-    image = form.get("image")
-    if not isinstance(image, UploadFile):
-        return {"error": "An image file is required"}
-    upload_to = Photo.__table__.c.image.info["upload_to"]
-    filename = await image.save_image(Path(settings.MEDIA_ROOT) / upload_to)
-    photo = Photo(image=f"{upload_to}/{filename}")
+async def upload_photo(image: UploadFile = File(...)):
+    filename = await image.save("photos", keep_filename=True)
+    photo = Photo(image=f"photos/{filename}")
     photo.save()
     return {"id": photo.id, "image": photo.image}
 ```
+
+For other file types, use `await file.save("documents", type="pdf")` or `type="doc"` (`.doc` and `.docx`). `type=None` allows any file type. Selected PDF and Word types are checked against their file signatures; all saves sanitize names and refuse to overwrite existing files. `save_image(directory)` remains available for explicit absolute-directory image saves. Use `Request.form()` for custom form parsing; typed `UploadFile` route arguments automatically describe the multipart schema in OpenAPI.
 
 The stored path is relative. `LENAPI` serves files from `MEDIA_ROOT` under `MEDIA_URL` (default `/media/`), so a saved path such as `photos/<filename>.jpg` is available at `/media/photos/<filename>.jpg`. Set both `MEDIA_ROOT` and `MEDIA_URL` in `settings.py`; media paths are restricted to files inside `MEDIA_ROOT`, and directory listings are not exposed. Request body size limits apply to multipart uploads too.
 

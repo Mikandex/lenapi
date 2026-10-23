@@ -6,7 +6,7 @@ import base64
 import hashlib
 import importlib
 import secrets
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from sqlalchemy import insert, select
 from sqlalchemy.exc import IntegrityError
@@ -42,6 +42,7 @@ class SocialAuth:
         jwt_enabled: bool = False,
         settings=None,
         user_model=None,
+        allowed_origins=None,
     ) -> None:
         if isinstance(providers, str):
             raise TypeError("providers must be a list or tuple of provider names")
@@ -69,8 +70,62 @@ class SocialAuth:
         self.auto_register = bool(auto_register)
         self.jwt_enabled = bool(jwt_enabled)
         self.settings = settings or self._load_settings()
+        if allowed_origins is None:
+            allowed_origins = getattr(self.settings, "SOCIAL_AUTH_ALLOWED_ORIGINS", ())
+        self.allowed_origins = self._normalize_origins(allowed_origins)
         self.user_model = user_model or self._load_user_model()
         self.jwt = jwt_auth(self.settings) if self.jwt_enabled else None
+
+    @staticmethod
+    def _normalize_origin(origin: str) -> str:
+        if not isinstance(origin, str) or not origin.strip():
+            raise ValueError("social auth origins must be non-empty origin URLs")
+        parsed = urlsplit(origin.strip())
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f"Invalid social auth origin: {origin!r}")
+        host = parsed.hostname.lower()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = parsed.port
+        default_port = (parsed.scheme.lower() == "https" and port == 443) or (
+            parsed.scheme.lower() == "http" and port == 80
+        )
+        authority = host if port is None or default_port else f"{host}:{port}"
+        return f"{parsed.scheme.lower()}://{authority}"
+
+    @classmethod
+    def _normalize_origins(cls, origins) -> frozenset[str]:
+        if isinstance(origins, str):
+            raise TypeError("allowed_origins must be a list or tuple of origins")
+        try:
+            values = tuple(origins)
+        except TypeError as exc:
+            raise TypeError("allowed_origins must be a list or tuple of origins") from exc
+        return frozenset(cls._normalize_origin(origin) for origin in values)
+
+    def _check_login_origin(self) -> None:
+        """Reject browser login requests whose supplied Origin is not trusted.
+
+        Top-level GET navigations may omit Origin. Those requests remain guarded
+        by the mandatory per-browser state cookie checked by the callback.
+        """
+        origin = get_current_request().headers.get("origin")
+        if origin is None:
+            return
+        try:
+            normalized = self._normalize_origin(origin)
+        except ValueError:
+            raise HTTPException(403, "Social login origin is not allowed") from None
+        if not self.allowed_origins or normalized not in self.allowed_origins:
+            raise HTTPException(403, "Social login origin is not allowed")
 
     @staticmethod
     def _load_settings():
@@ -132,6 +187,7 @@ class SocialAuth:
 
         @router.get(f"/{provider}/login")
         def login():
+            self._check_login_origin()
             client_id, _client_secret, redirect_uri, cookie_secure = self._provider_config(provider)
             state = secrets.token_urlsafe(32)
             verifier = secrets.token_urlsafe(64) if use_pkce else None

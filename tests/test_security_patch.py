@@ -3,6 +3,7 @@ import importlib
 import json
 import threading
 import time
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import pytest
@@ -16,6 +17,7 @@ from lenapi import (
     HMACAuth,
     JWTAuth,
     OpaqueBearerAuth,
+    SocialAuth,
     SessionAuth,
     WebSocketService,
     hmac_request_signature,
@@ -24,7 +26,7 @@ from lenapi.middleware import DocsAuthMiddleware
 from lenapi.models import SECURITY_STORE_TABLE
 
 
-async def _http_request(app, path, *, method="GET", payload=None, headers=()):
+async def _http_request(app, path, *, method="GET", payload=None, headers=(), query_string=b""):
     body = b"" if payload is None else json.dumps(payload).encode()
     headers = list(headers)
     if payload is not None:
@@ -45,7 +47,7 @@ async def _http_request(app, path, *, method="GET", payload=None, headers=()):
     await app({
         "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
         "method": method, "scheme": "http", "path": path, "raw_path": path.encode(),
-        "query_string": b"", "client": ("127.0.0.1", 43210), "server": ("test", 80),
+        "query_string": query_string, "client": ("127.0.0.1", 43210), "server": ("test", 80),
         "headers": headers,
     }, receive, send)
     start = next(item for item in messages if item["type"] == "http.response.start")
@@ -94,6 +96,83 @@ def test_top_level_auth_imports_remain_compatible():
     assert SocialAuth is SecuritySocialAuth
     assert authentication is security_authentication
     assert hmac_auth is security_hmac_auth
+
+
+def _social_auth_app(allowed_origins):
+    settings = SimpleNamespace(
+        GOOGLE_CLIENT_ID="test-client",
+        GOOGLE_CLIENT_SECRET="test-secret",
+        GOOGLE_REDIRECT_URI="https://api.example/auth/google/callback",
+        GOOGLE_COOKIE_SECURE=True,
+    )
+    app = Application(database=Database("sqlite://"), security_storage="memory")
+    auth = SocialAuth(
+        ["google"], settings=settings, allowed_origins=allowed_origins
+    )
+    app.include_router(auth.router(), prefix="/auth")
+    return app
+
+
+def test_social_auth_rejects_login_from_unapproved_origin():
+    app = _social_auth_app(["https://app.example"])
+    status, body = asyncio.run(_http_request(
+        app, "/auth/google/login",
+        headers=[(b"origin", b"https://attacker.example")],
+    ))
+
+    assert status == 403
+    assert body["detail"] == "Social login origin is not allowed"
+
+
+def test_social_auth_fails_closed_for_browser_origin_when_allowlist_is_empty():
+    app = _social_auth_app([])
+    status, body = asyncio.run(_http_request(
+        app, "/auth/google/login",
+        headers=[(b"origin", b"https://app.example")],
+    ))
+
+    assert status == 403
+    assert body["detail"] == "Social login origin is not allowed"
+
+
+def test_social_auth_allows_configured_origin_and_originless_navigation():
+    app = _social_auth_app(["https://app.example"])
+    allowed_status, _ = asyncio.run(_http_request(
+        app, "/auth/google/login",
+        headers=[(b"origin", b"https://app.example")],
+    ))
+    navigation_status, _ = asyncio.run(_http_request(app, "/auth/google/login"))
+
+    assert allowed_status == 302
+    assert navigation_status == 302
+
+
+def test_social_auth_callback_requires_state_even_when_provider_origin_is_present():
+    app = _social_auth_app(["https://app.example"])
+    status, body = asyncio.run(_http_request(
+        app,
+        "/auth/google/callback",
+        query_string=b"state=attacker-state&code=unused",
+        headers=[(b"origin", b"https://accounts.google.com")],
+    ))
+
+    assert status == 400
+    assert body["error"] == "Invalid or expired OAuth state"
+
+
+def test_social_auth_origin_configuration_is_normalized_and_validated():
+    auth = SocialAuth(
+        ["google"],
+        settings=SimpleNamespace(),
+        allowed_origins=["HTTPS://APP.EXAMPLE:443/"],
+    )
+
+    assert auth.allowed_origins == frozenset({"https://app.example"})
+    with pytest.raises(ValueError, match="Invalid social auth origin"):
+        SocialAuth(
+            ["google"], settings=SimpleNamespace(),
+            allowed_origins=["https://app.example/path"],
+        )
 
 
 class FakeWebSocket:

@@ -18,12 +18,15 @@ from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .request import Request, reset_current_request, set_current_request
+from .request import (
+    Request, UploadFile, endpoint_type_hints, reset_current_request, set_current_request,
+    upload_file_shape,
+)
 from .response import FileResponse, HTTPException, JSONResponse, Response
 from .dependencies import Depends
 from .concurrency import call_sync_or_async
 from .openapi import build_openapi, swagger_html
-from .parameters import Body
+from .parameters import Body, File
 from .database import AsyncDatabase, Database
 from .mongodb import MongoDatabase
 from .models import (
@@ -455,6 +458,7 @@ class Application(Router):
                 receive,
                 max_body_size=self.max_request_body_size,
                 body_timeout=self.request_body_timeout,
+                media_root=self.media_root,
             )
             request.background_tasks = BackgroundTasks()
             session = None
@@ -935,8 +939,39 @@ class Application(Router):
         query = request.query_params
         body_loaded = False
         body: Any = None
+        form_loaded = False
+        form: dict[str, Any] = {}
+        type_hints = endpoint_type_hints(endpoint)
         for name, parameter in inspect.signature(endpoint).parameters.items():
-            annotation = parameter.annotation
+            annotation = type_hints.get(name, parameter.annotation)
+            file_shape = upload_file_shape(annotation)
+            if file_shape is not None:
+                file_marker = parameter.default if isinstance(parameter.default, File) else None
+                file_default = file_marker.default if file_marker is not None else parameter.default
+                file_required = file_default is inspect.Parameter.empty or file_default is ...
+                if not form_loaded:
+                    form = await request.form()
+                    form_loaded = True
+                uploaded = form.get(name)
+                if uploaded is None:
+                    if not file_required:
+                        values[name] = file_default
+                        continue
+                    raise HTTPException(422, f"Missing uploaded file: {name}")
+                if file_shape == "multiple":
+                    items = uploaded if isinstance(uploaded, list) else [uploaded]
+                    if not all(isinstance(item, UploadFile) for item in items):
+                        raise HTTPException(422, f"'{name}' must contain uploaded files")
+                    values[name] = items
+                else:
+                    if isinstance(uploaded, list):
+                        if len(uploaded) != 1:
+                            raise HTTPException(422, f"'{name}' may only contain one uploaded file")
+                        uploaded = uploaded[0]
+                    if not isinstance(uploaded, UploadFile):
+                        raise HTTPException(422, f"'{name}' must be an uploaded file")
+                    values[name] = uploaded
+                continue
             if isinstance(parameter.default, Body):
                 values[name] = await request.json()
                 continue

@@ -3,7 +3,7 @@
 import asyncio
 import json
 
-from lenapi import Application, AsyncDatabase, Database, HTTPException, Model, Request, StringField, UploadFile
+from lenapi import Application, AsyncDatabase, Database, File, Model, StringField, UploadFile
 from lenapi.service import WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,27 +23,9 @@ def make_app(media_root):
         security_storage="memory",
     )
 
-    @app.post(
-        "/photos",
-        request_body={
-            "required": True,
-            "content": {
-                "multipart/form-data": {
-                    "schema": {
-                        "type": "object",
-                        "properties": {"image": {"type": "string", "format": "binary"}},
-                        "required": ["image"],
-                    }
-                }
-            },
-        },
-    )
-    async def upload_photo(request: Request):
-        form = await request.form()
-        image = form.get("image")
-        if not isinstance(image, UploadFile):
-            raise HTTPException(422, "An image file is required")
-        filename = await image.save_image(media_root / "photos")
+    @app.post("/photos")
+    async def upload_photo(image: UploadFile = File(...)):
+        filename = await image.save("photos")
         relative_path = f"photos/{filename}"
         return {"image": relative_path, "url": f"/media/{relative_path}"}
 
@@ -214,8 +196,88 @@ def test_openapi_documents_multipart_file_field(tmp_path):
 
     assert status == 200
     upload_body = json.loads(response_body)["paths"]["/photos"]["post"]["requestBody"]
+    assert upload_body["required"] is True
     schema = upload_body["content"]["multipart/form-data"]["schema"]
     assert schema["properties"]["image"] == {"type": "string", "format": "binary"}
+
+
+def test_upload_parameter_receives_file_without_manual_openapi_schema(tmp_path):
+    app = make_app(tmp_path)
+    boundary, body = multipart_image()
+    status, _headers, response_body = asgi_request(
+        app,
+        "/photos",
+        method="POST",
+        body=body,
+        headers=[(b"content-type", f"multipart/form-data; boundary={boundary}".encode())],
+    )
+
+    assert status == 200
+    assert json.loads(response_body)["image"].startswith("photos/")
+    image_path = tmp_path / json.loads(response_body)["image"]
+    assert image_path.is_file()
+    assert image_path.read_bytes() == PNG_BYTES
+
+
+def test_file_marker_requires_upload(tmp_path):
+    app = make_app(tmp_path)
+    status, _headers, response_body = asgi_request(
+        app,
+        "/photos",
+        method="POST",
+        body=(
+            b'--test-boundary\r\nContent-Disposition: form-data; name="other"'
+            b'\r\n\r\nx\r\n--test-boundary--\r\n'
+        ),
+        headers=[(b"content-type", b"multipart/form-data; boundary=test-boundary")],
+    )
+
+    assert status == 422
+    assert json.loads(response_body)["detail"] == "Missing uploaded file: image"
+
+
+def test_save_can_preserve_sanitized_original_filename(tmp_path):
+    upload = UploadFile("../portrait.png", "image/png", PNG_BYTES, media_root=tmp_path)
+    filename = asyncio.run(upload.save("photos", keep_filename=True))
+
+    assert filename == "portrait.png"
+    assert (tmp_path / "photos" / filename).read_bytes() == PNG_BYTES
+    try:
+        asyncio.run(upload.save("photos", keep_filename=True))
+    except ValueError as exc:
+        assert "already exists" in str(exc)
+    else:
+        raise AssertionError("save must not overwrite a file with the same name")
+
+
+def test_save_accepts_selected_pdf_or_any_file(tmp_path):
+    pdf = UploadFile("terms.pdf", "application/pdf", b"%PDF-1.7\nbody", media_root=tmp_path)
+    stored_pdf = asyncio.run(pdf.save("documents", type="pdf", keep_filename=True))
+    assert stored_pdf == "terms.pdf"
+    assert (tmp_path / "documents" / stored_pdf).read_bytes().startswith(b"%PDF-")
+
+    arbitrary = UploadFile("payload.bin", "application/octet-stream", b"payload", media_root=tmp_path)
+    stored_any = asyncio.run(arbitrary.save("misc", type=None))
+    assert stored_any.endswith(".bin")
+    assert (tmp_path / "misc" / stored_any).read_bytes() == b"payload"
+
+
+def test_save_requires_configured_media_root_and_checks_file_type(tmp_path):
+    without_root = UploadFile("x.png", "image/png", PNG_BYTES)
+    try:
+        asyncio.run(without_root.save("photos"))
+    except RuntimeError as exc:
+        assert "MEDIA_ROOT" in str(exc)
+    else:
+        raise AssertionError("save without MEDIA_ROOT must fail")
+
+    wrong_pdf = UploadFile("not-a-pdf.pdf", "application/pdf", b"not a PDF", media_root=tmp_path)
+    try:
+        asyncio.run(wrong_pdf.save("documents", type="pdf"))
+    except ValueError as exc:
+        assert "PDF signature" in str(exc)
+    else:
+        raise AssertionError("save(type='pdf') must validate the PDF signature")
 
 
 def test_websocket_route_accepts_and_echoes_json():

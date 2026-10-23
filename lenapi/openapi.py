@@ -7,8 +7,8 @@ from pydantic import BaseModel, TypeAdapter
 
 from .background import BackgroundTasks
 from .dependencies import Depends
-from .request import Request
-from .parameters import Body
+from .request import Request, endpoint_type_hints, upload_file_shape
+from .parameters import Body, File
 from .security import APIKeyAuth, BasicAuth, HMACAuth, JWTAuth, OIDCAuth, OpaqueBearerAuth, SessionAuth, WebhookAuth
 
 
@@ -118,8 +118,22 @@ def build_openapi(app, *, title: str, version: str) -> dict[str, Any]:
                 ]
             parameters = []
             request_body = operation.get("requestBody")
+            file_properties: dict[str, Any] = {}
+            required_files: list[str] = []
+            type_hints = endpoint_type_hints(route.endpoint)
             for name, parameter in inspect.signature(route.endpoint).parameters.items():
-                annotation = parameter.annotation
+                annotation = type_hints.get(name, parameter.annotation)
+                file_shape = upload_file_shape(annotation)
+                if file_shape is not None:
+                    field_schema: dict[str, Any] = {"type": "string", "format": "binary"}
+                    if file_shape == "multiple":
+                        field_schema = {"type": "array", "items": field_schema}
+                    file_properties[name] = field_schema
+                    marker = parameter.default if isinstance(parameter.default, File) else None
+                    marker_default = marker.default if marker is not None else parameter.default
+                    if marker_default is inspect.Parameter.empty or marker_default is ...:
+                        required_files.append(name)
+                    continue
                 if isinstance(parameter.default, Body):
                     request_body = {
                         "required": True,
@@ -162,6 +176,19 @@ def build_openapi(app, *, title: str, version: str) -> dict[str, Any]:
                 })
             if parameters:
                 operation["parameters"] = parameters
+            if file_properties and route.request_body is None:
+                request_body = {
+                    "required": bool(required_files),
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "properties": file_properties,
+                                **({"required": required_files} if required_files else {}),
+                            }
+                        }
+                    },
+                }
             if request_body is not None:
                 operation["requestBody"] = request_body
             if route.response_model is not None:

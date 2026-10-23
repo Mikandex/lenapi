@@ -79,6 +79,8 @@ LINKEDIN_CLIENT_ID = ""
 LINKEDIN_CLIENT_SECRET = ""
 LINKEDIN_REDIRECT_URI = ""
 LINKEDIN_COOKIE_SECURE = urlparse(LINKEDIN_REDIRECT_URI).scheme == "https"
+# Exact browser origins allowed to start social login; configure your frontend origin.
+SOCIAL_AUTH_ALLOWED_ORIGINS = []
 # Keep this generated key private. Rotate it to invalidate existing tokens.
 SECRET_KEY = "__LENAPI_GENERATED_SECRET_KEY__"
 TOKEN = {
@@ -366,6 +368,11 @@ def _main() -> None:
     startproject = commands.add_parser("startproject", help="create a new lenApi project")
     startproject.add_argument("name", nargs="?", default="lenApp", help="project folder name (default: lenApp)")
 
+    commands.add_parser(
+        "repair-settings",
+        help="recreate the project settings.py only when it is missing",
+    )
+
     apikey_command = commands.add_parser(
         "apikey", help="enable API-key authentication, add its model, and migrate"
     )
@@ -463,6 +470,35 @@ def _main() -> None:
             parser.error(f"could not create project: {exc}")
         print(f"Created lenApi project in {project_dir}")
         print(f"Next: cd {args.name} && python lenora.py migration && python lenora.py run")
+        return
+
+    if args.command == "repair-settings":
+        project_dir = Path.cwd()
+        settings_path = project_dir / "settings.py"
+        if not (project_dir / "lenora.py").is_file():
+            parser.error("run `python lenora.py repair-settings` from a lenApi project directory")
+        if settings_path.exists():
+            parser.error("settings.py already exists; it was not changed")
+
+        contents = PROJECT_FILES["settings.py"]
+        contents = contents.replace(
+            "__LENAPI_GENERATED_SECRET_KEY__", secrets.token_urlsafe(48)
+        ).replace(
+            "__LENAPI_GENERATED_API_KEY__", secrets.token_urlsafe(32)
+        )
+        created = False
+        try:
+            with settings_path.open("x", encoding="utf-8") as settings_file:
+                created = True
+                settings_file.write(contents)
+        except FileExistsError:
+            parser.error("settings.py already exists; it was not changed")
+        except OSError as exc:
+            if created:
+                settings_path.unlink(missing_ok=True)
+            parser.error(f"could not recreate settings.py: {exc}")
+        print(f"Recreated {settings_path} with default project settings and fresh keys.")
+        print("Review the settings before starting the app; provider credentials remain blank.")
         return
 
     if args.command == "apikey":
