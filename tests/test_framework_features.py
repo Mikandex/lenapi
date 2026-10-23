@@ -280,6 +280,46 @@ def test_jwt_api_key_and_basic_auth_routes_and_openapi_security():
     app.database.close()
 
 
+def test_jwt_token_and_refresh_routes_are_throttled_by_default_and_configurable():
+    app = make_app()
+    jwt = JWTAuth("t" * 32)
+    app.include_router(jwt.router(lambda _username, _password: None, throttle={"ip": "1/minute"}))
+
+    first = json_request(
+        app, "/auth/token", method="POST",
+        payload={"username": "ada", "password": "wrong"},
+    )
+    second = json_request(
+        app, "/auth/token", method="POST",
+        payload={"username": "ada", "password": "wrong"},
+    )
+    refresh_first = json_request(
+        app, "/auth/refresh", method="POST",
+        payload={"refresh_token": jwt.create_refresh_token("1")},
+    )
+    refresh_second = json_request(
+        app, "/auth/refresh", method="POST",
+        payload={"refresh_token": jwt.create_refresh_token("1")},
+    )
+
+    assert first[0] == 401
+    assert second[0] == 429
+    assert refresh_first[0] == 200
+    assert refresh_second[0] == 429
+    app.database.close()
+
+
+def test_jwt_auth_router_has_default_ip_throttle():
+    jwt = JWTAuth("u" * 32)
+    router = jwt.router(lambda _username, _password: None)
+    for route in router.routes:
+        assert route.throttle is not None
+        assert len(route.throttle) == 1
+        assert (route.throttle[0].scope, route.throttle[0].count, route.throttle[0].window_seconds) == (
+            "ip", 10, 60
+        )
+
+
 def test_router_and_route_level_authentication_and_openapi():
     app = make_app()
     jwt = JWTAuth("r" * 32)

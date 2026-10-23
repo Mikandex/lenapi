@@ -188,7 +188,7 @@ class JWTAuth:
                   if key not in {"sub", "iat", "exp", "iss", "token_use"}}
         return self.create_access_token(payload["sub"], claims=claims)
 
-    def router(self, authenticate=None):
+    def router(self, authenticate=None, *, throttle: dict[str, str] | None = None):
         """Build `/auth/token` and `/auth/refresh` routes for an app.
 
         `authenticate(username, password)` may be supplied here or when
@@ -201,9 +201,13 @@ class JWTAuth:
         if authenticate is None:
             raise ValueError("JWT token routes require an authenticate(username, password) callback")
 
+        # Keep password verification endpoints rate-limited even when the app
+        # has no global throttle configured. An empty mapping explicitly opts
+        # out; applications can also supply a stricter policy here.
+        token_throttle = {"ip": "10/minute"} if throttle is None else throttle
         router = Router(prefix="/auth")
 
-        @router.post("/token", include_in_schema=False)
+        @router.post("/token", include_in_schema=False, throttle=token_throttle)
         async def issue_token(credentials: _Credentials):
             user = authenticate(credentials.username, credentials.password)
             if inspect.isawaitable(user):
@@ -223,7 +227,7 @@ class JWTAuth:
                 "expires_in": self.token_lifetime_seconds,
             }
 
-        @router.post("/refresh", include_in_schema=False)
+        @router.post("/refresh", include_in_schema=False, throttle=token_throttle)
         def refresh_token(body: _RefreshRequest):
             try:
                 access_token = self.refresh_access_token(body.refresh_token)
