@@ -3,6 +3,7 @@ import importlib
 from urllib.parse import urlencode
 
 from lenapi import Application, Database, WebSocketService
+from lenapi.models import SECURITY_STORE_TABLE
 
 
 def test_authentication_public_api_is_available_from_security_module():
@@ -128,6 +129,30 @@ def test_docs_login_attempts_are_throttled_and_reset_after_success():
         assert app._claim_docs_login("192.0.2.21") == 0
         app._clear_docs_login_attempts("192.0.2.20")
         assert app._claim_docs_login("192.0.2.20") == 0
+    finally:
+        database.close()
+
+
+def test_docs_login_attempts_use_shared_security_store_across_apps(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'security_store.sqlite3'}")
+    SECURITY_STORE_TABLE.create(database.engine)
+    apps = []
+    for _ in range(2):
+        app = Application(
+            database=database,
+            safe_guard_docs_url=True,
+            docs_login_max_attempts=2,
+            docs_login_window_seconds=30,
+            security_storage="database",
+        )
+        apps.append(app)
+
+    try:
+        assert asyncio.run(apps[0]._claim_docs_login_shared("192.0.2.55")) == 0
+        assert asyncio.run(apps[1]._claim_docs_login_shared("192.0.2.55")) == 0
+        assert asyncio.run(apps[0]._claim_docs_login_shared("192.0.2.55")) > 0
+        asyncio.run(apps[1]._clear_docs_login_attempts_shared("192.0.2.55"))
+        assert asyncio.run(apps[0]._claim_docs_login_shared("192.0.2.55")) == 0
     finally:
         database.close()
 

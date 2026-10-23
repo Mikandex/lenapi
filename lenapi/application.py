@@ -583,7 +583,14 @@ class Application(Router):
                 submitted_csrf, cookie_csrf
             ):
                 return JSONResponse({"detail": "Invalid login request; reload the page and try again."}, status_code=403)
-            retry_after = self._claim_docs_login(request.client_ip or "unknown")
+            client_ip = request.client_ip or "unknown"
+            try:
+                retry_after = await self._claim_docs_login_shared(client_ip)
+            except SecurityStoreUnavailable:
+                return JSONResponse(
+                    {"detail": "Documentation login rate-limit storage is unavailable."},
+                    status_code=503,
+                )
             if retry_after:
                 return JSONResponse(
                     {"detail": "Too many login attempts. Try again later."},
@@ -607,7 +614,13 @@ class Application(Router):
                     httponly=False, samesite="strict",
                 )
                 return response
-            self._clear_docs_login_attempts(request.client_ip or "unknown")
+            try:
+                await self._clear_docs_login_attempts_shared(client_ip)
+            except SecurityStoreUnavailable:
+                return JSONResponse(
+                    {"detail": "Documentation login rate-limit storage is unavailable."},
+                    status_code=503,
+                )
             session_id = await self.docs_guard.create_session(identity["id"])
             response = Response(b"", status_code=303, headers={"location": self.docs_url or "/"})
             response.set_cookie(
@@ -636,7 +649,7 @@ class Application(Router):
         return None
 
     def _claim_docs_login(self, client_ip: str) -> int:
-        """Bound docs-login password guesses per client IP in this worker."""
+        """Bound docs-login guesses per client IP in this worker (memory mode)."""
         now = time.monotonic()
         with self._docs_login_lock:
             if len(self._docs_login_attempts) >= 4096:
@@ -660,9 +673,27 @@ class Application(Router):
                 self._docs_login_attempts[client_ip] = (record[0], record[1] + 1)
         return 0
 
+    async def _claim_docs_login_shared(self, client_ip: str) -> int:
+        """Count docs-login attempts in the configured shared security store."""
+        if self.security_store is None:
+            return self._claim_docs_login(client_ip)
+        key = f"docs_login_attempts:{self.docs_url or '/'}:{client_ip}"
+        count, retry_after = await self.security_store.increment(
+            key, self.docs_login_window_seconds
+        )
+        return retry_after if count > self.docs_login_max_attempts else 0
+
     def _clear_docs_login_attempts(self, client_ip: str) -> None:
         with self._docs_login_lock:
             self._docs_login_attempts.pop(client_ip, None)
+
+    async def _clear_docs_login_attempts_shared(self, client_ip: str) -> None:
+        """Clear docs-login counters after successful authentication."""
+        if self.security_store is None:
+            self._clear_docs_login_attempts(client_ip)
+            return
+        key = f"docs_login_attempts:{self.docs_url or '/'}:{client_ip}"
+        await self.security_store.delete(key)
 
     async def _has_docs_admin(self) -> bool:
         return await self.docs_guard.has_admin()
