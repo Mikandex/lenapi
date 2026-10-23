@@ -1,9 +1,38 @@
 import asyncio
 import importlib
+import json
+import threading
 from urllib.parse import urlencode
 
-from lenapi import Application, Database, WebSocketService
+from lenapi import Application, Database, Depends, JWTAuth, WebSocketService
 from lenapi.models import SECURITY_STORE_TABLE
+
+
+async def _http_request(app, path, *, method="GET", payload=None):
+    body = b"" if payload is None else json.dumps(payload).encode()
+    headers = [(b"content-type", b"application/json")] if payload is not None else []
+    messages = []
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    await app({
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": method, "scheme": "http", "path": path, "raw_path": path.encode(),
+        "query_string": b"", "client": ("127.0.0.1", 43210), "server": ("test", 80),
+        "headers": headers,
+    }, receive, send)
+    start = next(item for item in messages if item["type"] == "http.response.start")
+    response_body = next(item for item in messages if item["type"] == "http.response.body")["body"]
+    return start["status"], json.loads(response_body or b"null")
 
 
 def test_authentication_public_api_is_available_from_security_module():
@@ -155,6 +184,91 @@ def test_docs_login_attempts_use_shared_security_store_across_apps(tmp_path):
         assert asyncio.run(apps[0]._claim_docs_login_shared("192.0.2.55")) == 0
     finally:
         database.close()
+
+
+def test_refresh_token_is_one_time_use_across_app_instances(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'refresh_store.sqlite3'}")
+    SECURITY_STORE_TABLE.create(database.engine)
+    apps = [
+        Application(database=database, security_storage="database")
+        for _ in range(2)
+    ]
+    auths = [JWTAuth("r" * 32, security_store=app.security_store) for app in apps]
+    for app, auth in zip(apps, auths):
+        app.include_router(auth.router(lambda _username, _password: None, throttle={}))
+    refresh_token = auths[0].create_refresh_token("user-1")
+
+    async def run():
+        first = await _http_request(
+            apps[0], "/auth/refresh", method="POST", payload={"refresh_token": refresh_token}
+        )
+        replay = await _http_request(
+            apps[1], "/auth/refresh", method="POST", payload={"refresh_token": refresh_token}
+        )
+        return first, replay
+
+    try:
+        first, replay = asyncio.run(run())
+        assert first[0] == 200
+        assert first[1]["refresh_token"] != refresh_token
+        assert replay[0] == 401
+    finally:
+        database.close()
+
+
+def test_sync_dependency_does_not_block_event_loop():
+    app = Application(security_storage="memory")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_dependency():
+        entered.set()
+        release.wait(timeout=3)
+        return "ready"
+
+    @app.get("/sync-dependency")
+    async def endpoint(value=Depends(slow_dependency)):
+        return {"value": value}
+
+    async def run():
+        request = asyncio.create_task(_http_request(app, "/sync-dependency"))
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not request.done(), "request should still be waiting for its dependency"
+        release.set()
+        return await request
+
+    try:
+        status, body = asyncio.run(run())
+        assert status == 200
+        assert body == {"value": "ready"}
+    finally:
+        release.set()
+
+
+def test_sync_route_does_not_block_event_loop():
+    app = Application(security_storage="memory")
+    entered = threading.Event()
+    release = threading.Event()
+
+    @app.get("/sync-route")
+    def endpoint():
+        entered.set()
+        release.wait(timeout=3)
+        return {"value": "ready"}
+
+    async def run():
+        request = asyncio.create_task(_http_request(app, "/sync-route"))
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not request.done(), "request should still be waiting for its route"
+        release.set()
+        return await request
+
+    try:
+        status, body = asyncio.run(run())
+        assert status == 200
+        assert body == {"value": "ready"}
+    finally:
+        release.set()
 
 
 def test_docs_login_throttle_configuration_must_be_positive():

@@ -1,11 +1,13 @@
 """Small HS256 JWT authentication helper for protected lenApi routes."""
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import hmac as _hmac
 import inspect
 import json
+import math
 import re
 import secrets
 import threading
@@ -115,6 +117,7 @@ class JWTAuth:
         refresh_token_lifetime_seconds: int = 60 * 60 * 24 * 30,
         issuer: str | None = None,
         authenticate=None,
+        security_store=None,
     ) -> None:
         key = secret_key.encode("utf-8") if isinstance(secret_key, str) else secret_key
         if not isinstance(key, bytes) or len(key) < 32:
@@ -128,6 +131,10 @@ class JWTAuth:
         self.refresh_token_lifetime_seconds = refresh_token_lifetime_seconds
         self.issuer = issuer
         self.authenticate = authenticate
+        self.security_store = security_store
+        self._refresh_namespace = hashlib.sha256(key).hexdigest()[:32]
+        self._used_refresh_tokens: dict[str, float] = {}
+        self._refresh_lock = threading.Lock()
 
     def create_access_token(
         self,
@@ -143,7 +150,7 @@ class JWTAuth:
         if lifetime <= 0:
             raise ValueError("expires_in must be positive")
         payload = dict(claims or {})
-        reserved = {"sub", "iat", "exp", "iss", "token_use"}
+        reserved = {"sub", "iat", "exp", "iss", "token_use", "jti"}
         if reserved.intersection(payload):
             raise ValueError("claims cannot override reserved token claims")
         return self._create_token(subject, payload, lifetime, token_use="access")
@@ -162,9 +169,10 @@ class JWTAuth:
         if lifetime <= 0:
             raise ValueError("expires_in must be positive")
         payload = dict(claims or {})
-        reserved = {"sub", "iat", "exp", "iss", "token_use"}
+        reserved = {"sub", "iat", "exp", "iss", "token_use", "jti"}
         if reserved.intersection(payload):
             raise ValueError("claims cannot override reserved token claims")
+        payload["jti"] = secrets.token_urlsafe(32)
         return self._create_token(subject, payload, lifetime, token_use="refresh")
 
     def _create_token(self, subject: str, payload: dict[str, Any], lifetime: int, *, token_use: str) -> str:
@@ -179,16 +187,49 @@ class JWTAuth:
         signature = _hmac.new(self.secret_key, signing_input, hashlib.sha256).digest()
         return f"{head}.{body}.{_encode_segment(signature)}"
 
-    def refresh_access_token(self, refresh_token: str) -> str:
-        """Verify a refresh token and issue a new access token for its subject."""
+    async def refresh_access_token(self, refresh_token: str, *, security_store=None) -> str:
+        """Consume a refresh token once and issue an access token.
+
+        When a shared security store is configured, atomic storage prevents
+        replay across workers. Without one, replay protection is process-local.
+        """
         payload = self.decode_token(refresh_token, allow_refresh=True)
         if payload.get("token_use") != "refresh":
             raise ValueError("A refresh token is required")
+        await self._consume_refresh_token(payload, security_store=security_store)
         claims = {key: value for key, value in payload.items()
-                  if key not in {"sub", "iat", "exp", "iss", "token_use"}}
+                  if key not in {"sub", "iat", "exp", "iss", "token_use", "jti"}}
         return self.create_access_token(payload["sub"], claims=claims)
 
-    def router(self, authenticate=None, *, throttle: dict[str, str] | None = None):
+    async def _consume_refresh_token(self, payload: dict[str, Any], *, security_store=None) -> None:
+        token_id = payload.get("jti")
+        expiration = payload.get("exp")
+        if not isinstance(token_id, str) or not token_id:
+            raise ValueError("Refresh token is missing its one-time-use identifier")
+        if isinstance(expiration, bool) or not isinstance(expiration, (int, float)):
+            raise ValueError("Refresh token has an invalid expiration")
+        ttl = max(1, math.ceil(expiration - time.time()))
+        store = security_store if security_store is not None else self.security_store
+        key = f"jwt_refresh_used:{self._refresh_namespace}:{token_id}"
+        if store is not None:
+            used = store.claim(key, ttl)
+            if inspect.isawaitable(used):
+                used = await used
+            if used:
+                raise ValueError("Refresh token has already been used")
+            return
+        now = time.time()
+        with self._refresh_lock:
+            self._used_refresh_tokens = {
+                item: expires_at for item, expires_at in self._used_refresh_tokens.items()
+                if expires_at > now
+            }
+            if token_id in self._used_refresh_tokens:
+                raise ValueError("Refresh token has already been used")
+            self._used_refresh_tokens[token_id] = expiration
+
+    def router(self, authenticate=None, *, throttle: dict[str, str] | None = None,
+               security_store=None):
         """Build `/auth/token` and `/auth/refresh` routes for an app.
 
         `authenticate(username, password)` may be supplied here or when
@@ -205,11 +246,19 @@ class JWTAuth:
         # has no global throttle configured. An empty mapping explicitly opts
         # out; applications can also supply a stricter policy here.
         token_throttle = {"ip": "10/minute"} if throttle is None else throttle
+        refresh_store = security_store if security_store is not None else self.security_store
         router = Router(prefix="/auth")
 
         @router.post("/token", include_in_schema=False, throttle=token_throttle)
         async def issue_token(credentials: _Credentials):
-            user = authenticate(credentials.username, credentials.password)
+            if inspect.iscoroutinefunction(authenticate) or inspect.iscoroutinefunction(
+                getattr(authenticate, "__call__", None)
+            ):
+                user = authenticate(credentials.username, credentials.password)
+            else:
+                user = await asyncio.to_thread(
+                    authenticate, credentials.username, credentials.password
+                )
             if inspect.isawaitable(user):
                 user = await user
             if user is None or user is False:
@@ -228,14 +277,16 @@ class JWTAuth:
             }
 
         @router.post("/refresh", include_in_schema=False, throttle=token_throttle)
-        def refresh_token(body: _RefreshRequest):
+        async def refresh_token(body: _RefreshRequest):
             try:
-                access_token = self.refresh_access_token(body.refresh_token)
+                access_token = await self.refresh_access_token(
+                    body.refresh_token, security_store=refresh_store
+                )
                 payload = self.decode_token(body.refresh_token, allow_refresh=True)
             except ValueError as exc:
                 raise HTTPException(401, "Invalid or expired refresh token") from exc
             claims = {key: value for key, value in payload.items()
-                      if key not in {"sub", "iat", "exp", "iss", "token_use"}}
+                      if key not in {"sub", "iat", "exp", "iss", "token_use", "jti"}}
             return {
                 "access_token": access_token,
                 "refresh_token": self.create_refresh_token(payload["sub"], claims=claims),
@@ -641,6 +692,7 @@ def create_authenticator(
             token_lifetime_seconds=token.get("LIFETIME_SECONDS", 3600),
             refresh_token_lifetime_seconds=token.get("REFRESH_LIFETIME_SECONDS", 60 * 60 * 24 * 30),
             issuer=token.get("ISSUER"),
+            security_store=security_store,
         )
     if mode == "api_key":
         return APIKeyAuth(getattr(settings, "API_KEY", None), authenticate=authenticate_api_key)

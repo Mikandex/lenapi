@@ -501,7 +501,7 @@ def profile(user: dict = Depends(current_user)):
     return user
 ```
 
-Dependencies are cached once per request, so if multiple parameters use the same dependency callable, it runs once.
+Dependencies are cached once per request, so if multiple parameters use the same dependency callable, it runs once. Synchronous routes, dependencies, and authentication callbacks run in a worker thread so blocking I/O in them does not block the ASGI event loop. Async routes run on the event loop; use async I/O there or explicitly offload blocking work yourself.
 
 ## JWT bearer authentication
 
@@ -517,7 +517,7 @@ def authenticate_user(username: str, password: str):
 app.include_router(jwt_auth.router(authenticate_user))
 ```
 
-This adds `POST /auth/token` with `{"username": "...", "password": "..."}` and `POST /auth/refresh` with `{"refresh_token": "..."}`. Both routes have a default IP-based limit of 10 requests per minute, including failed credential checks. To set a different limit, pass `throttle={"ip": "5/minute"}` to `jwt_auth.router(authenticate_user, throttle=...)`; pass `throttle={}` only when you intentionally want to disable the built-in limit. In production, select shared `SECURITY_STORAGE = "database"` or `"redis"` so limits apply across workers. Both routes return an `access_token` and `refresh_token`; access tokens expire after `TOKEN["LIFETIME_SECONDS"]` and refresh tokens after `TOKEN["REFRESH_LIFETIME_SECONDS"]`. Refresh tokens are rejected by protected routes.
+This adds `POST /auth/token` with `{"username": "...", "password": "..."}` and `POST /auth/refresh` with `{"refresh_token": "..."}`. Both routes have a default IP-based limit of 10 requests per minute, including failed credential checks. To set a different limit, pass `throttle={"ip": "5/minute"}` to `jwt_auth.router(authenticate_user, throttle=...)`; pass `throttle={}` only when you intentionally want to disable the built-in limit. In production, select shared `SECURITY_STORAGE = "database"` or `"redis"` so refresh-token replay protection and limits work across workers. Each refresh token is one-time-use: the first refresh returns a replacement refresh token, while a replay is rejected. The in-memory fallback protects only within one process. Refresh tokens issued before one-time-use identifiers were added must be replaced by signing in again. Both routes return an `access_token` and `refresh_token`; access tokens expire after `TOKEN["LIFETIME_SECONDS"]` and refresh tokens after `TOKEN["REFRESH_LIFETIME_SECONDS"]`. Refresh tokens are rejected by protected routes.
 
 `JWTAuth` does not authenticate usernames or passwords itself; your callback owns that check. Keep a high-entropy secret private and use HTTPS in deployed applications:
 

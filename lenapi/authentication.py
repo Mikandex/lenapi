@@ -91,7 +91,8 @@ def api_key(user_model, *, field="api_key", header_name="x-api-key"):
     return APIKeyAuth(header_name=header_name, authenticate=authenticate)
 
 
-def jwt_auth(settings, user_model=None, *, identifier_field="username", password_field="password"):
+def jwt_auth(settings, user_model=None, *, identifier_field="username", password_field="password",
+             security_store=None):
     """Create JWT authentication, optionally backed by a project user model.
 
     Use ``auth.router(authenticate)`` to mount token and refresh endpoints.
@@ -102,6 +103,7 @@ def jwt_auth(settings, user_model=None, *, identifier_field="username", password
         token_lifetime_seconds=token.get("LIFETIME_SECONDS", 3600),
         refresh_token_lifetime_seconds=token.get("REFRESH_LIFETIME_SECONDS", 60 * 60 * 24 * 30),
         issuer=token.get("ISSUER"),
+        security_store=security_store,
         authenticate=(
             _user_authenticator(user_model, identifier_field, password_field)
             if user_model is not None else None
@@ -148,7 +150,7 @@ def configure(settings, user_model=None, *, security_store=None):
     if mode == "api_key":
         return api_key(user_model)
     if mode == "jwt":
-        return jwt_auth(settings, user_model)
+        return jwt_auth(settings, user_model, security_store=security_store)
     if mode == "session":
         options = getattr(settings, "SESSION", {})
         return session(store=security_store, cookie_name=options.get("COOKIE_NAME", "lenapi_session"))

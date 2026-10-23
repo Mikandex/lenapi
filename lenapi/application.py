@@ -1,5 +1,6 @@
 """ASGI application, routers, and route dispatch."""
 
+import asyncio
 import inspect
 from importlib import import_module
 import hashlib
@@ -40,6 +41,25 @@ from .throttling import RateLimit, normalize_throttle
 
 
 logger = get_logger("websocket")
+
+
+async def _call_sync_or_async(endpoint: Callable, kwargs: dict[str, Any]):
+    """Run synchronous application code off the event loop.
+
+    ``asyncio.to_thread`` copies context variables, preserving the active
+    request and database-session context for synchronous dependencies/routes.
+    If a synchronous callable returns an awaitable, await it on the event loop.
+    """
+    async_call = inspect.iscoroutinefunction(endpoint) or inspect.iscoroutinefunction(
+        getattr(endpoint, "__call__", None)
+    )
+    if async_call:
+        result = endpoint(**kwargs)
+    else:
+        result = await asyncio.to_thread(endpoint, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 class Route:
@@ -448,9 +468,7 @@ class Application(Router):
                         auth_kwargs = await self._build_arguments(
                             auth_dependency, request, raw_params, session, dependency_cache, set(), async_session
                         )
-                        identity = auth_dependency(**auth_kwargs)
-                        if inspect.isawaitable(identity):
-                            identity = await identity
+                        identity = await _call_sync_or_async(auth_dependency, auth_kwargs)
                     except HTTPException:
                         response = await self._enforce_rate_limits(
                             route, request, None, scopes={"anonymous"}
@@ -466,9 +484,7 @@ class Application(Router):
                     kwargs = await self._build_arguments(
                         route.endpoint, request, raw_params, session, dependency_cache, set(), async_session
                     )
-                    result = route.endpoint(**kwargs)
-                    if inspect.isawaitable(result):
-                        result = await result
+                    result = await _call_sync_or_async(route.endpoint, kwargs)
                     if isinstance(result, Response):
                         response = result
                     else:
@@ -721,9 +737,7 @@ class Application(Router):
                         kwargs[name] = raw if annotation is inspect.Parameter.empty else TypeAdapter(annotation).validate_python(raw)
                     elif parameter.default is inspect.Parameter.empty:
                         raise ValueError(f"Missing WebSocket parameter: {name}")
-                result = route.endpoint(**kwargs)
-                if inspect.isawaitable(result):
-                    await result
+                await _call_sync_or_async(route.endpoint, kwargs)
             except WebSocketDisconnect:
                 pass
             except Exception:
@@ -918,9 +932,7 @@ class Application(Router):
                     dependency_kwargs = await cls._build_arguments(
                         dependency, request, path_params, session, cache, resolving, async_session
                     )
-                    result = dependency(**dependency_kwargs)
-                    if inspect.isawaitable(result):
-                        result = await result
+                    result = await _call_sync_or_async(dependency, dependency_kwargs)
                     cache[dependency] = result
                     resolving.remove(dependency)
                 values[name] = cache[dependency]
