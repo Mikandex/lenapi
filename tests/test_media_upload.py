@@ -82,7 +82,10 @@ async def asgi_request_async(app, path, *, method="GET", body=b"", headers=()):
     }
     await app(scope, receive, send)
     response_headers = dict(messages[0]["headers"])
-    return messages[0]["status"], response_headers, messages[1]["body"]
+    response_body = b"".join(
+        message.get("body", b"") for message in messages if message["type"] == "http.response.body"
+    )
+    return messages[0]["status"], response_headers, response_body
 
 
 def multipart_image():
@@ -134,6 +137,22 @@ def test_upload_rejects_non_multipart_content_type(tmp_path):
     assert json.loads(response_body)["detail"] == "Expected form data"
 
 
+def test_upload_with_existing_filename_does_not_replace_file(tmp_path):
+    destination = tmp_path / "avatar.png"
+    original = b"existing image contents"
+    destination.write_bytes(original)
+    upload = UploadFile("avatar.png", "image/png", PNG_BYTES)
+
+    try:
+        asyncio.run(upload.save_image(tmp_path, filename="avatar.png"))
+    except ValueError as exc:
+        assert "already exists" in str(exc)
+    else:
+        raise AssertionError("save_image should refuse to overwrite an existing path")
+
+    assert destination.read_bytes() == original
+
+
 def test_media_serving_rejects_paths_outside_media_root(tmp_path):
     secret = tmp_path.parent / "outside.txt"
     secret.write_text("private")
@@ -154,6 +173,23 @@ def test_media_serves_raster_images_inline_with_nosniff(tmp_path):
     assert headers[b"content-type"] == b"image/png"
     assert headers[b"x-content-type-options"] == b"nosniff"
     assert b"content-disposition" not in headers
+
+
+def test_media_files_are_streamed_without_eagerly_loading_contents(tmp_path):
+    from lenapi.response import FileResponse
+
+    app = make_app(tmp_path)
+    payload = b"x" * (160 * 1024)
+    (tmp_path / "large.bin").write_bytes(payload)
+
+    response = app._media_response("large.bin")
+    assert isinstance(response, FileResponse)
+    assert response.body == b""
+
+    status, headers, body = asgi_request(app, "/media/large.bin")
+    assert status == 200
+    assert headers[b"content-length"] == str(len(payload)).encode()
+    assert body == payload
 
 
 def test_media_downloads_active_content_instead_of_serving_inline(tmp_path):

@@ -1,6 +1,12 @@
 # lenApi
 
-lenApi is a small ASGI framework experiment inspired by FastAPI. Pydantic v2 validates request bodies, typed path/query parameters, and response models. Routers group endpoints, while SQLAlchemy provides the ORM and request-scoped sessions.
+**LenAPI** is a modern ASGI framework shaped by real-world experience building with Python backend frameworks. It brings routing, Pydantic validation, synchronous and asynchronous database access, migrations, and interactive API documentation together in a developer-friendly toolkit.
+
+LenAPI includes tools for common backend needs, including WebSockets, caching, background tasks, and authentication. Its social sign-in routes currently support Google, GitHub, and LinkedIn, with provider credentials and callback URLs configured by the developer.
+
+LenAPI aims to reduce repetitive code and simplify common integrations, helping developers build APIs with less setup. Its framework source is compact, while its full-featured installation includes database and server dependencies.
+
+**LenAPI — Compact by Design, Powerful by Capability.**
 
 ```python
 from pydantic import BaseModel, ConfigDict
@@ -239,7 +245,7 @@ from lenapi import LENAPI, Router
 
 app = LENAPI(throttle={
     "ip": "300/minute",                 # all requests, before authentication
-    "anonymous": "30/minute",           # public requests and failed route authentication
+    "anonymous": "30/minute",           # public calls and pre-auth requests by IP
     "authenticated": "600/minute",      # requests authenticated by route auth=
 })
 
@@ -257,7 +263,7 @@ def account():
 app.include_router(api)
 ```
 
-Rate strings accept seconds, minutes, hours, or days, for example `"10/second"`, `"60/minute"`, and `"1000/day"`. Throttling uses a fixed window that starts with the first request. `ip` counts every request from the client address, including attempts with invalid credentials. `anonymous` counts public calls and failed route-level authentication by IP. `authenticated` counts successful route-level authentication by a stable identity returned from `auth=`. Route and router `throttle=` values override inherited limits; an empty mapping disables inherited limits for that route or router. Endpoint-only auth declared with `Depends(...)` does not supply the identity to the throttle; attach it with `auth=` when you want authenticated quotas.
+Rate strings accept seconds, minutes, hours, or days, for example `"10/second"`, `"60/minute"`, and `"1000/day"`. Throttling uses a fixed window that starts with the first request. `ip` counts every request from the client address before authentication. `anonymous` counts public calls and, on routes using `auth=`, all requests from that IP before credentials are verified. This intentionally includes successful logins so repeated password checks are stopped before they consume CPU. `authenticated` counts successful route-level authentication by a stable identity returned from `auth=`. Routes using `BasicAuth` receive a default `ip` limit of 10 requests per minute if no pre-auth `ip` or `anonymous` limit is configured. Set `throttle={}` to deliberately disable the inherited and default limit. Route and router `throttle=` values otherwise override inherited limits; an empty mapping disables inherited limits for that route or router. Endpoint-only auth declared with `Depends(...)` does not supply the identity to the authenticated quota; attach it with `auth=` when you want identity-based quotas.
 
 When a quota is exceeded, LenAPI returns `429 Too Many Requests` with `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers. Quota counters use the same security backend as IP cooldowns. Choose `SECURITY_STORAGE = "database"` or `"redis"` in project `settings.py`. Database mode stores state in the internal `lenapi_security_store` table or MongoDB collection, initialized by migrations. Redis mode uses `REDIS_URL` and requires `pip install 'lenapi[redis]'` plus a running Redis server. The generated settings default to database storage and include `REDIS_URL = "redis://127.0.0.1:6379/0"` for switching to Redis. Shared database or Redis storage coordinates limits across workers. `SECURITY_STORAGE = "memory"` keeps counters in each process, so use it only for single-process development. LenAPI uses the ASGI connection's client address and does not trust forwarded-IP headers automatically; configure trusted proxy handling at your deployment edge before relying on IP quotas behind a proxy.
 
@@ -808,7 +814,7 @@ async def receive_event(payload: Any = Body()):
     return payload
 ```
 
-For image uploads, send `multipart/form-data` and read the `UploadFile` from `Request.form()`. `save_image()` accepts JPEG, PNG, GIF, WebP, or BMP only, checks the file signature against its content type, uses a generated safe filename, and returns the filename to store in the model:
+For image uploads, send `multipart/form-data` and read the `UploadFile` from `Request.form()`. `save_image()` accepts JPEG, PNG, GIF, WebP, or BMP only, checks the file signature against its content type, uses a generated safe filename by default, refuses to overwrite existing files when a filename is supplied, and returns the filename to store in the model:
 
 ```python
 from pathlib import Path

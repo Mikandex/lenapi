@@ -1,9 +1,9 @@
 """Reusable role, permission, and object ownership dependencies."""
 
-import inspect
 from collections.abc import Mapping
 from typing import Any, Callable
 
+from .concurrency import call_sync_or_async
 from .dependencies import Depends
 from .request import Request
 from .response import HTTPException
@@ -77,9 +77,7 @@ def require_owner(
         object_id = request.path_params.get(path_param)
         if object_id is None:
             raise HTTPException(400, f"Missing object path parameter '{path_param}'")
-        resource = load_object(str(object_id))
-        if inspect.isawaitable(resource):
-            resource = await resource
+        resource = await call_sync_or_async(load_object, str(object_id))
         if resource is None:
             raise HTTPException(404, "Not found")
 

@@ -6,6 +6,7 @@ import json
 from email import policy
 from email.parser import BytesParser
 from http.cookies import SimpleCookie
+import os
 from pathlib import Path
 import time
 import uuid
@@ -75,7 +76,20 @@ class UploadFile:
         destination = (root / safe_name).resolve()
         if not destination.is_relative_to(root):
             raise ValueError("Image destination must stay inside its upload directory")
-        await asyncio.to_thread(destination.write_bytes, self._data)
+        def write_exclusive() -> None:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+            try:
+                fd = os.open(destination, flags, 0o644)
+            except FileExistsError as exc:
+                raise ValueError("An image with this filename already exists") from exc
+            try:
+                with os.fdopen(fd, "wb") as image_file:
+                    image_file.write(self._data)
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
+
+        await asyncio.to_thread(write_exclusive)
         return safe_name
 
 

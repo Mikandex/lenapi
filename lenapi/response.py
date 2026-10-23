@@ -1,6 +1,9 @@
 """HTTP response types."""
 
+import asyncio
 import json
+import os
+import stat
 from collections.abc import Mapping
 from http.cookies import SimpleCookie
 from typing import Any
@@ -79,6 +82,68 @@ class JSONResponse(Response):
     def __init__(self, content: Any, *, status_code: int = 200, headers: Mapping[str, str] | None = None) -> None:
         body = json.dumps(content, ensure_ascii=False, separators=(",", ":"), default=_json_default).encode("utf-8")
         super().__init__(body, status_code=status_code, headers=headers, media_type="application/json")
+
+
+class FileResponse(Response):
+    """Stream a local file to the client in bounded chunks."""
+
+    def __init__(
+        self,
+        path,
+        *,
+        status_code: int = 200,
+        headers: Mapping[str, str] | None = None,
+        media_type: str = "application/octet-stream",
+        chunk_size: int = 64 * 1024,
+    ) -> None:
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+        super().__init__(b"", status_code=status_code, headers=headers, media_type=media_type)
+        self.path = os.fspath(path)
+        self.chunk_size = chunk_size
+
+    async def __call__(self, scope: dict, receive, send) -> None:
+        # O_NOFOLLOW prevents a final-component symlink swap between the
+        # media-root containment check and opening the file where supported.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        fd = None
+        try:
+            fd = await asyncio.to_thread(os.open, self.path, flags)
+            metadata = await asyncio.to_thread(os.fstat, fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                await asyncio.to_thread(os.close, fd)
+                fd = None
+                await Response(b"Not found", status_code=404)(scope, receive, send)
+                return
+        except OSError:
+            if fd is not None:
+                await asyncio.to_thread(os.close, fd)
+            await Response(b"Not found", status_code=404)(scope, receive, send)
+            return
+
+        headers = [
+            (key.lower().encode("latin-1"), value.encode("latin-1"))
+            for key, value in self.headers.items()
+        ]
+        headers.extend((b"set-cookie", value.encode("latin-1")) for value in self._cookies)
+        headers.append((b"content-length", str(metadata.st_size).encode("ascii")))
+        try:
+            await send({"type": "http.response.start", "status": self.status_code, "headers": headers})
+            remaining = metadata.st_size
+            while remaining > 0:
+                chunk = await asyncio.to_thread(os.read, fd, min(self.chunk_size, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                await send({"type": "http.response.body", "body": chunk, "more_body": remaining > 0})
+            if metadata.st_size == 0 or remaining == 0:
+                if metadata.st_size == 0:
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+            elif remaining > 0:
+                # A file truncated during transfer: end the stream cleanly.
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            await asyncio.to_thread(os.close, fd)
 
 
 class HTTPException(Exception):

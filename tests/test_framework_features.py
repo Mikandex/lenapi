@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import threading
 import time
 import uuid
 from decimal import Decimal
@@ -309,6 +310,76 @@ def test_jwt_token_and_refresh_routes_are_throttled_by_default_and_configurable(
     app.database.close()
 
 
+def test_anonymous_throttle_rejects_before_route_authentication():
+    app = make_app()
+    calls = []
+
+    def authenticate(username, password):
+        calls.append((username, password))
+        return None
+
+    @app.get("/protected", auth=BasicAuth(authenticate), throttle={"anonymous": "1/minute"})
+    def protected():
+        return {"ok": True}
+
+    credentials = base64.b64encode(b"ada:wrong")
+    headers = [(b"authorization", b"Basic " + credentials)]
+    first = json_request(app, "/protected", headers=headers)
+    second = json_request(app, "/protected", headers=headers)
+
+    assert first[0] == 401
+    assert second[0] == 429
+    assert calls == [("ada", "wrong")]
+    app.database.close()
+
+
+def test_basic_auth_gets_a_default_pre_auth_limit():
+    app = make_app()
+    calls = []
+
+    def authenticate(username, password):
+        calls.append((username, password))
+        return None
+
+    @app.get("/basic-limited", auth=BasicAuth(authenticate))
+    def basic_limited():
+        return {"ok": True}
+
+    credentials = base64.b64encode(b"ada:wrong")
+    headers = [(b"authorization", b"Basic " + credentials)]
+    results = [json_request(app, "/basic-limited", headers=headers) for _ in range(11)]
+
+    assert all(result[0] == 401 for result in results[:10])
+    assert results[10][0] == 429
+    assert len(calls) == 10
+    app.database.close()
+
+
+def test_database_auth_runs_dummy_password_check_for_unknown_user(monkeypatch):
+    from importlib import import_module
+
+    authentication_module = import_module("lenapi.authentication")
+
+    class MissingUserModel:
+        __table__ = SimpleNamespace(columns={"username": object(), "password": object()})
+
+        @classmethod
+        def get(cls, **_filters):
+            return SimpleNamespace(get=lambda: None)
+
+    checks = []
+
+    def check_password(password, encoded_hash):
+        checks.append((password, encoded_hash))
+        return False
+
+    monkeypatch.setattr(authentication_module, "check_password", check_password)
+    authenticate = authentication_module._user_authenticator(MissingUserModel)
+
+    assert authenticate("missing-user", "incorrect-password") is None
+    assert checks == [("incorrect-password", authentication_module._DUMMY_PASSWORD_HASH)]
+
+
 def test_jwt_auth_router_has_default_ip_throttle():
     jwt = JWTAuth("u" * 32)
     router = jwt.router(lambda _username, _password: None)
@@ -483,8 +554,15 @@ def test_authorization_role_permission_and_owner_dependencies():
     auth = lambda: {"sub": "12", "roles": ["editor"], "permissions": ["read", "write"]}
     role = require_role("admin", "editor", auth=auth)
     permission = require_permission("read", "write", match_all=True, auth=auth)
+    main_thread_id = threading.get_ident()
+    loader_thread_ids = []
+
+    def load_item(item_id):
+        loader_thread_ids.append(threading.get_ident())
+        return {"user_id": 12, "id": item_id}
+
     owner = require_owner(
-        lambda item_id: {"user_id": 12, "id": item_id}, auth=auth, path_param="item_id"
+        load_item, auth=auth, path_param="item_id"
     )
 
     @app.get("/role")
@@ -503,6 +581,7 @@ def test_authorization_role_permission_and_owner_dependencies():
     assert json_request(app, "/permission")[2] == {"sub": "12"}
     status, _headers, result = json_request(app, "/items/7")
     assert status == 200 and result["user_id"] == 12
+    assert loader_thread_ids and loader_thread_ids[0] != main_thread_id
     app.database.close()
 
 

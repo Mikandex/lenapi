@@ -19,7 +19,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .request import Request, reset_current_request, set_current_request
-from .response import HTTPException, JSONResponse, Response
+from .response import FileResponse, HTTPException, JSONResponse, Response
 from .dependencies import Depends
 from .concurrency import call_sync_or_async
 from .openapi import build_openapi, swagger_html
@@ -41,6 +41,32 @@ from .throttling import RateLimit, normalize_throttle
 
 
 logger = get_logger("websocket")
+
+
+def _uses_basic_auth(endpoint: Callable, auth: Any) -> bool:
+    """Detect BasicAuth supplied directly or through endpoint dependencies."""
+    from .security import BasicAuth
+
+    seen: set[int] = set()
+
+    def visit(dependency: Any) -> bool:
+        if isinstance(dependency, Depends):
+            dependency = dependency.dependency
+        if isinstance(dependency, BasicAuth):
+            return True
+        if not callable(dependency) or id(dependency) in seen:
+            return False
+        seen.add(id(dependency))
+        try:
+            parameters = inspect.signature(dependency).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            isinstance(parameter.default, Depends) and visit(parameter.default)
+            for parameter in parameters
+        )
+
+    return visit(auth) or visit(endpoint)
 
 
 class Route:
@@ -65,6 +91,13 @@ class Route:
         self.tag_name = tag_name
         self.auth = auth
         self.throttle = throttle
+        if _uses_basic_auth(endpoint, auth) and throttle != () and not any(
+            limit.scope in {"ip", "anonymous"} for limit in (throttle or ())
+        ):
+            # BasicAuth may perform an expensive password hash verification.
+            # Provide a pre-auth IP limit unless the route explicitly opts out
+            # with throttle={}; preserve any authenticated quota supplied.
+            self.throttle = (throttle or ()) + (RateLimit("ip", 10, 60),)
         self.api_flag = api_flag
         self.cool_time = cool_time
         self.regex, self.parameter_names = self._compile_path(path)
@@ -437,30 +470,23 @@ class Application(Router):
                     async_session_token = set_current_async_session(async_session)
                 dependency_cache: dict[Callable, Any] = {}
                 response = None
-                pre_auth_scopes = {"ip"}
-                if route.auth is None:
-                    pre_auth_scopes.add("anonymous")
+                # Authentication credentials are untrusted until verified.
+                # Apply anonymous limits before calling the authenticator so
+                # password hashing and other expensive checks are rate-limited.
+                pre_auth_scopes = {"ip", "anonymous"}
                 response = await self._enforce_rate_limits(
                     route, request, None, scopes=pre_auth_scopes
                 )
                 if response is None and route.auth is not None:
                     auth_dependency = route.auth.dependency if isinstance(route.auth, Depends) else route.auth
-                    try:
-                        auth_kwargs = await self._build_arguments(
-                            auth_dependency, request, raw_params, session, dependency_cache, set(), async_session
-                        )
-                        identity = await call_sync_or_async(auth_dependency, **auth_kwargs)
-                    except HTTPException:
-                        response = await self._enforce_rate_limits(
-                            route, request, None, scopes={"anonymous"}
-                        )
-                        if response is None:
-                            raise
-                    else:
-                        dependency_cache[auth_dependency] = identity
-                        response = await self._enforce_rate_limits(
-                            route, request, identity, scopes={"authenticated"}
-                        )
+                    auth_kwargs = await self._build_arguments(
+                        auth_dependency, request, raw_params, session, dependency_cache, set(), async_session
+                    )
+                    identity = await call_sync_or_async(auth_dependency, **auth_kwargs)
+                    dependency_cache[auth_dependency] = identity
+                    response = await self._enforce_rate_limits(
+                        route, request, identity, scopes={"authenticated"}
+                    )
                 if response is None:
                     kwargs = await self._build_arguments(
                         route.endpoint, request, raw_params, session, dependency_cache, set(), async_session
@@ -758,7 +784,7 @@ class Application(Router):
         headers = {"X-Content-Type-Options": "nosniff"}
         if media_type.lower() not in inline_image_types:
             headers["Content-Disposition"] = "attachment"
-        return Response(file_path.read_bytes(), media_type=media_type, headers=headers)
+        return FileResponse(file_path, media_type=media_type, headers=headers)
 
     async def _handle_lifespan(self, receive, send) -> None:
         while True:

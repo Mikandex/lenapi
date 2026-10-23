@@ -23,6 +23,14 @@ from .security import (
     make_password,
 )
 
+# A fixed, valid hash keeps the missing-user path doing password-hash work too,
+# reducing username-enumeration timing differences. This value is never used
+# to authenticate an account.
+_DUMMY_PASSWORD_HASH = (
+    "pbkdf2_sha256$1800000$Pe8aASgaamrPqx7hXk1orO$"
+    "9esnpuqwJ8N1RJhCnLIYcGD9ymQibrGYW6gbvheDbiw="
+)
+
 
 class UserRegistration(BaseModel):
     """Default request schema for registering a project user."""
@@ -61,7 +69,11 @@ def _user_authenticator(user_model, identifier_field="username", password_field=
 
     def authenticate(identifier, password):
         user = user_model.get(**{identifier_field: identifier}).get()
-        if user is not None and check_password(password, getattr(user, password_field)):
+        stored_password = (
+            getattr(user, password_field) if user is not None else _DUMMY_PASSWORD_HASH
+        )
+        password_matches = check_password(password, stored_password)
+        if user is not None and password_matches:
             return str(user.id)
         return None
 
