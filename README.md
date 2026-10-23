@@ -303,7 +303,7 @@ python -m pip install -e .
 lenora startproject my_api
 cd my_api
 python lenora.py migration
-python lenora.py runserver
+python lenora.py run
 ```
 
 Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LENAPI()` configures the authentication dependency without adding authentication routes. The framework repository contains the installable `lenapi` package; create an application scaffold separately with `lenora startproject`.
@@ -324,7 +324,7 @@ The `test`, `generate_test`, `run_test`, and `run_test_output` commands are appl
 
 Request bodies are limited to 10 MiB by default, and lenApi allows up to 30 seconds to receive the body. Configure `MAX_REQUEST_BODY_SIZE` (bytes) and `REQUEST_BODY_TIMEOUT_SECONDS` in `settings.py`; set either to `None` to disable that limit. Oversized bodies receive HTTP 413, and bodies that exceed the receive timeout receive HTTP 408. Direct `Application(...)` instances accept the equivalent `max_request_body_size` and `request_body_timeout` arguments.
 
-The runserver command looks for `app` in the current application's `main.py`. It watches application files and reloads the server when code changes. The default port is `8009`. Change `PORT` in application `settings.py` or pass `--port` to `runserver`, for example `python lenora.py runserver --port 8010`. Host and app can also be changed with `--host` and `--app package.module:variable`; disable reload with `--no-reload`. Installing the package also provides the `lenora runserver` command.
+The `run` command looks for `app` in the current application's `main.py`. It watches application files and reloads the server when code changes. The default port is `8009`. Change `PORT` in application `settings.py` or pass `--port` to `run`, for example `python lenora.py run --port 8010`. Host and app can also be changed with `--host` and `--app package.module:variable`; disable reload with `--no-reload`. Installing the package also provides the `lenora run` command. The former `runserver` spelling remains available as a compatibility alias.
 
 ## Async database access
 
@@ -1132,7 +1132,7 @@ The engine is disposed on ASGI lifespan shutdown. For response serialization fro
 - Pydantic request body models and response models
 - mountable `Router` groups
 - optional request-scoped SQLAlchemy `Session` injection
-- `python lenora.py runserver` development command (default port `8009`); `python lenora.py migration` generates and applies model migrations
+- `python lenora.py run` development command (default port `8009`; `runserver` remains an alias); `python lenora.py migration` generates and applies model migrations
 - Migration commands compare the database revision with migration files and skip the database upgrade when there is no new revision to apply
 - Swagger UI at `/docs/` and generated OpenAPI 3.1 at `/openapi.json`
 - JSON responses by default, with `Response` and `JSONResponse` for explicit control

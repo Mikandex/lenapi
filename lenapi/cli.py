@@ -52,7 +52,7 @@ REDIS_URL = "redis://127.0.0.1:6379/0"
 CACHE_BACKEND = "memory"  # "memory", "database", or "redis".
 # Optional fixed-window request quotas. Scopes: "ip", "anonymous", "authenticated".
 THROTTLE_RATES = {}  # Example: {"anonymous": "60/minute", "authenticated": "300/minute"}
-# runserver uses these values; blank HOST falls back to 127.0.0.1.
+# run uses these values; blank HOST falls back to 127.0.0.1.
 HOST = ""
 PORT = 8009
 DATABASE_TYPE = "sqlite"  # "sqlite", "mysql", "postgresql", or "mongodb".
@@ -303,7 +303,7 @@ first migration includes the framework `User` and `AdminUser` tables.
 
 ```bash
 python lenora.py migration
-python lenora.py runserver
+python lenora.py run
 ```
 
 Migration checks for schema changes and skips the database upgrade when there is no new revision to apply. Set `SAFE_GUARD_DOCS_URL = True` in `settings.py` and run `python lenora.py admin` to enable database-backed login for `/docs/`.
@@ -346,7 +346,7 @@ def _main() -> None:
             "Examples:\n"
             "  python lenora.py startproject myproject\n"
             "  python lenora.py apikey\n"
-            "  python lenora.py runserver --port 8010\n"
+            "  python lenora.py run --port 8010\n"
             "  python lenora.py migration --message add_users\n\n"
             "For flags and arguments for a command, run: "
             "python lenora.py <command> --help"
@@ -354,14 +354,14 @@ def _main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    runserver = commands.add_parser("runserver", help="run the ASGI development server")
-    runserver.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
-    runserver.add_argument("--host", help="host to bind (default: project settings or 127.0.0.1)")
-    runserver.add_argument("--port", type=int, help="port to bind (default: project settings or 8009)")
-    reload_options = runserver.add_mutually_exclusive_group()
+    run_command = commands.add_parser("run", aliases=["runserver"], help="run the ASGI development server")
+    run_command.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
+    run_command.add_argument("--host", help="host to bind (default: project settings or 127.0.0.1)")
+    run_command.add_argument("--port", type=int, help="port to bind (default: project settings or 8009)")
+    reload_options = run_command.add_mutually_exclusive_group()
     reload_options.add_argument("--reload", dest="reload", action="store_true", help="reload when project files change (default)")
     reload_options.add_argument("--no-reload", dest="reload", action="store_false", help="disable automatic reload")
-    runserver.set_defaults(reload=True)
+    run_command.set_defaults(reload=True)
 
     startproject = commands.add_parser("startproject", help="create a new lenApi project")
     startproject.add_argument("name", nargs="?", default="lenApp", help="project folder name (default: lenApp)")
@@ -425,11 +425,14 @@ def _main() -> None:
     test_command.add_argument("paths", nargs="*", help="optional pytest files or directories")
 
     args = parser.parse_args()
+    # Keep the former spelling working for existing projects and scripts.
+    if args.command == "runserver":
+        args.command = "run"
 
     if args.command in {"run_test", "run_test_output", "test"} and find_spec("pytest") is None:
         parser.error("pytest is missing; reinstall lenApi or install it with `python -m pip install pytest`")
 
-    if args.command == "runserver":
+    if args.command == "run":
         project_settings = None
         if (Path.cwd() / "settings.py").is_file():
             project_settings = import_module("settings")
@@ -459,7 +462,7 @@ def _main() -> None:
             shutil.rmtree(project_dir, ignore_errors=True)
             parser.error(f"could not create project: {exc}")
         print(f"Created lenApi project in {project_dir}")
-        print(f"Next: cd {args.name} && python lenora.py migration && python lenora.py runserver")
+        print(f"Next: cd {args.name} && python lenora.py migration && python lenora.py run")
         return
 
     if args.command == "apikey":
@@ -697,11 +700,11 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             generated_test_temp.cleanup()
         raise SystemExit(result.returncode)
 
-    if args.command == "runserver":
+    if args.command == "run":
         try:
             import uvicorn
         except ImportError:
-            parser.error("runserver requires Uvicorn; install LenApi with `python -m pip install lenapi`")
+            parser.error("run requires Uvicorn; install LenApi with `python -m pip install lenapi`")
         print(f"lenApi server: http://{args.host}:{args.port}", flush=True)
         uvicorn.run(args.app, host=args.host, port=args.port, reload=args.reload)
         return
