@@ -501,7 +501,7 @@ def profile(user: dict = Depends(current_user)):
     return user
 ```
 
-Dependencies are cached once per request, so if multiple parameters use the same dependency callable, it runs once. Synchronous routes, dependencies, and authentication callbacks run in a worker thread so blocking I/O in them does not block the ASGI event loop. Async routes run on the event loop; use async I/O there or explicitly offload blocking work yourself.
+Dependencies are cached once per request, so if multiple parameters use the same dependency callable, it runs once. Synchronous routes, dependencies, authentication and token-lookup callbacks, HMAC nonce-store methods, and `DocsAuthMiddleware` authenticators run in a worker thread so blocking I/O in them does not block the ASGI event loop. Async callbacks run on the event loop; use async I/O there or explicitly offload blocking work yourself.
 
 ## JWT bearer authentication
 

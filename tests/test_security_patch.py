@@ -2,15 +2,33 @@ import asyncio
 import importlib
 import json
 import threading
+import time
 from urllib.parse import urlencode
 
-from lenapi import Application, Database, Depends, JWTAuth, WebSocketService
+import pytest
+
+from lenapi import (
+    APIKeyAuth,
+    Application,
+    BasicAuth,
+    Database,
+    Depends,
+    HMACAuth,
+    JWTAuth,
+    OpaqueBearerAuth,
+    SessionAuth,
+    WebSocketService,
+    hmac_request_signature,
+)
+from lenapi.middleware import DocsAuthMiddleware
 from lenapi.models import SECURITY_STORE_TABLE
 
 
-async def _http_request(app, path, *, method="GET", payload=None):
+async def _http_request(app, path, *, method="GET", payload=None, headers=()):
     body = b"" if payload is None else json.dumps(payload).encode()
-    headers = [(b"content-type", b"application/json")] if payload is not None else []
+    headers = list(headers)
+    if payload is not None:
+        headers.append((b"content-type", b"application/json"))
     messages = []
     delivered = False
 
@@ -267,6 +285,160 @@ def test_sync_route_does_not_block_event_loop():
         status, body = asyncio.run(run())
         assert status == 200
         assert body == {"value": "ready"}
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    ("auth_kind", "headers"),
+    [
+        ("api_key", [(b"x-api-key", b"presented-key")]),
+        ("basic", [(b"authorization", b"Basic YWRhOnBhc3M=")]),
+        ("session", [(b"cookie", b"lenapi_session=session-id")]),
+        ("opaque", [(b"authorization", b"Bearer opaque-token")]),
+    ],
+)
+def test_sync_builtin_auth_lookups_do_not_block_event_loop(auth_kind, headers):
+    app = Application(security_storage="memory")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_lookup(*_args):
+        entered.set()
+        release.wait(timeout=3)
+        return {"sub": "authenticated-user"}
+
+    auth = {
+        "api_key": lambda: APIKeyAuth(authenticate=slow_lookup),
+        "basic": lambda: BasicAuth(slow_lookup),
+        "session": lambda: SessionAuth(slow_lookup),
+        "opaque": lambda: OpaqueBearerAuth(slow_lookup),
+    }[auth_kind]()
+
+    @app.get("/protected", auth=auth)
+    async def protected():
+        return {"ok": True}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    async def run():
+        protected_request = asyncio.create_task(
+            _http_request(app, "/protected", headers=headers)
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not protected_request.done()
+        health_status, health_body = await asyncio.wait_for(
+            _http_request(app, "/health"), timeout=0.5
+        )
+        release.set()
+        protected_status, protected_body = await protected_request
+        return health_status, health_body, protected_status, protected_body
+
+    try:
+        assert asyncio.run(run()) == (
+            200, {"status": "ok"}, 200, {"ok": True}
+        )
+    finally:
+        release.set()
+
+
+def test_docs_auth_middleware_offloads_sync_authenticator():
+    app = Application(security_storage="memory")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_authenticator(_request):
+        entered.set()
+        release.wait(timeout=3)
+        return {"sub": "docs-user"}
+
+    @app.get("/private-docs")
+    async def private_docs():
+        return {"ok": True}
+
+    app.add_middleware(
+        DocsAuthMiddleware, auth=slow_authenticator, paths=("/private-docs",)
+    )
+
+    async def run():
+        protected_request = asyncio.create_task(_http_request(app, "/private-docs"))
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not protected_request.done()
+        health_status, health_body = await asyncio.wait_for(
+            _http_request(app, "/health"), timeout=0.5
+        )
+        release.set()
+        protected_status, protected_body = await protected_request
+        return health_status, health_body, protected_status, protected_body
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    try:
+        assert asyncio.run(run()) == (
+            200, {"status": "ok"}, 200, {"ok": True}
+        )
+    finally:
+        release.set()
+
+
+def test_sync_hmac_nonce_store_does_not_block_event_loop():
+    app = Application(security_storage="memory")
+    entered = threading.Event()
+    release = threading.Event()
+    secret = "h" * 32
+
+    class SlowNonceStore:
+        def claim(self, _key, _ttl):
+            entered.set()
+            release.wait(timeout=3)
+            return 0
+
+    auth = HMACAuth(secret, nonce_store=SlowNonceStore())
+
+    @app.post("/signed", auth=auth)
+    async def signed():
+        return {"ok": True}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    body = b"{}"
+    timestamp = str(int(time.time()))
+    nonce = "request-nonce"
+    signature = hmac_request_signature(
+        secret, "POST", "/signed", timestamp, body, nonce=nonce
+    )
+
+    async def run():
+        protected_request = asyncio.create_task(_http_request(
+            app,
+            "/signed",
+            method="POST",
+            payload={},
+            headers=[
+                (b"x-lenapi-timestamp", timestamp.encode()),
+                (b"x-lenapi-nonce", nonce.encode()),
+                (b"x-lenapi-signature", signature.encode()),
+            ],
+        ))
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not protected_request.done()
+        health_status, health_body = await asyncio.wait_for(
+            _http_request(app, "/health"), timeout=0.5
+        )
+        release.set()
+        protected_status, protected_body = await protected_request
+        return health_status, health_body, protected_status, protected_body
+
+    try:
+        assert asyncio.run(run()) == (
+            200, {"status": "ok"}, 200, {"ok": True}
+        )
     finally:
         release.set()
 

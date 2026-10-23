@@ -1,11 +1,9 @@
 """Small HS256 JWT authentication helper for protected lenApi routes."""
 
-import asyncio
 import base64
 import binascii
 import hashlib
 import hmac as _hmac
-import inspect
 import json
 import math
 import re
@@ -16,6 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .concurrency import call_sync_or_async
 from .request import Request
 from .response import HTTPException, Response
 
@@ -212,9 +211,7 @@ class JWTAuth:
         store = security_store if security_store is not None else self.security_store
         key = f"jwt_refresh_used:{self._refresh_namespace}:{token_id}"
         if store is not None:
-            used = store.claim(key, ttl)
-            if inspect.isawaitable(used):
-                used = await used
+            used = await call_sync_or_async(store.claim, key, ttl)
             if used:
                 raise ValueError("Refresh token has already been used")
             return
@@ -251,16 +248,9 @@ class JWTAuth:
 
         @router.post("/token", include_in_schema=False, throttle=token_throttle)
         async def issue_token(credentials: _Credentials):
-            if inspect.iscoroutinefunction(authenticate) or inspect.iscoroutinefunction(
-                getattr(authenticate, "__call__", None)
-            ):
-                user = authenticate(credentials.username, credentials.password)
-            else:
-                user = await asyncio.to_thread(
-                    authenticate, credentials.username, credentials.password
-                )
-            if inspect.isawaitable(user):
-                user = await user
+            user = await call_sync_or_async(
+                authenticate, credentials.username, credentials.password
+            )
             if user is None or user is False:
                 raise HTTPException(401, "Invalid username or password")
             if isinstance(user, tuple) and len(user) == 2:
@@ -372,9 +362,7 @@ class APIKeyAuth:
     async def __call__(self, request: Request) -> Any:
         supplied = request.headers.get(self.header_name, "")
         if self.authenticate is not None:
-            identity = self.authenticate(supplied)
-            if inspect.isawaitable(identity):
-                identity = await identity
+            identity = await call_sync_or_async(self.authenticate, supplied)
             if identity is not None and identity is not False:
                 return identity
         elif supplied and _hmac.compare_digest(supplied.encode("utf-8"), self.api_key):
@@ -400,9 +388,7 @@ class BasicAuth:
             raise HTTPException(401, "Invalid Basic credentials", headers={"WWW-Authenticate": 'Basic realm="lenApi"'}) from exc
         if not username or not password:
             raise HTTPException(401, "Invalid Basic credentials", headers={"WWW-Authenticate": 'Basic realm="lenApi"'})
-        user = self.authenticate(username, password)
-        if inspect.isawaitable(user):
-            user = await user
+        user = await call_sync_or_async(self.authenticate, username, password)
         if user is None or user is False:
             raise HTTPException(401, "Invalid username or password", headers={"WWW-Authenticate": 'Basic realm="lenApi"'})
         return user
@@ -421,17 +407,16 @@ class SessionAuth:
     async def __call__(self, request: Request) -> Any:
         session_id = request.cookies.get(self.cookie_name)
         if session_id and self.store is not None:
-            serialized = self.store.get(f"session:{session_id}")
-            if inspect.isawaitable(serialized):
-                serialized = await serialized
+            serialized = await call_sync_or_async(self.store.get, f"session:{session_id}")
             try:
                 identity = json.loads(serialized) if serialized is not None else None
             except (TypeError, json.JSONDecodeError):
                 identity = None
         else:
-            identity = self.lookup(session_id) if session_id and self.lookup is not None else None
-        if inspect.isawaitable(identity):
-            identity = await identity
+            identity = (
+                await call_sync_or_async(self.lookup, session_id)
+                if session_id and self.lookup is not None else None
+            )
         if identity is None or identity is False:
             raise HTTPException(401, "Valid session required")
         return identity
@@ -452,17 +437,15 @@ class OpaqueBearerAuth:
         identity = None
         if separator and scheme.lower() == "bearer" and token.strip():
             if self.store is not None:
-                serialized = self.store.get(f"opaque_bearer:{token.strip()}")
-                if inspect.isawaitable(serialized):
-                    serialized = await serialized
+                serialized = await call_sync_or_async(
+                    self.store.get, f"opaque_bearer:{token.strip()}"
+                )
                 try:
                     identity = json.loads(serialized) if serialized is not None else None
                 except (TypeError, json.JSONDecodeError):
                     identity = None
             else:
-                identity = self.lookup(token.strip())
-            if inspect.isawaitable(identity):
-                identity = await identity
+                identity = await call_sync_or_async(self.lookup, token.strip())
         if identity is None or identity is False:
             raise HTTPException(401, "Valid bearer token required", headers={"WWW-Authenticate": "Bearer"})
         return identity
@@ -657,9 +640,9 @@ class HMACAuth:
         if not _hmac.compare_digest(supplied, expected):
             raise HTTPException(401, "Invalid signed request", headers={"WWW-Authenticate": "HMAC"})
         if self.nonce_store is not None:
-            used = self.nonce_store.claim(f"hmac_nonce:{nonce}", self.tolerance_seconds)
-            if inspect.isawaitable(used):
-                used = await used
+            used = await call_sync_or_async(
+                self.nonce_store.claim, f"hmac_nonce:{nonce}", self.tolerance_seconds
+            )
             if used:
                 raise HTTPException(401, "Signed request has already been used", headers={"WWW-Authenticate": "HMAC"})
         else:

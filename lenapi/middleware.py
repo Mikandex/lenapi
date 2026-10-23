@@ -2,12 +2,12 @@
 
 import secrets
 import time
-import inspect
 import zlib
 from collections.abc import Iterable
 
 from .request import Request
 from .response import HTTPException, JSONResponse
+from .concurrency import call_sync_or_async
 from .models import reset_current_async_session, reset_current_session, set_current_async_session, set_current_session
 
 
@@ -290,9 +290,7 @@ class DocsAuthMiddleware:
             set_current_async_session(async_session) if async_session is not None else None
         )
         try:
-            identity = self.auth(request)
-            if inspect.isawaitable(identity):
-                identity = await identity
+            identity = await call_sync_or_async(self.auth, request)
             if identity is None or identity is False:
                 raise HTTPException(401, "Authentication required")
         except HTTPException as exc:
