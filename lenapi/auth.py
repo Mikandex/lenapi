@@ -12,6 +12,7 @@ from sqlalchemy import insert, select
 from sqlalchemy.exc import IntegrityError
 
 from .authentication import jwt_auth
+from .concurrency import call_sync_or_async
 from .models import SOCIAL_ACCOUNT_TABLE, User, _session
 from .request import get_current_request
 from .response import HTTPException, JSONResponse, Response
@@ -179,7 +180,10 @@ class SocialAuth:
                 identity = self._normalize_identity(provider, profile)
                 if not identity.get("sub"):
                     raise ValueError(f"{provider} profile did not include an account ID")
-                user_id = self._resolve_user(provider, identity) if self.auto_register else None
+                user_id = (
+                    await call_sync_or_async(self._resolve_user, provider, identity)
+                    if self.auto_register else None
+                )
             except HTTPException as exc:
                 return self._callback_error(provider, state_cookie, verifier_cookie,
                                             str(exc.detail), exc.status_code)

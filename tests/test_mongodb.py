@@ -158,6 +158,20 @@ def test_sync_get_rejects_multiple_matches(mongo_db):
         Student.get(name="Ada")
 
 
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"name": {"$ne": "Ada"}},
+        {"$where": "true"},
+        {"profile.$where": "true"},
+        {"profile": {"preferences": {"$gt": 1}}},
+    ],
+)
+def test_mongo_filters_reject_query_operators(mongo_db, filters):
+    with pytest.raises(ValueError, match="filter operators are not accepted"):
+        Student.filter(**filters)
+
+
 def test_async_document_crud(mongo_db):
     async def run():
         student = await Student.acreate(name="Grace", course="Python")

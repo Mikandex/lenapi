@@ -749,7 +749,16 @@ class Application(Router):
         if not file_path.is_relative_to(root) or not file_path.is_file():
             return Response(b"Not found", status_code=404)
         media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-        return Response(file_path.read_bytes(), media_type=media_type)
+        # Only passive raster formats are served inline. Other files from a
+        # public upload directory download instead of executing in the app's
+        # origin (for example HTML, SVG, XML, or script files).
+        inline_image_types = {
+            "image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
+        }
+        headers = {"X-Content-Type-Options": "nosniff"}
+        if media_type.lower() not in inline_image_types:
+            headers["Content-Disposition"] = "attachment"
+        return Response(file_path.read_bytes(), media_type=media_type, headers=headers)
 
     async def _handle_lifespan(self, receive, send) -> None:
         while True:

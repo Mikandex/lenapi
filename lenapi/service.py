@@ -1,7 +1,6 @@
 """Optional services for WebSockets, caching, background jobs, and AI APIs."""
 
 import asyncio
-import inspect
 import json
 import math
 import threading
@@ -10,6 +9,7 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from .dependencies import Depends
+from .concurrency import call_sync_or_async
 from .request import Request
 from .response import HTTPException
 
@@ -267,9 +267,7 @@ class WebSocketService:
             return {"type": "http.request", "body": b"", "more_body": False}
 
         request = Request(scope, empty_body, max_body_size=0, body_timeout=1)
-        identity = dependency(request)
-        if inspect.isawaitable(identity):
-            identity = await identity
+        identity = await call_sync_or_async(dependency, request)
         if identity is None or identity is False:
             raise HTTPException(401, "WebSocket authentication failed")
         return identity

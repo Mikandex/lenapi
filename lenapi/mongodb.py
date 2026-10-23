@@ -105,6 +105,19 @@ def _object_id(value):
 
 
 def _mongo_filter(filters: dict[str, Any]) -> dict[str, Any]:
+    def reject_operators(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if not isinstance(key, str) or any(part.startswith("$") for part in key.split(".")):
+                    raise ValueError(
+                        "MongoDB filter operators are not accepted; use field values for exact-match filters"
+                    )
+                reject_operators(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                reject_operators(nested)
+
+    reject_operators(filters)
     result = dict(filters)
     if "id" in result:
         result["_id"] = _object_id(result.pop("id"))

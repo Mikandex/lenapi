@@ -144,6 +144,34 @@ def test_media_serving_rejects_paths_outside_media_root(tmp_path):
     assert status == 404
 
 
+def test_media_serves_raster_images_inline_with_nosniff(tmp_path):
+    app = make_app(tmp_path)
+    (tmp_path / "safe.png").write_bytes(PNG_BYTES)
+
+    status, headers, _body = asgi_request(app, "/media/safe.png")
+
+    assert status == 200
+    assert headers[b"content-type"] == b"image/png"
+    assert headers[b"x-content-type-options"] == b"nosniff"
+    assert b"content-disposition" not in headers
+
+
+def test_media_downloads_active_content_instead_of_serving_inline(tmp_path):
+    app = make_app(tmp_path)
+    (tmp_path / "page.html").write_text("<script>alert(1)</script>")
+    (tmp_path / "vector.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'/>")
+
+    for path, expected_type in (
+        ("/media/page.html", b"text/html"),
+        ("/media/vector.svg", b"image/svg+xml"),
+    ):
+        status, headers, _body = asgi_request(app, path)
+        assert status == 200
+        assert headers[b"content-type"].startswith(expected_type)
+        assert headers[b"content-disposition"] == b"attachment"
+        assert headers[b"x-content-type-options"] == b"nosniff"
+
+
 def test_openapi_documents_multipart_file_field(tmp_path):
     app = make_app(tmp_path)
     status, _headers, response_body = asgi_request(app, "/openapi.json")

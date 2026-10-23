@@ -115,6 +115,39 @@ class FakeWebSocket:
         self.events.append(("accept", subprotocol))
 
 
+def test_websocket_sync_auth_dependency_runs_off_event_loop_thread():
+    service = WebSocketService(path="/ws/chat")
+    event_loop_thread = threading.get_ident()
+    callback_threads = []
+
+    def authenticate(_request):
+        callback_threads.append(threading.get_ident())
+        return {"id": 7}
+
+    service.auth = authenticate
+    identity = asyncio.run(service._authenticate(FakeWebSocket()))
+
+    assert identity == {"id": 7}
+    assert callback_threads
+    assert callback_threads[0] != event_loop_thread
+
+
+def test_websocket_async_auth_dependency_stays_async():
+    service = WebSocketService(path="/ws/chat")
+    event_loop_thread = threading.get_ident()
+    callback_threads = []
+
+    async def authenticate(_request):
+        callback_threads.append(threading.get_ident())
+        return {"id": 7}
+
+    service.auth = authenticate
+    identity = asyncio.run(service._authenticate(FakeWebSocket()))
+
+    assert identity == {"id": 7}
+    assert callback_threads == [event_loop_thread]
+
+
 def test_websocket_allowlist_rejects_missing_origin():
     service = WebSocketService(path="/ws/chat", allowed_origins=["https://app.example"])
     socket = FakeWebSocket()
