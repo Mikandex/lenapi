@@ -49,6 +49,7 @@ from .middleware import CORSMiddleware, DocsAuthMiddleware, GZipMiddleware, Requ
 from .service import Cache, Faker, Ollama, OpenAI, WebSocket, WebSocketConnection, WebSocketDisconnect, WebSocketService
 from .payments import Flutterwave, Nomba, PaymentPlugin, Payments, Paystack, Stripe, payment_provider, register_payment_provider
 from .response import HTTPException, JSONResponse, Response
+from .sentinels import UNSET
 from .security import (
     APIKeyAuth,
     BasicAuth,
@@ -79,5 +80,5 @@ __all__ = [
     "Application", "LENAPI", "Router", "Depends", "BackgroundTasks", "BackgroundQueue", "Cache", "Faker", "OpenAI", "Ollama", "Payments", "PaymentPlugin", "Nomba", "Flutterwave", "Stripe", "Paystack", "payment_provider", "register_payment_provider", "CORSMiddleware", "DocsAuthMiddleware", "GZipMiddleware", "RequestIDMiddleware", "TimingMiddleware", "require_role", "require_permission", "require_owner", "Database", "AsyncDatabase", "MongoDatabase", "MongoDocument", "MultipleDocumentsFound", "Body", "Model", "AdminUser", "AutoField", "logger", "get_logger", "WebSocket", "WebSocketConnection", "WebSocketDisconnect", "WebSocketService",
     "IntegerField", "BigIntField", "BigIntegerField", "DecimalField", "StringField", "EmailField", "IPField", "PhoneField", "TextField", "UUIDField", "ImageField", "BooleanField", "FloatField", "User",
     "DateTimeField", "JSONField", "ForeignKeyField", "ManyToManyField", "Count", "Sum", "Min", "Max", "Avg", "Request", "UploadFile", "Response", "JSONResponse",
-    "HTTPException", "JWTAuth", "APIKeyAuth", "BasicAuth", "CSRFProtect", "SessionAuth", "OpaqueBearerAuth", "HMACAuth", "OIDCAuth", "WebhookAuth", "hmac_request_signature", "session_auth", "opaque_bearer_auth", "hmac_auth", "oidc_auth", "webhook_auth", "create_authenticator", "authentication", "SocialAuth", "hash_password", "verify_password", "make_password", "check_password", "make_api_key", "hash_api_key", "model", "CASCADE", "SET_NULL", "PROTECT", "cascade", "null", "protected",
+    "HTTPException", "JWTAuth", "APIKeyAuth", "BasicAuth", "CSRFProtect", "SessionAuth", "OpaqueBearerAuth", "HMACAuth", "OIDCAuth", "WebhookAuth", "hmac_request_signature", "session_auth", "opaque_bearer_auth", "hmac_auth", "oidc_auth", "webhook_auth", "create_authenticator", "authentication", "SocialAuth", "hash_password", "verify_password", "make_password", "check_password", "make_api_key", "hash_api_key", "UNSET", "model", "CASCADE", "SET_NULL", "PROTECT", "cascade", "null", "protected",
 ]

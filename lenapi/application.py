@@ -38,6 +38,7 @@ from .logging import get_logger
 from .service import Cache, WebSocket, WebSocketDisconnect
 from .docs_guard import DocsGuard, render_login_page
 from .throttling import RateLimit, normalize_throttle
+from .sentinels import UNSET
 
 
 logger = get_logger("websocket")
@@ -1002,18 +1003,18 @@ class LENAPI(Application):
                  async_database: AsyncDatabase | None = None,
                  mongodb: MongoDatabase | None = None,
                  title: str | None = None, version: str | None = None,
-                 docs_url: str | None = None, openapi_url: str | None = None,
-                 max_request_body_size: int | None = None,
-                 request_body_timeout: float | None = None,
+                 docs_url: Any = UNSET, openapi_url: Any = UNSET,
+                 max_request_body_size: Any = UNSET,
+                 request_body_timeout: Any = UNSET,
                  ip_flag_backend: str | None = None, redis_url: str | None = None,
                  security_storage: str | None = None,
                  cache_backend: str | None = None,
-                 media_root: str | Path | None = None, media_url: str | None = None,
+                 media_root: Any = UNSET, media_url: Any = UNSET,
                  tag_name: str | None = None, auth: Any = None,
                  throttle: dict[str, str] | None = None,
                  safe_guard_docs_url: bool | None = None,
                  docs_session_lifetime_seconds: int | None = None,
-                 docs_cookie_secure: bool | None = None,
+                 docs_cookie_secure: Any = UNSET,
                  docs_login_max_attempts: int | None = None,
                  docs_login_window_seconds: int | None = None) -> None:
         # Project settings are optional, so importing lenapi outside a project
@@ -1096,12 +1097,14 @@ class LENAPI(Application):
             mongodb=configured_mongodb,
             title=title or getattr(project_settings, "API_TITLE", "lenApi"),
             version=version or getattr(project_settings, "API_VERSION", "0.1.0"),
-            docs_url=docs_url if docs_url is not None else getattr(project_settings, "DOCS_URL", "/docs/"),
-            openapi_url=openapi_url if openapi_url is not None else getattr(project_settings, "OPENAPI_URL", "/openapi.json"),
-            max_request_body_size=(max_request_body_size if max_request_body_size is not None else
-                                   getattr(project_settings, "MAX_REQUEST_BODY_SIZE", 10 * 1024 * 1024)),
-            request_body_timeout=(request_body_timeout if request_body_timeout is not None else
-                                  getattr(project_settings, "REQUEST_BODY_TIMEOUT_SECONDS", 30.0)),
+            docs_url=_setting_override(docs_url, project_settings, "DOCS_URL", "/docs/"),
+            openapi_url=_setting_override(openapi_url, project_settings, "OPENAPI_URL", "/openapi.json"),
+            max_request_body_size=_setting_override(
+                max_request_body_size, project_settings, "MAX_REQUEST_BODY_SIZE", 10 * 1024 * 1024
+            ),
+            request_body_timeout=_setting_override(
+                request_body_timeout, project_settings, "REQUEST_BODY_TIMEOUT_SECONDS", 30.0
+            ),
             ip_flag_backend=(ip_flag_backend if ip_flag_backend is not None else
                              getattr(project_settings, "IP_FLAG_BACKEND", None)),
             redis_url=redis_url if redis_url is not None else getattr(
@@ -1110,8 +1113,8 @@ class LENAPI(Application):
             security_storage=(security_storage if security_storage is not None else
                               getattr(project_settings, "SECURITY_STORAGE", None)),
             cache_backend=cache_backend or getattr(project_settings, "CACHE_BACKEND", "memory"),
-            media_root=media_root if media_root is not None else getattr(project_settings, "MEDIA_ROOT", None),
-            media_url=media_url if media_url is not None else getattr(project_settings, "MEDIA_URL", None),
+            media_root=_setting_override(media_root, project_settings, "MEDIA_ROOT", None),
+            media_url=_setting_override(media_url, project_settings, "MEDIA_URL", None),
             tag_name=tag_name,
             auth=auth,
             throttle=(throttle if throttle is not None else
@@ -1120,8 +1123,9 @@ class LENAPI(Application):
                                  getattr(project_settings, "SAFE_GUARD_DOCS_URL", False)),
             docs_session_lifetime_seconds=(docs_session_lifetime_seconds if docs_session_lifetime_seconds is not None else
                                            getattr(project_settings, "DOCS_SESSION_LIFETIME_SECONDS", 3600)),
-            docs_cookie_secure=(docs_cookie_secure if docs_cookie_secure is not None else
-                                getattr(project_settings, "DOCS_COOKIE_SECURE", None)),
+            docs_cookie_secure=_setting_override(
+                docs_cookie_secure, project_settings, "DOCS_COOKIE_SECURE", None
+            ),
             docs_login_max_attempts=(docs_login_max_attempts if docs_login_max_attempts is not None else
                                      getattr(project_settings, "DOCS_LOGIN_MAX_ATTEMPTS", 5)),
             docs_login_window_seconds=(docs_login_window_seconds if docs_login_window_seconds is not None else
@@ -1131,3 +1135,10 @@ class LENAPI(Application):
             from .authentication import install_default_authentication
 
             install_default_authentication(self, project_settings)
+
+
+def _setting_override(value: Any, settings: Any, name: str, default: Any) -> Any:
+    """Use explicit values, including None; inherit settings only when omitted."""
+    if value is not UNSET:
+        return value
+    return getattr(settings, name, default) if settings is not None else default

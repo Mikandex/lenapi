@@ -324,6 +324,19 @@ The `test`, `generate_test`, `run_test`, and `run_test_output` commands are appl
 
 Request bodies are limited to 10 MiB by default, and lenApi allows up to 30 seconds to receive the body. Configure `MAX_REQUEST_BODY_SIZE` (bytes) and `REQUEST_BODY_TIMEOUT_SECONDS` in `settings.py`; set either to `None` to disable that limit. Oversized bodies receive HTTP 413, and bodies that exceed the receive timeout receive HTTP 408. Direct `Application(...)` instances accept the equivalent `max_request_body_size` and `request_body_timeout` arguments.
 
+`LENAPI()` uses values from `settings.py` when an override is omitted. Pass `None` explicitly to disable an optional feature or limit, for example `LENAPI(docs_url=None, max_request_body_size=None)`. The public `UNSET` sentinel is available for your own function defaults when omitted and explicit `None` need different meanings:
+
+```python
+from lenapi import UNSET
+
+def update_field(value=UNSET):
+    if value is UNSET:
+        return "leave the stored value unchanged"
+    return value  # None is an explicit value and can clear a nullable field.
+```
+
+For Pydantic request bodies, use `model_dump(exclude_unset=True)` for partial updates; Pydantic already tracks which fields the client sent.
+
 The `run` command looks for `app` in the current application's `main.py`. It watches application files and reloads the server when code changes. The default port is `8009`. Change `PORT` in application `settings.py` or pass `--port` to `run`, for example `python lenora.py run --port 8010`. Host and app can also be changed with `--host` and `--app package.module:variable`; disable reload with `--no-reload`. Installing the package also provides the `lenora run` command. The former `runserver` spelling remains available as a compatibility alias.
 
 ## Async database access
