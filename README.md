@@ -265,9 +265,11 @@ class Invoice(model.Model):
 
 `model.UUIDField()` stores a native UUID and generates a UUID4 by default. `model.ImageField(upload_to="avatars")` stores a relative file path in the database; upload bytes are written beneath `MEDIA_ROOT` by `UploadFile.save()` or `UploadFile.save_image()`. The generated project setting `MEDIA_ROOT` defaults to `BASE_DIR / "media"`.
 
-The repository root contains the lenApi library. Create an application scaffold and run it separately:
+Install LenAPI from PyPI, or install an editable copy while working on the framework. Then create an application scaffold and run it separately:
 
 ```bash
+python -m pip install lenapi
+# For framework development from the repository root, use instead:
 python -m pip install -e .
 lenora startproject my_api
 cd my_api
