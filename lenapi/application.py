@@ -260,6 +260,7 @@ class Application(Router):
                  security_storage: str | None = None,
                  cache_backend: str = "memory",
                  media_root: str | Path | None = None, media_url: str | None = None,
+                 private_media_root: str | Path | None = None,
                  tag_name: str | None = None, auth: Any = None,
                  throttle: dict[str, str] | None = None,
                  safe_guard_docs_url: bool = False,
@@ -323,6 +324,10 @@ class Application(Router):
             raise ValueError("SAFE_GUARD_DOCS_URL requires a configured SQL or MongoDB database")
         self.media_root = Path(media_root).expanduser().resolve() if media_root is not None else None
         self.media_url = self._normalize_media_url(media_url) if self.media_root is not None and media_url else None
+        self.private_media_root = (
+            Path(private_media_root).expanduser().resolve()
+            if private_media_root is not None else None
+        )
         self.max_request_body_size = max_request_body_size
         self.request_body_timeout = float(request_body_timeout) if request_body_timeout is not None else None
         self._throttle_until: dict[tuple[str, str], float] = {}
@@ -459,6 +464,7 @@ class Application(Router):
                 max_body_size=self.max_request_body_size,
                 body_timeout=self.request_body_timeout,
                 media_root=self.media_root,
+                private_media_root=self.private_media_root,
             )
             request.background_tasks = BackgroundTasks()
             session = None
@@ -791,6 +797,36 @@ class Application(Router):
             headers["Content-Disposition"] = "attachment"
         return FileResponse(file_path, media_type=media_type, headers=headers)
 
+    def private_file(self, relative_path: str, *, inline: bool = False) -> Response:
+        """Return a private file response for use inside an authenticated route.
+
+        This helper does not authenticate or authorize the caller. Protect the
+        route with ``auth=...`` and check that the caller may access this exact
+        record before returning the response.
+        """
+        if not isinstance(inline, bool):
+            raise TypeError("inline must be a boolean")
+        if self.private_media_root is None or not isinstance(relative_path, str) or not relative_path:
+            return Response(b"Not found", status_code=404)
+        relative = Path(relative_path.replace("\\", "/"))
+        if relative.is_absolute() or ".." in relative.parts:
+            return Response(b"Not found", status_code=404)
+        root = self.private_media_root
+        file_path = (root / relative).resolve()
+        if not file_path.is_relative_to(root) or not file_path.is_file():
+            return Response(b"Not found", status_code=404)
+        media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        inline_image_types = {
+            "image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
+        }
+        headers = {
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        }
+        if not inline or media_type.lower() not in inline_image_types:
+            headers["Content-Disposition"] = "attachment"
+        return FileResponse(file_path, media_type=media_type, headers=headers)
+
     async def _handle_lifespan(self, receive, send) -> None:
         while True:
             message = await receive()
@@ -1051,7 +1087,8 @@ class LENAPI(Application):
                  docs_session_lifetime_seconds: int | None = None,
                  docs_cookie_secure: Any = UNSET,
                  docs_login_max_attempts: int | None = None,
-                 docs_login_window_seconds: int | None = None) -> None:
+                 docs_login_window_seconds: int | None = None,
+                 private_media_root: Any = UNSET) -> None:
         # Project settings are optional, so importing lenapi outside a project
         # continues to work with the framework defaults.
         try:
@@ -1150,6 +1187,12 @@ class LENAPI(Application):
             cache_backend=cache_backend or getattr(project_settings, "CACHE_BACKEND", "memory"),
             media_root=_setting_override(media_root, project_settings, "MEDIA_ROOT", None),
             media_url=_setting_override(media_url, project_settings, "MEDIA_URL", None),
+            private_media_root=_setting_override(
+                private_media_root,
+                project_settings,
+                "PRIVATE_MEDIA_ROOT",
+                Path(getattr(project_settings, "BASE_DIR", Path.cwd())) / "private_media",
+            ),
             tag_name=tag_name,
             auth=auth,
             throttle=(throttle if throttle is not None else

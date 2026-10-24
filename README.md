@@ -265,6 +265,41 @@ class Invoice(model.Model):
 
 `model.UUIDField()` stores a native UUID and generates a UUID4 by default. `model.ImageField(upload_to="avatars")` stores a relative file path in the database; upload bytes are written beneath `MEDIA_ROOT` by `UploadFile.save()` or `UploadFile.save_image()`. The generated project setting `MEDIA_ROOT` defaults to `BASE_DIR / "media"`.
 
+### Public and private uploaded files
+
+`MEDIA_ROOT` and `MEDIA_URL` are for files that anyone with the URL may access. For sensitive files, use `PRIVATE_MEDIA_ROOT` (generated as `BASE_DIR / "private_media"`) and save with `private=True`. Private files have no built-in public URL. Serve them only inside an authenticated route, after checking that the authenticated user may access that specific record:
+
+```python
+from lenapi import Depends, File, HTTPException, UploadFile
+from app.models import Student
+
+@app.post("/students/{student_id}/private-image", auth=app.authenticator)
+async def upload_private_image(
+    student_id: int,
+    image: UploadFile = File(...),
+    identity=Depends(app.authenticator),
+):
+    student = Student.get_or_404(id=student_id)
+    if not can_edit_student(identity, student):  # implement for your identity and ownership model
+        raise HTTPException(404, "Not found")
+
+    filename = await image.save("profiles", private=True)
+    student.private_profile_image = f"profiles/{filename}"
+    student.save()
+    return {"saved": True}
+
+@app.get("/students/{student_id}/private-image", auth=app.authenticator)
+def get_private_image(student_id: int, identity=Depends(app.authenticator)):
+    student = Student.get_or_404(id=student_id)
+    if not can_view_student(identity, student):
+        raise HTTPException(404, "Not found")
+    if not student.private_profile_image:
+        raise HTTPException(404, "Not found")
+    return app.private_file(student.private_profile_image, inline=True)
+```
+
+Add a separate nullable `private_profile_image = model.ImageField(upload_to="profiles", nullable=True)` field to `Student` and run `python lenora.py migration`. `app.private_file()` confines paths to `PRIVATE_MEDIA_ROOT`, disables caching, and only serves supported raster images inline; other files download as attachments. It does not perform authentication or ownership checks. Load its relative path from the authorized model record, never directly from request input. Image signature validation is not malware scanning.
+
 Install LenAPI from PyPI, or install an editable copy while working on the framework. Then create an application scaffold and run it separately:
 
 ```bash

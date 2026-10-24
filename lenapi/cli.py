@@ -24,7 +24,7 @@ DEFAULT_APP = "main:app"
 
 PROJECT_FILES = {
     "__init__.py": "",
-    ".gitignore": "__pycache__/\n.pytest_cache/\n*.py[cod]\n.env\nlenapi.db\nmedia/\n.venv/\nbuild/\ndist/\n*.egg-info/\n",
+    ".gitignore": "__pycache__/\n.pytest_cache/\n*.py[cod]\n.env\nlenapi.db\nmedia/\nprivate_media/\n.venv/\nbuild/\ndist/\n*.egg-info/\n",
     "settings.py": '''"""Project settings for lenApp."""
 
 import os
@@ -62,6 +62,8 @@ DATABASE_URL = f"sqlite:///{BASE_DIR / 'lenapi.db'}"
 ACTIVATE_ASYNC = True  # Async access uses the same database and URL as sync access.
 MEDIA_ROOT = BASE_DIR / "media"
 MEDIA_URL = "/media/"
+# Files here are not exposed by the built-in /media/ static route.
+PRIVATE_MEDIA_ROOT = BASE_DIR / "private_media"
 # Choose one primary method: "jwt", "api_key", "basic_login", "opaque_bearer", or "session".
 # Session can also be added to selected routes; add HMAC/OIDC with Depends(...).
 AUTHENTICATION = "jwt"

@@ -42,13 +42,19 @@ class UploadFile:
     """An uploaded multipart file held in memory for a bounded request."""
 
     def __init__(
-        self, filename: str, content_type: str, data: bytes, *, media_root: str | Path | None = None
+        self, filename: str, content_type: str, data: bytes, *,
+        media_root: str | Path | None = None,
+        private_media_root: str | Path | None = None,
     ) -> None:
         self.filename = Path(filename.replace("\\", "/")).name or "upload"
         self.content_type = content_type
         self.size = len(data)
         self._data = data
         self.media_root = Path(media_root).expanduser().resolve() if media_root is not None else None
+        self.private_media_root = (
+            Path(private_media_root).expanduser().resolve()
+            if private_media_root is not None else None
+        )
 
     async def read(self) -> bytes:
         return self._data
@@ -115,17 +121,24 @@ class UploadFile:
         *,
         type: str | None = "image",
         keep_filename: bool = False,
+        private: bool = False,
     ) -> str:
-        """Save under MEDIA_ROOT; return the stored filename.
+        """Save an upload under public or private media storage.
 
         By default uploads are validated as images and get a generated name.
         Set ``type`` to an extension such as ``"pdf"`` or ``"doc"`` to allow
         that document type, or ``None`` to allow any file type. Set
-        ``keep_filename=True`` to retain the sanitized uploaded filename.
+        ``keep_filename=True`` to retain the sanitized uploaded filename. Set
+        ``private=True`` to store under PRIVATE_MEDIA_ROOT, which has no public
+        static URL; serve it only through an authenticated application route.
         Existing files are never overwritten.
         """
-        if self.media_root is None:
-            raise RuntimeError("File saving requires LENAPI MEDIA_ROOT configuration")
+        if not isinstance(private, bool):
+            raise TypeError("private must be a boolean")
+        root = self.private_media_root if private else self.media_root
+        if root is None:
+            setting = "PRIVATE_MEDIA_ROOT" if private else "MEDIA_ROOT"
+            raise RuntimeError(f"File saving requires LENAPI {setting} configuration")
         if not isinstance(keep_filename, bool):
             raise TypeError("keep_filename must be a boolean")
 
@@ -152,7 +165,7 @@ class UploadFile:
         else:
             raise ValueError("type must be an extension such as 'pdf', 'doc', 'image', or None")
 
-        directory_path = self._directory(self.media_root, directory)
+        directory_path = self._directory(root, directory)
         safe_name = self._safe_name(self.filename) if keep_filename else f"{uuid.uuid4().hex}{extension}"
         return await self._write(directory_path, safe_name)
 
@@ -205,12 +218,17 @@ def endpoint_type_hints(endpoint) -> dict:
 
 class Request:
     def __init__(self, scope: dict, receive, *, max_body_size: int | None = 10 * 1024 * 1024,
-                 body_timeout: float | None = 30.0, media_root: str | Path | None = None) -> None:
+                 body_timeout: float | None = 30.0, media_root: str | Path | None = None,
+                 private_media_root: str | Path | None = None) -> None:
         self.scope = scope
         self._receive = receive
         self.max_body_size = max_body_size
         self.body_timeout = body_timeout
         self.media_root = Path(media_root).expanduser().resolve() if media_root is not None else None
+        self.private_media_root = (
+            Path(private_media_root).expanduser().resolve()
+            if private_media_root is not None else None
+        )
         self._body: bytes | None = None
 
     @property
@@ -305,7 +323,13 @@ class Request:
             filename = part.get_filename()
             value: str | UploadFile
             if filename is not None:
-                value = UploadFile(filename, part.get_content_type(), data, media_root=self.media_root)
+                value = UploadFile(
+                    filename,
+                    part.get_content_type(),
+                    data,
+                    media_root=self.media_root,
+                    private_media_root=self.private_media_root,
+                )
             else:
                 charset = part.get_content_charset() or "utf-8"
                 try:
