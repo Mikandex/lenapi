@@ -13,6 +13,7 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
+from . import __version__
 from .logging import logger
 
 
@@ -355,6 +356,9 @@ def _main() -> None:
             "python lenora.py <command> --help"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"%(prog)s {__version__}"
     )
     commands = parser.add_subparsers(dest="command", required=True)
     run_command = commands.add_parser("run", aliases=["runserver"], help="run the ASGI development server")

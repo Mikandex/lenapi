@@ -1,5 +1,7 @@
 """lenApi: a small, typed ASGI web framework."""
 
+__version__ = "0.1.2"
+
 from .application import Application, LENAPI, Router
 from .background import BackgroundQueue, BackgroundTasks
 from .dependencies import Depends
