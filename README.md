@@ -77,11 +77,11 @@ For a ready-made room relay, use `WebSocketService`. The primary types are `chat
 from lenapi import LENAPI, WebSocketService
 
 app = LENAPI()
+# Add the browser origins your app trusts in settings.py. The default is [].
 chat = WebSocketService(
     path="/ws/chat/{room_id}",
     type="chat",  # "video", "json", "message", or "byte"
     auth=authenticate,
-    allowed_origins=["https://myapp.com"],
     max_message_size=64_000,
     max_connections=6,  # optional per-room limit
     max_total_connections=100,  # cap across all rooms in this process
@@ -90,7 +90,7 @@ chat = WebSocketService(
 app.include_router(chat.router())
 ```
 
-The relay broadcasts each message to the connected clients in its room. For chat, send a JSON object such as `{"type": "chat.message", "text": "Hello"}`. The `json` type accepts JSON values on a fixed path such as `/ws/json`, without a room ID; its clients share the default channel. The heartbeat uses JSON `{"type":"lenapi.ping"}` and expects `{"type":"lenapi.pong"}`. Setting `allowed_origins` requires an `Origin` header and rejects missing or non-matching origins; leaving it as `None` accepts any origin, so configure an allowlist for browser-facing services. Origin checks do not authenticate clients: use `auth` for private services. `max_connections` caps one room; `max_total_connections` defaults to 100 connections across all rooms in this process (`None` disables that cap). These connection counters and the built-in room manager are process-local, so each worker enforces its own limit. Multi-worker deployments also need a shared pub/sub backend. Browser clients should use cookie-based auth or a custom WebSocket authenticator because the browser WebSocket API cannot set arbitrary request headers.
+The relay broadcasts each message to the connected clients in its room. For chat, send a JSON object such as `{"type": "chat.message", "text": "Hello"}`. The `json` type accepts JSON values on a fixed path such as `/ws/json`, without a room ID; its clients share the default channel. The heartbeat uses JSON `{"type":"lenapi.ping"}` and expects `{"type":"lenapi.pong"}`. By default, `WebSocketService` reads `WEBSOCKET_ALLOWED_ORIGINS` from project `settings.py`. Set that list to the exact browser origins you trust; the generated setting is `[]`, which rejects WebSocket connections until you configure an origin. An explicit `allowed_origins=[...]` argument overrides the project setting. Missing and non-matching `Origin` headers are rejected. Origin checks do not authenticate clients: use `auth` for private services. `max_connections` caps one room; `max_total_connections` defaults to 100 connections across all rooms in this process (`None` disables that cap). These connection counters and the built-in room manager are process-local, so each worker enforces its own limit. Multi-worker deployments also need a shared pub/sub backend. Browser clients should use cookie-based auth or a custom WebSocket authenticator because the browser WebSocket API cannot set arbitrary request headers.
 
 Create an invite ID with a normal HTTP endpoint, then share the WebSocket path with participants. The room is joined when the first client connects; the ID itself is not persisted by the service.
 
@@ -159,37 +159,6 @@ asyncio.run(main())
 ```
 
 `OpenAI` reads `OPENAI_API_KEY` from the environment unless `api_key=` is passed directly. Its `base_url` defaults to `https://api.openai.com/v1`; override it for an OpenAI-compatible endpoint. It supports the Responses API, chat completions, and embeddings. `Ollama` defaults to `http://127.0.0.1:11434`; set `base_url=` to use another Ollama host. Ollama must be running and the requested model must be available there. These calls are non-streaming and raise HTTPX errors for unsuccessful provider responses. The OpenAI Responses API is the recommended starting point for new projects; chat completions are included for compatibility. ([OpenAI API](https://platform.openai.com/docs/api-reference/responses), [Ollama chat API](https://docs.ollama.com/api/chat), [Ollama generate API](https://docs.ollama.com/api/generate))
-
-## Payment provider plugins
-
-Payment integrations are optional plugins with both synchronous and asynchronous APIs. Install their shared HTTPX transport with `python -m pip install -e '.[payments]'`. LenApi includes hosted-checkout adapters for Nomba, Flutterwave, Stripe, and Paystack; select only the provider your application uses. Credentials are read from environment variables by default, or can be passed explicitly:
-
-```python
-from lenapi import Payments
-
-with Payments("paystack") as payment:  # PAYSTACK_SECRET_KEY
-    checkout = payment.create_checkout(
-        amount="2500.00", currency="NGN", email="customer@example.com",
-        reference="order-2026-0001", success_url="https://example.com/payment/return",
-    )
-    print(checkout["data"]["authorization_url"])
-    verified = payment.verify("order-2026-0001")
-```
-
-For `async def` routes, use `async with` and the `a`-prefixed methods:
-
-```python
-async with Payments("paystack") as payment:
-    checkout = await payment.acreate_checkout(
-        amount="2500.00", currency="NGN", email="customer@example.com",
-        reference="order-2026-0001", success_url="https://example.com/payment/return",
-    )
-    verified = await payment.averify("order-2026-0001")
-```
-
-Provider environment variables: `NOMBA_CLIENT_ID`, `NOMBA_CLIENT_SECRET`, `NOMBA_ACCOUNT_ID`; `FLW_SECRET_KEY`; `STRIPE_SECRET_KEY`; and `PAYSTACK_SECRET_KEY`. For webhooks, configure `FLW_WEBHOOK_SECRET_HASH` and `STRIPE_WEBHOOK_SECRET` where relevant. Paystack and Stripe adapters expose `verify_webhook(raw_body, signature)`; Flutterwave accepts its `verif-hash` header as `signature`. Nomba's adapter obtains and refreshes its client-credentials token for checkout and verification.
-
-Adapters use the provider's hosted checkout, so LenApi does not collect or store card numbers or CVVs. `create_checkout()` returns the provider response, and `verify()` queries the provider; your application must verify transaction status, amount, currency, and reference before fulfilling an order, and record its own order/payment state. Treat webhook deliveries as untrusted until signature validation and transaction verification succeed. Provider APIs have different capabilities and field requirements, so adapter-specific options are passed through to the provider. See the [Nomba checkout API](https://developer.nomba.com/nomba-api-reference/online-checkout/create-an-online-checkout-order), [Flutterwave verification and webhooks](https://developer.flutterwave.com/docs/transaction-verification), [Stripe Checkout Sessions](https://docs.stripe.com/api/checkout/sessions/create), and [Paystack transaction API](https://paystack.com/docs/api/transaction/).
 
 You can also define a router without a prefix and mount it with the Django Ninja style `add_router(prefix, router)` call. Prefixes with or without trailing slashes are normalized:
 
@@ -868,7 +837,7 @@ from lenapi.security import webhook_auth
 webhook = webhook_auth(
     settings.WEBHOOK_SECRET,
     security_store=app.security_store,
-    provider="payments",
+    provider="billing",
     signature_header="x-webhook-signature",
     event_id_header="x-webhook-id",
     timestamp_header="x-webhook-timestamp",
@@ -878,8 +847,8 @@ def process_event(event_id, payload):
     # Process the event; open a fresh database session here if needed.
     ...
 
-@app.post("/webhooks/payments")
-async def payments_webhook(
+@app.post("/webhooks/billing")
+async def billing_webhook(
     payload: Any = Body(),
     verified=Depends(webhook),
     background_tasks: BackgroundTasks = None,

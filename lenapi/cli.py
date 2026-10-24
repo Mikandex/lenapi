@@ -55,6 +55,7 @@ THROTTLE_RATES = {}  # Example: {"anonymous": "60/minute", "authenticated": "300
 # run uses these values; blank HOST falls back to 127.0.0.1.
 HOST = ""
 PORT = 8009
+WEBSOCKET_ALLOWED_ORIGINS = []
 DATABASE_TYPE = "sqlite"  # "sqlite", "mysql", "postgresql", or "mongodb".
 DATABASE_URL = f"sqlite:///{BASE_DIR / 'lenapi.db'}"
 ACTIVATE_ASYNC = True  # Async access uses the same database and URL as sync access.

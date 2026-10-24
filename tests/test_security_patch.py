@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import json
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -256,10 +257,36 @@ def test_websocket_allowlist_accepts_configured_origin():
     assert any(event[0] == "accept" for event in socket.events)
 
 
+def test_websocket_service_uses_project_settings_origin_allowlist(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(
+        sys.modules,
+        "settings",
+        SimpleNamespace(WEBSOCKET_ALLOWED_ORIGINS=["HTTPS://APP.EXAMPLE:443/"]),
+    )
+    service = WebSocketService(path="/ws/chat")
+
+    assert service.allowed_origins == frozenset({"https://app.example"})
+
+
+def test_websocket_empty_origin_allowlist_rejects_connections():
+    service = WebSocketService(path="/ws/chat", allowed_origins=[])
+    socket = FakeWebSocket(headers={"origin": "https://app.example"})
+
+    asyncio.run(service._handle_connection(socket))
+
+    assert socket.events[0][0:2] == ("close", 4403)
+
+
 def test_websocket_total_connection_limit_is_enforced_across_rooms():
-    service = WebSocketService(path="/ws/chat", max_total_connections=1)
+    service = WebSocketService(
+        path="/ws/chat",
+        allowed_origins=["https://app.example"],
+        max_total_connections=1,
+    )
     service._rooms["occupied-room"] = {object()}
-    socket = FakeWebSocket()
+    socket = FakeWebSocket(headers={"origin": "https://app.example"})
 
     async def authenticated(_websocket):
         return {"id": 1}

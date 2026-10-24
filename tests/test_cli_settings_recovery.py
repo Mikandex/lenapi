@@ -16,6 +16,7 @@ def test_repair_settings_creates_missing_settings_with_fresh_keys(tmp_path, monk
     settings_path = tmp_path / "settings.py"
     source = settings_path.read_text(encoding="utf-8")
     ast.parse(source)
+    assert "WEBSOCKET_ALLOWED_ORIGINS = []" in source
     assert "SOCIAL_AUTH_ALLOWED_ORIGINS = []" in source
     assert "__LENAPI_GENERATED_SECRET_KEY__" not in source
     assert "__LENAPI_GENERATED_API_KEY__" not in source

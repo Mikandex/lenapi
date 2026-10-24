@@ -1,12 +1,13 @@
 """Optional services for WebSockets, caching, background jobs, and AI APIs."""
 
 import asyncio
+import importlib
 import json
 import math
 import threading
 import time
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from .dependencies import Depends
 from .concurrency import call_sync_or_async
@@ -189,6 +190,56 @@ class WebSocketService:
         "binary": "bytes",
     }
 
+    @staticmethod
+    def _load_settings():
+        """Load optional project settings for the default WebSocket origin policy."""
+        try:
+            return importlib.import_module("settings")
+        except ModuleNotFoundError as exc:
+            if exc.name != "settings":
+                raise
+            return None
+
+    @staticmethod
+    def _normalize_origin(origin: str) -> str:
+        if not isinstance(origin, str) or not origin.strip():
+            raise ValueError("WebSocket origins must be non-empty origin URLs")
+        value = origin.strip()
+        if value == "*":
+            return value
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"Invalid WebSocket origin: {origin!r}") from exc
+        scheme = parsed.scheme.lower()
+        if (
+            scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f"Invalid WebSocket origin: {origin!r}")
+        host = parsed.hostname.lower()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+        authority = host if port is None or default_port else f"{host}:{port}"
+        return f"{scheme}://{authority}"
+
+    @classmethod
+    def _normalize_origins(cls, origins) -> frozenset[str]:
+        if isinstance(origins, str):
+            raise TypeError("allowed_origins must be a list or tuple of origins")
+        try:
+            values = tuple(origins)
+        except TypeError as exc:
+            raise TypeError("allowed_origins must be a list or tuple of origins") from exc
+        return frozenset(cls._normalize_origin(origin) for origin in values)
+
     def __init__(
         self,
         *,
@@ -231,11 +282,10 @@ class WebSocketService:
             raise ValueError("heartbeat_seconds must be positive or None")
         if auth is not None and not callable(auth) and not isinstance(auth, Depends):
             raise TypeError("auth must be a callable authentication dependency or Depends instance")
-        origins = None if allowed_origins is None else tuple(allowed_origins)
-        if isinstance(allowed_origins, str):
-            raise TypeError("allowed_origins must be a list or tuple of origins")
-        if origins is not None and any(not isinstance(origin, str) or not origin.strip() for origin in origins):
-            raise ValueError("allowed_origins must contain non-empty origin strings")
+        if allowed_origins is None:
+            project_settings = self._load_settings()
+            allowed_origins = getattr(project_settings, "WEBSOCKET_ALLOWED_ORIGINS", [])
+        origins = self._normalize_origins(allowed_origins)
 
         self.path = path
         self.type = message_type
@@ -279,10 +329,17 @@ class WebSocketService:
 
     async def _handle_connection(self, websocket: WebSocket) -> None:
         origin = websocket.headers.get("origin")
-        if self.allowed_origins is not None:
-            if origin is None or ("*" not in self.allowed_origins and origin not in self.allowed_origins):
-                await websocket.close(code=4403, reason="WebSocket origin is not allowed")
-                return
+        if origin is None:
+            await websocket.close(code=4403, reason="WebSocket origin is not allowed")
+            return
+        try:
+            normalized_origin = self._normalize_origin(origin)
+        except ValueError:
+            await websocket.close(code=4403, reason="WebSocket origin is not allowed")
+            return
+        if "*" not in self.allowed_origins and normalized_origin not in self.allowed_origins:
+            await websocket.close(code=4403, reason="WebSocket origin is not allowed")
+            return
         try:
             identity = await self._authenticate(websocket)
         except HTTPException as exc:
@@ -701,13 +758,3 @@ class Cache:
 
 # Keep service entry points together for projects using ``lenapi.service``.
 from .background import BackgroundQueue, BackgroundTasks  # noqa: E402
-from .payments import (  # noqa: E402
-    Flutterwave,
-    Nomba,
-    PaymentPlugin,
-    Payments,
-    Paystack,
-    Stripe,
-    payment_provider,
-    register_payment_provider,
-)
