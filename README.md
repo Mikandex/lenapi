@@ -987,17 +987,27 @@ class Invoice(model.Model):
 
 Table names are inferred from model class names in lowercase (`Student` becomes `student`); no table-name declaration is needed. Import `model` from `lenapi` and access the model base class, fields, and relationship behaviors through it, such as `model.Model`, `model.StringField`, and `model.ForeignKeyField`.
 
-LenApi assigns stable names to generated primary-key, foreign-key, index, and unique constraints. For a custom unique constraint name, declare it in `__table_args__` with `model.UniqueConstraint` (omit `unique=True` on the field to avoid creating a second constraint):
+Constraint names are optional in model declarations. LenApi automatically assigns stable names to generated primary-key, foreign-key, index, and unique constraints, so a normal `unique=True` field needs no explicit name and works with Alembic, including SQLite batch migrations. Use `__table_args__` only when you want to choose the exact unique-constraint name; omit `unique=True` on that field to avoid creating a second constraint:
 
 ```python
 class Student(model.Model):
+    phone = model.PhoneField(max_length=32, nullable=False, unique=True)
+
+# To choose the exact SQL constraint name instead:
+class StudentWithNamedPhone(model.Model):
     phone = model.PhoneField(max_length=32, nullable=False)
     __table_args__ = (
         model.UniqueConstraint("phone", name="uq_student_phone"),
     )
+
+class Enrollment(model.Model):
+    student_id = model.ForeignKeyField(
+        "student.id",
+        constraint_name="fk_enrollment_student_id_student",
+    )
 ```
 
-Foreign-key names can be set directly on the field with `constraint_name="fk_student_classroom_id_classroom"`.
+`ForeignKeyField.constraint_name` is also optional; set it only when you need a specific foreign-key name.
 
 From the project root, run one command to detect model changes, write a migration under `migrations/versions/`, and apply it to the configured database:
 
