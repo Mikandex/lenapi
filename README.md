@@ -860,7 +860,23 @@ async def upload_photo(image: UploadFile = File(...)):
 
 For other file types, use `await file.save("documents", type="pdf")` or `type="doc"` (`.doc` and `.docx`). `type=None` allows any file type. Selected PDF and Word types are checked against their file signatures; all saves sanitize names and refuse to overwrite existing files. `save_image(directory)` remains available for explicit absolute-directory image saves. Use `Request.form()` for custom form parsing; typed `UploadFile` route arguments automatically describe the multipart schema in OpenAPI.
 
-The stored path is relative. `LENAPI` serves files from `MEDIA_ROOT` under `MEDIA_URL` (default `/media/`), so a saved path such as `photos/<filename>.jpg` is available at `/media/photos/<filename>.jpg`. Set both `MEDIA_ROOT` and `MEDIA_URL` in `settings.py`; media paths are restricted to files inside `MEDIA_ROOT`, and directory listings are not exposed. Request body size limits apply to multipart uploads too.
+The stored path is relative. New projects use `MEDIA_URL = "/"`, so a file saved directly into `MEDIA_ROOT` with `await image.save()` is available at `/<generated-filename>.jpg` (for example, `https://example.com/755cdb37768845ad976f9ddacf308173.jpg`). Root-level media serving only handles an existing file whose URL has one path segment; if there is no matching file, normal application routes continue to be checked. Save with a directory such as `await image.save("profiles")` to keep the file under that folder; that stored path is `/profiles/<filename>.jpg` when `MEDIA_URL = "/"`. Existing projects can retain `MEDIA_URL = "/media/"` and their current `/media/...` URLs. Set `MEDIA_ROOT` and `MEDIA_URL` in `settings.py`; media paths are restricted to files inside `MEDIA_ROOT`, directory listings are not exposed, and non-image uploads are sent as attachments. Request body size limits apply to multipart uploads too.
+
+To publish a generated image directly at the domain root, save it without a subdirectory and store the returned filename in the model:
+
+```python
+@app.post("/students/{student_id}/profile-image")
+async def upload_profile_image(student_id: int, image: UploadFile = File(...)):
+    filename = await image.save()  # MEDIA_ROOT/<generated-name>.jpg
+    student = Student.get_or_404(id=student_id)
+    student.profile_image = filename
+    student.save()
+    return {
+        "student_id": student.id,
+        "profile_image": student.profile_image,
+        "image_url": f"/{filename}",
+    }
+```
 
 ## Webhooks and background work
 

@@ -61,8 +61,8 @@ DATABASE_TYPE = "sqlite"  # "sqlite", "mysql", "postgresql", or "mongodb".
 DATABASE_URL = f"sqlite:///{BASE_DIR / 'lenapi.db'}"
 ACTIVATE_ASYNC = True  # Async access uses the same database and URL as sync access.
 MEDIA_ROOT = BASE_DIR / "media"
-MEDIA_URL = "/media/"
-# Files here are not exposed by the built-in /media/ static route.
+MEDIA_URL = "/"
+# Files here are never exposed by the public media route.
 PRIVATE_MEDIA_ROOT = BASE_DIR / "private_media"
 # Choose one primary method: "jwt", "api_key", "basic_login", "opaque_bearer", or "session".
 # Session can also be added to selected routes; add HMAC/OIDC with Depends(...).

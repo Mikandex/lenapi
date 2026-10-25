@@ -400,11 +400,22 @@ class Application(Router):
             response = JSONResponse(build_openapi(self, title=self.title, version=self.version))
             await response(route_scope, receive, send)
             return
-        if self.media_url is not None and path.startswith(self.media_url) and method == "GET":
-            relative_path = path[len(self.media_url):]
-            response = self._media_response(relative_path)
-            await response(route_scope, receive, send)
-            return
+        if self.media_url is not None and method == "GET":
+            if self.media_url == "/":
+                # A root media URL is useful for generated names such as
+                # /<uuid>.jpg. Only serve a file if it exists; otherwise let
+                # ordinary application routes (including /) continue routing.
+                relative_path = path.lstrip("/")
+                if relative_path and "/" not in relative_path:
+                    response = self._media_response(relative_path)
+                    if response.status_code != 404:
+                        await response(route_scope, receive, send)
+                        return
+            elif path.startswith(self.media_url):
+                relative_path = path[len(self.media_url):]
+                response = self._media_response(relative_path)
+                await response(route_scope, receive, send)
+                return
         path_matched = False
         for route in self.routes:
             raw_params = route.match(path)
