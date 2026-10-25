@@ -312,11 +312,11 @@ python lenora.py migration
 python lenora.py run
 ```
 
-Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically; `LENAPI()` configures the authentication dependency without adding authentication routes. The framework repository contains the installable `lenapi` package; create an application scaffold separately with `lenora startproject`.
+Use the installed `lenora` command to create the first project; `python lenora.py ...` commands are available after entering the generated project. The server listens on `127.0.0.1:8009` by default. The generated application contains `app/models.py`, `app/schemas.py`, `settings.py`, `main.py`, a `tests/` package, a project-local CLI launcher, `alembic.ini`, and a `migrations/` folder. The default `User` model and authentication implementation live in the framework. The initial migration includes the framework's `User` table automatically. `LENAPI()` sets up `app.authenticator` from `settings.AUTHENTICATION`, but route protection is opt-in: pass an authenticator to `LENAPI(auth=...)`, `Router(auth=...)`, or a route's `auth=` parameter. This keeps login and registration routes public unless you protect them too. The framework repository contains the installable `lenapi` package; create an application scaffold separately with `lenora startproject`.
 
 If `settings.py` is accidentally deleted, run `python lenora.py repair-settings` from the project directory. It recreates the generated defaults only when the file is missing and refuses to overwrite an existing settings file. The recreated file gets fresh `SECRET_KEY` and `API_KEY` values; review it before starting the app. The old `SECRET_KEY` cannot be recovered, so tokens signed with that key will no longer validate.
 
-Run `python lenora.py apikey` inside a project to set `AUTHENTICATION = "api_key"`, add the `APIKey` model to `app/models.py` when it is missing, and generate/apply its migration. The command is safe to repeat; it leaves an existing model in place and applies no migration when the database is already current. The table stores each key's hash, owning user, active state, creation time, and revocation time; never store the raw key there.
+Run `python lenora.py apikey` inside a project to set `AUTHENTICATION = "api_key"`, add the `APIKey` model to `app/models.py` when it is missing, and generate/apply its migration. The command is safe to repeat; it leaves an existing model in place and applies no migration when the database is already current. The generated table is suitable for app-managed key records and stores a hash, owning user, active state, creation time, and revocation time. The built-in `authentication("api_key")` helper currently checks the digest in `User.api_key`; `register_user(..., authentication="api_key")` writes that digest and returns the raw key once. The generated `APIKey` table is not automatically populated by `register_user()`.
 
 `settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database selection, token settings, and shared security storage. `HOST = ""` uses `127.0.0.1`; set `HOST` directly to bind another address. `app = LENAPI()` loads project settings automatically. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. `DATABASE_TYPE` chooses one backend (`sqlite`, `mysql`, `postgresql`, or `mongodb`), and `DATABASE_URL` configures it. `ACTIVATE_ASYNC` enables asynchronous access using the same database URL. The default database is SQLite.
 
@@ -530,67 +530,174 @@ def profile(user: dict = Depends(current_user)):
 
 Dependencies are cached once per request, so if multiple parameters use the same dependency callable, it runs once. Synchronous routes, dependencies, authentication and token-lookup callbacks, HMAC nonce-store methods, and `DocsAuthMiddleware` authenticators run in a worker thread so blocking I/O in them does not block the ASGI event loop. Async callbacks run on the event loop; use async I/O there or explicitly offload blocking work yourself.
 
-## JWT bearer authentication
+## Authentication: global, router, and route scope
 
-`JWTAuth` signs and verifies HS256 access tokens and works as a route dependency. It validates the signature, expiration, optional not-before time, and configured issuer. To add credential and refresh endpoints, mount the router with your own credential checker. The checker must validate the password (using a password hash in a real app) and return a string user ID or `(user_id, claims)`; invalid credentials return `None`:
+LenAPI authentication has two steps: choose/configure an authenticator, then attach it where it should run. `settings.AUTHENTICATION` selects the project's `app.authenticator` using the framework `User` model. It does not protect every route automatically and does not create login, registration, token, refresh, or profile endpoints. Add protection with `LENAPI(auth=...)` for all app routes, `Router(auth=...)` for a route group, or a route decorator's `auth=` for one endpoint. The route authenticator is enforced before the handler and appears in Swagger's security metadata.
 
-```python
-def authenticate_user(username: str, password: str):
-    user = find_user(username)
-    if user is None or not verify_password(password, user.password):
-        return None
-    return str(user.id), {"role": user.role}
-
-app.include_router(jwt_auth.router(authenticate_user))
-```
-
-This adds `POST /auth/token` with `{"username": "...", "password": "..."}` and `POST /auth/refresh` with `{"refresh_token": "..."}`. Both routes have a default IP-based limit of 10 requests per minute, including failed credential checks. To set a different limit, pass `throttle={"ip": "5/minute"}` to `jwt_auth.router(authenticate_user, throttle=...)`; pass `throttle={}` only when you intentionally want to disable the built-in limit. In production, select shared `SECURITY_STORAGE = "database"` or `"redis"` so refresh-token replay protection and limits work across workers. Each refresh token is one-time-use: the first refresh returns a replacement refresh token, while a replay is rejected. The in-memory fallback protects only within one process. Refresh tokens issued before one-time-use identifiers were added must be replaced by signing in again. Both routes return an `access_token` and `refresh_token`; access tokens expire after `TOKEN["LIFETIME_SECONDS"]` and refresh tokens after `TOKEN["REFRESH_LIFETIME_SECONDS"]`. Refresh tokens are rejected by protected routes.
-
-`JWTAuth` does not authenticate usernames or passwords itself; your callback owns that check. Keep a high-entropy secret private and use HTTPS in deployed applications:
-
-Choose the application's default authentication in the project `settings.py`:
+App-wide auth is appropriate when every HTTP route should require the same credential. Create the authenticator and pass it to `LENAPI`:
 
 ```python
-AUTHENTICATION = "basic_login"  # choose one: jwt, api_key, basic_login, opaque_bearer, or session
-BASIC_AUTH_FIELD = "email"  # username, email, phone, or another User field
-```
-
-The HTTP Basic username slot is treated as the configured identifier, so a client can send `auth=(email, password)` when `BASIC_AUTH_FIELD = "email"`. The framework's default `User` model supports `username` and `email` as identifiers.
-
-`LENAPI()` reads this setting and configures the framework's default `User` model and authentication dependency. It does not register built-in `/auth/register`, `/auth/profile`, `/auth/token`, or `/auth/refresh` routes. Create only the auth endpoints your application needs, and use `app.authenticator` on protected routes:
-
-```python
-from lenapi import Depends
-
-@app.get("/protected")
-def protected(user=Depends(app.authenticator)):
-    return {"authenticated": True}
-```
-
-You can protect an entire router with `auth=`, or protect an individual endpoint with the same option. A route-level authenticator overrides the router's default. `authentication(type="jwt")` uses the current project's `settings.py` and built-in `User` model by default; pass `settings=`, `user_model=`, or `app=` to customize it. Authenticated endpoints can also receive the identity with `Depends(authenticate)`:
-
-```python
-from pydantic import BaseModel
-from lenapi import LENAPI, Router
+from lenapi import Depends, LENAPI
 from lenapi.security import authentication
 
+# Reads settings.AUTHENTICATION, TOKEN, and the framework User model.
+auth = authentication("jwt")
+app = LENAPI(auth=auth)
+
+@app.get("/account")
+def account(identity=Depends(auth)):
+    return {"identity": identity}
+```
+
+Because app-wide auth protects every application route, prefer router or endpoint scope when the same app also needs public registration or sign-in routes. Router scope is commonly used with the settings-configured authenticator:
+
+```python
+from lenapi import Depends, LENAPI, Router
+
 app = LENAPI()
-authenticate = authentication(type="jwt")
-api = Router(prefix="/api")
+auth = app.authenticator
+api = Router(prefix="/api", auth=auth)
 
-class Greeting(BaseModel):
-    name: str
-
-@api.post("/hello", auth=authenticate)
-async def hello(data: Greeting):
-    return {"message": f"Hello, {data.name}!"}
+@api.get("/account")
+def account(identity=Depends(auth)):
+    return {"identity": identity}
 
 app.include_router(api)
 ```
 
-To apply the same requirement to every route in a group, initialize it with `Router(prefix="/api", auth=authenticate)`. Route authentication is enforced before the endpoint runs and is included in the generated OpenAPI security metadata.
+For one protected endpoint, put `auth=auth` directly on its decorator. `Depends(auth)` gives the handler the verified identity; using only `auth=` still enforces the check without injecting a value. Route-level `auth=` takes precedence over the router default. The setting `AUTHENTICATION` accepts `jwt`, `api_key`, `basic_login`, `opaque_bearer`, or `session`; HMAC and OIDC can be added as callable dependencies too.
 
-The primary authentication setting chooses one method for the scaffold's default protected route: `jwt`, `api_key`, `basic_login`, `opaque_bearer`, or `session`. Session cookies, HMAC, and OIDC can also be attached as additional callable dependencies on selected routes. This lets an app use API keys generally and require a session cookie on a browser route, or require both on one route:
+When using a non-default identifier such as email or phone, that column must exist on the configured user model and your registration or provisioning flow must save its value. The generated `UserRegistration` schema asks for username by default; extend it or provide a custom registration route when collecting another identifier.
+
+## JWT bearer authentication
+
+Set the signing settings in `settings.py`. A generated project starts with a unique `SECRET_KEY` and uses it in `TOKEN`:
+
+```python
+AUTHENTICATION = "jwt"
+TOKEN = {
+    "SECRET_KEY": SECRET_KEY,
+    "LIFETIME_SECONDS": 3600,
+    "REFRESH_LIFETIME_SECONDS": 2592000,
+    "ISSUER": API_TITLE,
+}
+```
+
+`LENAPI()` creates `app.authenticator` from these settings and the framework `User` model. Mount its token router on an app that does not have app-wide auth, then protect private routes with that same authenticator:
+
+```python
+from lenapi import Depends, LENAPI, Router
+from lenapi.authentication import UserRegistration, register_user
+
+app = LENAPI()
+jwt = app.authenticator
+app.include_router(jwt.router())  # POST /auth/token and POST /auth/refresh
+
+public = Router(prefix="/auth")
+@public.post("/register")
+def register(data: UserRegistration):
+    return register_user(data=data, authentication="jwt")
+
+api = Router(prefix="/api", auth=jwt)
+
+@api.get("/profile")
+def profile(identity=Depends(jwt)):
+    return {"user_id": identity["sub"]}
+
+app.include_router(api)
+app.include_router(public)
+```
+
+The framework-backed JWT authenticator checks the submitted username and password against the database `User` model and its stored password hash. `POST /auth/token` accepts `{"username": "...", "password": "..."}` and returns an access token plus a refresh token. Send the access token as `Authorization: Bearer <access_token>`. `POST /auth/refresh` accepts `{"refresh_token": "..."}` and returns replacement tokens. The token and refresh routes are intentionally hidden from Swagger; protected API routes still show their Bearer scheme and Swagger's **Authorize** control. These routes have a default IP limit of 10 requests per minute, including failed credential checks; pass `throttle={"ip": "5/minute"}` to `jwt.router(...)` for a different limit. In production, use shared `SECURITY_STORAGE = "database"` or `"redis"` for refresh replay protection across workers. Refresh tokens are single-use; the in-memory fallback coordinates only within one process.
+
+For a custom user table or credential rules, create the JWT dependency with `authentication("jwt", user_model=YourUser)` or configure `JWTAuth` with an `authenticate(username, password)` callback. That callback must verify a password hash and return the user's string ID, `(string_id, claims)`, or `None`. `JWTAuth` signs and verifies HS256 tokens, checks expiry and configured issuer, and rejects refresh tokens when used as access tokens. Keep the signing key secret and serve credentials only over HTTPS.
+
+## API-key authentication
+
+The built-in user API-key flow uses random URL-safe keys. The raw key is returned once at registration; LenAPI stores only its SHA-256 digest in `User.api_key`. To enable the setting and generate the app's additional key-management model, run this from the generated project directory:
+
+```python
+# settings.py
+AUTHENTICATION = "api_key"
+```
+
+```bash
+python lenora.py apikey
+```
+
+The CLI sets that setting, adds `APIKey` to `app/models.py` if it is absent, and runs the migration workflow. The generated model has `user_id`, `key_hash`, `is_active`, `created_at`, and `revoked_at`; never place a raw key in `key_hash`. The default authenticator checks the hash on the framework `User.api_key` field. The CLI-created `APIKey` table is available for app-managed key records, but `register_user()` does not populate it automatically.
+
+Create users through your registration endpoint with the framework helper. Its response includes the one-time raw key; the database row stores only the digest:
+
+```python
+from lenapi import LENAPI, Router
+from lenapi.authentication import UserRegistration, register_user
+
+app = LENAPI()
+api = Router(prefix="/auth")  # Keep registration public.
+
+@api.post("/register")
+def register(data: UserRegistration):
+    return register_user(data=data, authentication="api_key")
+
+app.include_router(api)
+```
+
+After registration, copy the `api_key` from that response and keep it securely; it cannot be recovered from the database. Send it on later requests as `X-API-Key`:
+
+```python
+from lenapi import Depends, LENAPI, Router
+
+app = LENAPI()
+auth = app.authenticator  # settings.AUTHENTICATION = "api_key"
+api = Router(prefix="/api", auth=auth)
+
+@api.get("/profile")
+def profile(identity=Depends(auth)):
+    return {"user_id": identity["user_id"]}
+
+app.include_router(api)
+```
+
+For an existing user, issue or rotate a key in a trusted provisioning flow: generate it with `make_api_key()`, store `hash_api_key(raw_key)` in `User.api_key`, and show the raw value to the user once. Never log it or return it from ordinary profile endpoints. The generated `APIKey` table is not currently the lookup table used by `app.authenticator`; applications that use it directly must implement the corresponding lookup and revocation policy.
+
+## Database-backed HTTP Basic authentication
+
+Basic authentication sends a username-like identifier and password on every request using the HTTP `Authorization: Basic ...` header. LenAPI checks the submitted credentials against the configured user model and verifies the stored password hash. Choose the identifier field in `settings.py`:
+
+```python
+AUTHENTICATION = "basic_login"
+BASIC_AUTH_FIELD = "username"  # Can be email, phone, or another User column.
+```
+
+Use `app.authenticator` on a router or route. Registration remains a public route unless you protect it separately; use `register_user()` to hash passwords consistently:
+
+```python
+from lenapi import Depends, LENAPI, Router
+from lenapi.authentication import UserRegistration, register_user
+
+app = LENAPI()
+basic_auth = app.authenticator
+public = Router(prefix="/auth")
+private = Router(prefix="/api", auth=basic_auth)
+
+@public.post("/register")
+def register(data: UserRegistration):
+    return register_user(data=data, authentication="basic_login")
+
+@private.get("/profile")
+def profile(identity=Depends(basic_auth)):
+    return {"user_id": identity}
+
+app.include_router(public)
+app.include_router(private)
+```
+
+Call the protected endpoint with Basic credentials; for example, `requests.get(url, auth=("ada", "password"))`. If `BASIC_AUTH_FIELD = "email"`, send the email in the username position: `auth=("ada@example.com", "password")`. Use HTTPS because Basic credentials are encoded, not encrypted, by the header scheme itself.
+
+### Additional authentication dependencies
+
+Session cookies, HMAC, OIDC, and opaque bearer tokens can also be attached to selected routes. For example, an API can use an API key on most routes and require a browser session or a signed webhook request on specific endpoints:
 
 ```python
 from lenapi import Depends
@@ -715,7 +822,7 @@ def change_email(user=Depends(auth), _csrf=Depends(csrf)):
 
 Safe methods do not require the header; state-changing methods do. `SameSite` is additional protection and does not replace this token check. Use HTTPS so the CSRF cookie can be `Secure`.
 
-`API_KEY` is generated uniquely for each new project. The scaffold's Basic/JWT credential callback looks up `User` in the database and verifies its hashed `password`. Use `make_password(password)` to hash a password and `check_password(password, stored_password)` to verify it; the latter returns a boolean. Never store plaintext passwords. The older `hash_password()` and `verify_password()` names remain available as aliases. Use HTTPS for Basic credentials and bearer/API key requests outside local development.
+The generated `SECRET_KEY` is unique to each new project and signs JWTs. The framework-backed Basic and JWT credential check looks up `User` in the database and verifies its hashed `password`. Use `make_password(password)` to hash a password and `check_password(password, encoded_password=stored_password)` to verify it; the latter returns a boolean. Never store plaintext passwords. The older `hash_password()` and `verify_password()` names remain available as aliases. Use HTTPS for Basic credentials and bearer/API-key requests outside local development.
 
 The framework provides `lenapi.User` with `username`, nullable `email`, `first_name`, `last_name`, `password`, and `api_key` fields. The default `UserRegistration` request asks for `username`, `first_name`, `last_name`, `password`, and `confirm_password`; email is not required or included in the default registration response. Apps that want to collect email can define a custom registration schema and pass its email value through `register_user()`. When a trusted provisioning flow creates a user directly, store the password hash:
 
@@ -753,7 +860,7 @@ class User(BaseUser):
 
 Import the extended `User` from `app.models` in application code and run `python lenora.py migration`. Do not set a second table name for this subclass; it extends the framework's existing `user` table. `bio` is nullable because MySQL does not support defaults on `TEXT` columns; if existing rows need an empty string instead of `NULL`, add a data backfill to the generated migration. Ordinary subclasses of the abstract `Model` base still get a table inferred from their class name.
 
-When `settings.AUTHENTICATION = "api_key"`, registration generates a URL-safe API key with 32 bytes of cryptographically secure randomness and returns it once as plain text in the registration response. The `user.api_key` column remains nullable for installations using another authentication mode; in API-key mode, newly registered users get a key automatically. lenApi stores only the key's SHA-256 digest in that column, so the original key cannot be recovered later. Send the returned key on authenticated requests with `X-API-Key: <key>`. The API-key authenticator hashes the supplied key before lookup and returns that user's identity. Existing users need to be issued a key through a key-rotation/provisioning flow before they can use API-key authentication.
+For API-key mode, call `register_user(data=..., authentication="api_key")` from your own registration route. It generates a URL-safe key with 32 bytes of cryptographically secure randomness and returns it once as plain text. LenAPI stores only its SHA-256 digest in the nullable `user.api_key` column, so the original key cannot be recovered later. Send the returned key on authenticated requests with `X-API-Key: <key>`. The `python lenora.py apikey` command also creates an `APIKey` table for app-managed key records, but the built-in authenticator looks up `User.api_key`; the helper does not automatically add rows to that separate table.
 
 Use `register_user()` from your own registration handler if you want the framework's user creation and password handling. The password encoding uses Django's `pbkdf2_sha256` format, so Django's password hashers can verify it; this is one-way hashing, not reversible encryption. See [Django password management](https://docs.djangoproject.com/en/6.0/topics/auth/passwords/) for the encoded format and verification helpers.
 
@@ -1131,6 +1238,10 @@ async_students = await Student.aget.all()
 student = Student.get(id=1).get()
 async_student = await Student.aget(id=1)
 
+# Check whether a row exists
+exists = Student.get(id=1).exists()
+async_exists = await Student.aget(id=1).exists()
+
 # 4. Select only particular columns while applying lookup filters
 name = Student.get("person_name").get(id=1)  # scalar value
 summary = Student.get("person_name", "course").get(id=1)  # mapping
@@ -1170,11 +1281,52 @@ async_total = async_page.total_count
 async_pages = async_page.page_count
 ```
 
-`Student.get.all()` returns all rows synchronously; its async counterpart is `await Student.aget.all()`. For filtered async lists, use `await Student.afilter(...).all()`. `Student.get(...)` builds a single-row lookup; call `.get()` for the model instance or `.exists()` for a boolean. The async single-row counterpart is `await Student.aget(...)`. Multiple matches are an error rather than an arbitrary row selection. `Student.get("field", ...).get(...)` selects one or more columns; one selected column returns a scalar and multiple columns return a mapping. This is a query projection, not a uniqueness constraint. To make the database reject duplicates, declare `unique=True` on the field.
+`Student.get.all()` returns all rows synchronously; its async counterpart is `await Student.aget.all()`. For filtered async lists, use `await Student.afilter(...).all()`. `Student.get(...)` builds a single-row lookup; call `.get()` for the model instance or `.exists()` for a boolean. The async single-row counterpart is `await Student.aget(...)`, and its existence check is `await Student.aget(...).exists()`. Multiple matches are an error rather than an arbitrary row selection. `Student.get("field", ...).get(...)` selects one or more columns; one selected column returns a scalar and multiple columns return a mapping. This is a query projection, not a uniqueness constraint. To make the database reject duplicates, declare `unique=True` on the field.
 
 `filter(...)` accepts equality filters and lookups such as `course__icontains="py"`, `id__gte=10`, `id__in=[1, 2]`, and `classroom_id__isnull=True`. Supported lookup suffixes are `exact`, `iexact`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notin`, `contains`, `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`, and `isnull`. Query methods include `.values(...)`, `.order(field)` (prefix with `-` for descending), `.limit(n)`, `.offset(n)`, and terminal operations `.all()`, `.first()`, `.one_or_none()`, `.count()`, `.aggregate(...)`, and `.delete()`. Async query builders use `afilter()`, `asearch()`, and `asearch_any()`; await terminal methods such as `.all()`, `.get()`, `.count()`, `.aggregate()`, or `.delete()`.
 
 `search(**terms)` applies case-insensitive substring matching and combines supplied terms with AND. `search_any(query, *fields)` searches one term across string columns and combines fields with OR. Paginated results remain list-like and expose `.total_count`, `.page_count`/`.total_pages`, and `.pagination`; `limit` and `offset` must be non-negative integers. Annotate a route argument as SQLAlchemy's `Session` when you need transaction control directly.
+
+Use a Pydantic output schema for paginated API responses so Swagger shows both each student and the pagination metadata:
+
+```python
+from typing import Any
+from pydantic import BaseModel, ConfigDict
+from lenapi import LENAPI
+from app.models import Student
+
+app = LENAPI()
+
+class StudentOutput(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    person_name: str | None
+    course: str | None
+
+class StudentPageOutput(BaseModel):
+    results: list[StudentOutput]
+    pagination: dict[str, Any] | None
+
+@app.get("/students", response_model=StudentPageOutput)
+def list_students(limit: int = 20, offset: int = 0):
+    page = Student.filter(course="Python").all(limit=limit, offset=offset)
+    return {
+        "results": [StudentOutput.model_validate(row).model_dump(mode="json")
+                    for row in page],
+        "pagination": page.pagination,
+    }
+
+@app.get("/async/students", response_model=StudentPageOutput)
+async def list_students_async(limit: int = 20, offset: int = 0):
+    page = await Student.afilter(course="Python").all(
+        limit=limit, offset=offset
+    )
+    return {
+        "results": [StudentOutput.model_validate(row).model_dump(mode="json")
+                    for row in page],
+        "pagination": page.pagination,
+    }
+```
 
 The sample API exposes these operations as `GET /students/filter?course__icontains=py&id__gte=1&order_by=-id&limit=20&offset=0`. Use comma-separated values for `__in`, for example `GET /students/filter?id__in=1,2,3`. Search using `GET /students/search?q=python` (searches `person_name` and `course` by default), or choose fields with `GET /students/search?q=ada&fields=person_name,course`.
 

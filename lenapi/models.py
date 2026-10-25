@@ -476,6 +476,29 @@ class _AsyncQuerySet(_QuerySet):
         return result.rowcount or 0
 
 
+class _AsyncSingleQuery(_AsyncQuerySet):
+    """Awaitable async lookup that also exposes async query operations."""
+
+    def __init__(self, model, *, session=None, **filters):
+        super().__init__(model, **filters)
+        self.default_session = session
+
+    async def _resolve(self):
+        return await super().one_or_none(session=self.default_session)
+
+    def __await__(self):
+        # Preserve ``await Model.aget(**filters)`` as a concise single-row lookup.
+        return self._resolve().__await__()
+
+    async def exists(self, *, session=None) -> bool:
+        active_session = self.default_session if session is None else session
+        return await super().exists(session=active_session)
+
+    async def get(self, *, session=None, **filters):
+        active_session = self.default_session if session is None else session
+        return await self._clone_with_filters(filters).one_or_none(session=active_session)
+
+
 class _ModelManager:
     def __init__(self, model):
         self.model = model
@@ -631,9 +654,9 @@ class _AsyncModelManager:
             self.model, limit=limit, offset=offset
         ).all(session=session)
 
-    async def __call__(self, *, session=None, **filters):
-        """Return the sole matching model instance asynchronously, or None."""
-        return await _AsyncQuerySet(self.model, **filters).one_or_none(session=session)
+    def __call__(self, *, session=None, **filters):
+        """Build an awaitable single-row lookup, or await its async helpers."""
+        return _AsyncSingleQuery(self.model, session=session, **filters)
 
 
 class _AsyncModelManagerDescriptor:

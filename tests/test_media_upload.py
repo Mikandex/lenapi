@@ -388,15 +388,26 @@ def test_async_model_crud_methods(tmp_path):
             await connection.run_sync(AsyncTestRecord.metadata.create_all)
 
         created = await asgi_request_async(app, "/async-records", method="POST")
+        async with db.session() as session:
+            existing = await AsyncTestRecord.aget(
+                name="before", session=session
+            ).exists()
+            missing = await AsyncTestRecord.aget(
+                name="missing", session=session
+            ).exists()
+            all_records = await AsyncTestRecord.aget.all(session=session)
         listed = await asgi_request_async(app, "/async-records")
         updated = await asgi_request_async(app, "/async-records", method="PUT")
         deleted = await asgi_request_async(app, "/async-records", method="DELETE")
-        return created, listed, updated, deleted
+        return created, existing, missing, all_records, listed, updated, deleted
 
     try:
-        created, listed, updated, deleted = asyncio.run(run())
+        created, existing, missing, all_records, listed, updated, deleted = asyncio.run(run())
         assert created[0] == 200
         assert json.loads(created[2])["name"] == "before"
+        assert existing is True
+        assert missing is False
+        assert len(all_records) == 1
         assert json.loads(listed[2]) == [{"id": json.loads(created[2])["id"], "name": "before"}]
         assert json.loads(updated[2])["name"] == "after"
         assert json.loads(deleted[2]) == {"deleted": 1}
