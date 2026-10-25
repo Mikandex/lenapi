@@ -1114,7 +1114,67 @@ new_student = Student(person_name="Ada", course="Databases")
 new_student.save()  # commits and refreshes the instance
 ```
 
-`Student.get(...)` builds a single-row lookup; call `.get()` for the full model instance or `.exists()` for a boolean. Multiple matches raise a multiple-results error. Pass column names to `Student.get(...)` to return only those fields, either as a scalar or a dictionary. The `Model.get.unique("field")` spelling also selects a field for a lookup; `unique` in this query API is not the same as the field option `unique=True`. `filter(...)` accepts exact field matches and Django-style lookups such as `course__icontains="py"`, `id__gte=10`, `id__in=[1, 2]`, and `classroom_id__isnull=True`. Supported lookups include `exact`, `iexact`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notin`, `contains`, `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`, and `isnull`. `search(...)` applies case-insensitive substring matching across all provided string fields (all terms must match); `search_any(query, *fields)` searches one term across fields and returns rows matching any field. Use `.values()` to select all columns as dictionaries or `.values("field", ...)` for selected columns; chain `.order("field")` (prefix with `-` for descending) and then `.all()` to execute. `Model.count()` counts all rows; `Model.filter(...).count()` counts only matches. Annotate a route argument as SQLAlchemy's `Session` when you need transaction control directly.
+### CRUD, search, and pagination: sync and async
+
+Each sync operation has an async counterpart. Sync calls return immediately; async calls must be awaited inside an `async def` handler, with `ACTIVATE_ASYNC = True` in settings.
+
+```python
+# 1. Create
+student = Student.create(person_name="Ada", course="Python")
+async_student = await Student.acreate(person_name="Ada", course="Python")
+
+# 2. Get all rows
+students = Student.get.all()
+async_students = await Student.afilter().all()
+
+# 3. Get one row by a unique value or primary key
+student = Student.get(id=1).get()
+async_student = await Student.aget(id=1)
+
+# 4. Select only particular columns while applying lookup filters
+name = Student.get("person_name").get(id=1)  # scalar value
+summary = Student.get("person_name", "course").get(id=1)  # mapping
+async_summary = await Student.afilter().values(
+    "person_name", "course"
+).get(id=1)
+
+# 5. Filter rows. Chain values/order/limit/offset before all().
+python_students = Student.filter(course__iexact="python").all()
+page = Student.filter(course__icontains="py").values(
+    "person_name", "course"
+).order("-id").limit(20).offset(0).all()
+async_page = await Student.afilter(course__icontains="py").values(
+    "person_name", "course"
+).order("-id").all(limit=20, offset=0)
+
+# 6. Search string fields (all search terms must match)
+matches = Student.search(person_name="ada", course="python").all()
+async_matches = await Student.asearch(person_name="ada").all()
+
+# Search one term across specified columns (any column may match)
+matches_any = Student.search_any(
+    "python", "person_name", "course"
+).all()
+async_matches_any = await Student.asearch_any(
+    "python", "person_name", "course"
+).all()
+
+# 7. Pagination metadata accompanies list-like results
+page = Student.filter(course="Python").all(limit=20, offset=40)
+total = page.total_count
+pages = page.page_count
+metadata = page.pagination
+
+async_page = await Student.afilter(course="Python").all(limit=20, offset=40)
+async_total = async_page.total_count
+async_pages = async_page.page_count
+```
+
+`Student.get(...)` builds a single-row lookup; call `.get()` for the model instance or `.exists()` for a boolean. Multiple matches are an error rather than an arbitrary row selection. `Student.get("field", ...).get(...)` selects one or more columns; one selected column returns a scalar and multiple columns return a mapping. This is a query projection, not a uniqueness constraint. To make the database reject duplicates, declare `unique=True` on the field.
+
+`filter(...)` accepts equality filters and lookups such as `course__icontains="py"`, `id__gte=10`, `id__in=[1, 2]`, and `classroom_id__isnull=True`. Supported lookup suffixes are `exact`, `iexact`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notin`, `contains`, `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`, and `isnull`. Query methods include `.values(...)`, `.order(field)` (prefix with `-` for descending), `.limit(n)`, `.offset(n)`, and terminal operations `.all()`, `.first()`, `.one_or_none()`, `.count()`, `.aggregate(...)`, and `.delete()`. Async query builders use `afilter()`, `asearch()`, and `asearch_any()`; await terminal methods such as `.all()`, `.get()`, `.count()`, `.aggregate()`, or `.delete()`.
+
+`search(**terms)` applies case-insensitive substring matching and combines supplied terms with AND. `search_any(query, *fields)` searches one term across string columns and combines fields with OR. Paginated results remain list-like and expose `.total_count`, `.page_count`/`.total_pages`, and `.pagination`; `limit` and `offset` must be non-negative integers. Annotate a route argument as SQLAlchemy's `Session` when you need transaction control directly.
 
 The sample API exposes these operations as `GET /students/filter?course__icontains=py&id__gte=1&order_by=-id&limit=20&offset=0`. Use comma-separated values for `__in`, for example `GET /students/filter?id__in=1,2,3`. Search using `GET /students/search?q=python` (searches `person_name` and `course` by default), or choose fields with `GET /students/search?q=ada&fields=person_name,course`.
 
