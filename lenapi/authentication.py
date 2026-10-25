@@ -149,7 +149,7 @@ def webhook(secret, *, tolerance_seconds=300, nonce_store=None):
     return WebhookAuth(secret, tolerance_seconds=tolerance_seconds, nonce_store=nonce_store)
 
 
-def configure(settings, user_model=None, *, security_store=None):
+def configure(settings, user_model=None, *, security_store=None, api_key_field=None):
     """Build the primary authenticator selected by ``settings.AUTHENTICATION``."""
     if user_model is None:
         from .models import User
@@ -160,7 +160,7 @@ def configure(settings, user_model=None, *, security_store=None):
     if mode == "basic_login":
         return basic(user_model, identifier_field=identifier_field)
     if mode == "api_key":
-        return api_key(user_model)
+        return api_key(user_model, field=api_key_field or "api_key")
     if mode == "jwt":
         return jwt_auth(settings, user_model, security_store=security_store)
     if mode == "session":
@@ -181,7 +181,7 @@ def configure(settings, user_model=None, *, security_store=None):
     raise ValueError(f"Unknown AUTHENTICATION mode: {mode}")
 
 
-def authentication_type(auth_type, *, settings, user_model=None, app=None):
+def authentication_type(auth_type, *, settings, user_model=None, api_key_field=None, app=None):
     """Create the authenticator selected by a project settings module.
 
     ``auth_type`` may be ``"jwt"``, ``"api_key"``, ``"basic_login``,
@@ -194,6 +194,11 @@ def authentication_type(auth_type, *, settings, user_model=None, app=None):
     from types import SimpleNamespace
 
     mode = str(auth_type).lower()
+    if mode == "api_key" and user_model is not None and not api_key_field:
+        raise ValueError(
+            "Custom API-key authentication requires api_key_field matching a column "
+            f"on {user_model.__name__}; for example, api_key_field='key_digest'."
+        )
     selected_settings = SimpleNamespace(**{
         key: value for key, value in vars(settings).items() if not key.startswith("__")
     })
@@ -202,11 +207,12 @@ def authentication_type(auth_type, *, settings, user_model=None, app=None):
         selected_settings,
         user_model,
         security_store=getattr(app, "security_store", None),
+        api_key_field=api_key_field,
     )
     return authenticator
 
 
-def authentication(type="jwt", *, settings=None, user_model=None, app=None):
+def authentication(type="jwt", *, settings=None, user_model=None, api_key_field=None, app=None):
     """Create a route authentication dependency from project settings.
 
     By default, ``settings`` is imported from the current project and the
@@ -222,7 +228,13 @@ def authentication(type="jwt", *, settings=None, user_model=None, app=None):
             raise ValueError(
                 "authentication() needs a project settings.py; pass settings= explicitly"
             ) from exc
-    return authentication_type(type, settings=settings, user_model=user_model, app=app)
+    return authentication_type(
+        type,
+        settings=settings,
+        user_model=user_model,
+        api_key_field=api_key_field,
+        app=app,
+    )
 
 
 def install_default_authentication(app, settings):
@@ -231,31 +243,47 @@ def install_default_authentication(app, settings):
 
     mode = getattr(settings, "AUTHENTICATION", "jwt").lower()
     authenticator = authentication_type(
-        mode, settings=settings, user_model=User, app=app
+        mode, settings=settings, user_model=User,
+        api_key_field="api_key" if mode == "api_key" else None,
+        app=app,
     )
 
     app.authenticator = authenticator
     return authenticator
 
 
-def register_user(user_model=None, data=None, *, authentication="jwt"):
+def register_user(user_model=None, data=None, *, authentication="jwt", api_key_field=None):
     """Create a user, hash its password, and return a one-time API key if used.
 
     Apps may define a custom registration schema with an ``email`` field. When
     provided, that value is passed through to models that expose an email column.
     """
+    using_default_model = user_model is None
     if user_model is None:
         from .models import User
 
         user_model = User
+    if authentication == "api_key":
+        if using_default_model:
+            api_key_field = api_key_field or "api_key"
+        elif not api_key_field:
+            raise ValueError(
+                "Custom API-key registration requires api_key_field matching a column "
+                f"on {user_model.__name__}; for example, api_key_field='key_digest'."
+            )
+        if api_key_field not in user_model.__table__.columns:
+            raise ValueError(
+                f"API-key field '{api_key_field}' is not a field on {user_model.__name__}."
+            )
     raw_key = make_api_key() if authentication == "api_key" else None
     values = dict(
         username=data.username,
         first_name=data.first_name,
         last_name=data.last_name,
         password=make_password(data.password),
-        api_key=hash_api_key(raw_key) if raw_key is not None else None,
     )
+    if raw_key is not None:
+        values[api_key_field] = hash_api_key(raw_key)
     email = getattr(data, "email", None)
     if email is not None and "email" in user_model.__table__.columns:
         values["email"] = email

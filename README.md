@@ -387,7 +387,7 @@ Add ASGI middleware with `app.add_middleware`. Middleware is applied in registra
 
 ```python
 from lenapi import LENAPI
-from lenapi.security import authentication
+from lenapi import authentication
 from lenapi.middleware import (
     CORSMiddleware,
     DocsAuthMiddleware,
@@ -476,7 +476,7 @@ Protect both the Swagger page and its OpenAPI JSON with `DocsAuthMiddleware`. It
 
 ```python
 from lenapi import LENAPI, DocsAuthMiddleware
-from lenapi.security import authentication
+from lenapi import authentication
 
 app = LENAPI()
 docs_auth = authentication("basic_login")
@@ -537,8 +537,7 @@ LenAPI authentication has two steps: choose/configure an authenticator, then att
 App-wide auth is appropriate when every HTTP route should require the same credential. Create the authenticator and pass it to `LENAPI`:
 
 ```python
-from lenapi import Depends, LENAPI
-from lenapi.security import authentication
+from lenapi import Depends, LENAPI, authentication
 
 # Reads settings.AUTHENTICATION, TOKEN, and the framework User model.
 auth = authentication("jwt")
@@ -610,7 +609,7 @@ app.include_router(public)
 
 The framework-backed JWT authenticator checks the submitted username and password against the database `User` model and its stored password hash. `POST /auth/token` accepts `{"username": "...", "password": "..."}` and returns an access token plus a refresh token. Send the access token as `Authorization: Bearer <access_token>`. `POST /auth/refresh` accepts `{"refresh_token": "..."}` and returns replacement tokens. The token and refresh routes are intentionally hidden from Swagger; protected API routes still show their Bearer scheme and Swagger's **Authorize** control. These routes have a default IP limit of 10 requests per minute, including failed credential checks; pass `throttle={"ip": "5/minute"}` to `jwt.router(...)` for a different limit. In production, use shared `SECURITY_STORAGE = "database"` or `"redis"` for refresh replay protection across workers. Refresh tokens are single-use; the in-memory fallback coordinates only within one process.
 
-For a custom user table or credential rules, create the JWT dependency with `authentication("jwt", user_model=YourUser)` or configure `JWTAuth` with an `authenticate(username, password)` callback. That callback must verify a password hash and return the user's string ID, `(string_id, claims)`, or `None`. `JWTAuth` signs and verifies HS256 tokens, checks expiry and configured issuer, and rejects refresh tokens when used as access tokens. Keep the signing key secret and serve credentials only over HTTPS.
+For a custom user table, create the JWT dependency with `authentication("jwt", user_model=YourUser)`. Basic and JWT can use your model as long as it has the selected identifier column and a `password` column containing LenAPI-compatible password hashes. For Basic, select the identifier with `BASIC_AUTH_FIELD`. Or configure `JWTAuth` with an `authenticate(username, password)` callback. That callback must verify a password hash and return the user's string ID, `(string_id, claims)`, or `None`. `JWTAuth` signs and verifies HS256 tokens, checks expiry and configured issuer, and rejects refresh tokens when used as access tokens. Keep the signing key secret and serve credentials only over HTTPS.
 
 ## API-key authentication
 
@@ -626,6 +625,31 @@ python lenora.py apikey
 ```
 
 The CLI sets that setting, adds `APIKey` to `app/models.py` if it is absent, and runs the migration workflow. The generated model has `user_id`, `key_hash`, `is_active`, `created_at`, and `revoked_at`; never place a raw key in `key_hash`. The default authenticator checks the hash on the framework `User.api_key` field. The CLI-created `APIKey` table is available for app-managed key records, but `register_user()` does not populate it automatically.
+
+For quick development, use the framework `User` model and its `api_key` column with no custom arguments. To use your own model, provide both `user_model` and `api_key_field`; there is no implicit key-column fallback for this custom-model path. LenAPI validates the field during setup and raises a clear error if it is missing:
+
+```python
+from lenapi import authentication, hash_api_key, make_api_key, model
+
+class Customer(model.Model):
+    username = model.StringField(max_length=120, unique=True)
+    password = model.StringField(max_length=255)
+    key_digest = model.StringField(max_length=64, unique=True, nullable=True)
+
+auth = authentication(
+    "api_key",
+    user_model=Customer,
+    api_key_field="key_digest",
+)
+
+# In a trusted provisioning flow, show the raw key once and store only its digest.
+raw_key = make_api_key()
+customer = Customer.get(id=1).get()
+customer.key_digest = hash_api_key(raw_key)
+customer.save()
+```
+
+When using `register_user()` with a custom model, also pass `api_key_field="key_digest"`. The model and registration schema must include the fields your registration flow writes.
 
 Create users through your registration endpoint with the framework helper. Its response includes the one-time raw key; the database row stores only the digest:
 

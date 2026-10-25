@@ -9,6 +9,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import importlib
 import json
 import threading
 import time
@@ -808,3 +809,67 @@ def test_authentication_factory_modes_and_database_user_password_helpers():
         AUTHENTICATION="oidc", OIDC_TOKEN_LOOKUP=lambda token: {"sub": token}
     )), OIDCAuth)
     assert callable(register_user)
+
+
+def test_custom_model_api_key_field_is_required_validated_and_used(monkeypatch):
+    class CustomerForAPIKey(Model):
+        username = StringField(max_length=64, unique=True)
+        password = StringField(max_length=255)
+        first_name = StringField(max_length=80, default="")
+        last_name = StringField(max_length=80, default="")
+        key_digest = StringField(max_length=64, unique=True, nullable=True)
+
+    from lenapi import authentication
+    from lenapi.authentication import register_user
+
+    settings = SimpleNamespace(AUTHENTICATION="jwt")
+    assert isinstance(authentication("api_key", settings=settings), APIKeyAuth)
+    with pytest.raises(ValueError, match="requires api_key_field"):
+        authentication("api_key", settings=settings, user_model=CustomerForAPIKey)
+    with pytest.raises(ValueError, match="not a field"):
+        authentication(
+            "api_key", settings=settings, user_model=CustomerForAPIKey,
+            api_key_field="missing_digest",
+        )
+
+    filters = []
+
+    class QueryResult:
+        def get(self):
+            return SimpleNamespace(id=42)
+
+    def fake_get(cls, **kwargs):
+        filters.append(kwargs)
+        return QueryResult()
+
+    monkeypatch.setattr(CustomerForAPIKey, "get", classmethod(fake_get))
+    auth = authentication(
+        "api_key", settings=settings, user_model=CustomerForAPIKey,
+        api_key_field="key_digest",
+    )
+    assert auth.authenticate("raw-client-key") == {
+        "user_id": "42", "auth_method": "api_key"
+    }
+    assert filters == [{"key_digest": hash_api_key("raw-client-key")}]
+
+    auth_module = importlib.import_module("lenapi.authentication")
+    monkeypatch.setattr(auth_module, "make_api_key", lambda: "new-raw-key")
+    created = {}
+
+    def fake_create(cls, **kwargs):
+        created.update(kwargs)
+        return SimpleNamespace(
+            id=1, username=kwargs["username"], first_name=kwargs["first_name"],
+            last_name=kwargs["last_name"],
+        )
+
+    monkeypatch.setattr(CustomerForAPIKey, "create", classmethod(fake_create))
+    registration = SimpleNamespace(
+        username="ada", first_name="Ada", last_name="Lovelace", password="secret-pass"
+    )
+    result = register_user(
+        user_model=CustomerForAPIKey, data=registration,
+        authentication="api_key", api_key_field="key_digest",
+    )
+    assert result["api_key"] == "new-raw-key"
+    assert created["key_digest"] == hash_api_key("new-raw-key")
