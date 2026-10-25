@@ -200,6 +200,29 @@ from lenapi import Model
 config = context.config
 
 
+def include_migration_object(obj, name, type_, reflected, compare_to):
+    if type_ == "table" and name == "lenapi_background_jobs":
+        return config.attributes.get("lenapi_include_background_jobs", False)
+    # A newer LenApi naming convention can assign a name to a unique
+    # constraint that an older database already has unnamed. Treat matching
+    # column sets as the same constraint instead of generating a duplicate.
+    if type_ == "unique_constraint" and not reflected:
+        bind = context.get_context().bind
+        table = getattr(obj, "table", None)
+        columns = tuple(column.name for column in getattr(obj, "columns", ()))
+        if bind is not None and table is not None and columns:
+            try:
+                existing = inspect(bind).get_unique_constraints(table.name)
+            except Exception:
+                existing = ()
+            if any(
+                not item.get("name") and tuple(item.get("column_names") or ()) == columns
+                for item in existing
+            ):
+                return False
+    return True
+
+
 def load_app():
     app_path = config.attributes.get("app_import_string", "main:app")
     module_name, _, attribute_path = app_path.partition(":")
@@ -222,11 +245,7 @@ def run_migrations_offline():
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
-        include_object=lambda obj, name, type_, reflected, compare_to: (
-            config.attributes.get("lenapi_include_background_jobs", False)
-            if type_ == "table" and name == "lenapi_background_jobs"
-            else True
-        ),
+        include_object=include_migration_object,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -241,11 +260,7 @@ def run_migrations_online():
             connection=connection,
             target_metadata=Model.metadata,
             compare_type=True,
-            include_object=lambda obj, name, type_, reflected, compare_to: (
-                config.attributes.get("lenapi_include_background_jobs", False)
-                if type_ == "table" and name == "lenapi_background_jobs"
-                else True
-            ),
+            include_object=include_migration_object,
             render_as_batch=connection.dialect.name == "sqlite",
         )
         with context.begin_transaction():
@@ -932,6 +947,19 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     def include_migration_object(obj, name, type_, reflected, compare_to):
         if type_ == "table" and name == "lenapi_background_jobs":
             return config.attributes.get("lenapi_include_background_jobs", False)
+        if type_ == "unique_constraint" and not reflected:
+            table = getattr(obj, "table", None)
+            columns = tuple(column.name for column in getattr(obj, "columns", ()))
+            if table is not None and columns:
+                try:
+                    existing = inspect(engine).get_unique_constraints(table.name)
+                except Exception:
+                    existing = ()
+                if any(
+                    not item.get("name") and tuple(item.get("column_names") or ()) == columns
+                    for item in existing
+                ):
+                    return False
         return True
 
     if args.command == "showmigrations":

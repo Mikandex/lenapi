@@ -4,6 +4,8 @@ Import this module with ``from lenapi import model`` and declare fields as
 ``model.StringField(...)``, ``model.ForeignKeyField(...)``, and so on.
 """
 
+from sqlalchemy import UniqueConstraint
+
 from .models import (
     AutoField,
     Avg,
@@ -47,6 +49,7 @@ Json = JSONField
 
 __all__ = [
     "Model", "AdminUser", "AutoField", "IntegerField", "BigIntField", "BigIntegerField", "DecimalField", "StringField", "EmailField", "IPField", "PhoneField", "TextField",
+    "UniqueConstraint",
     "Email_field", "IP_field", "Phone_field", "TExtfield",
     "BooleanField", "FloatField", "DateTimeField", "JSONField", "Json", "UUIDField", "ImageField",
     "Count", "Sum", "Min", "Max", "Avg",

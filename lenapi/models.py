@@ -5,7 +5,7 @@ from contextvars import ContextVar
 import math
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, Numeric, String, Table, Text, Uuid, UniqueConstraint, and_, delete, func, inspect, or_, select
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, MetaData, Numeric, String, Table, Text, Uuid, UniqueConstraint, and_, delete, func, inspect, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, mapped_column, relationship
 
@@ -651,6 +651,15 @@ class Model(DeclarativeBase):
     """Base class for lenApi ORM models."""
 
     __abstract__ = True
+    # Give SQLAlchemy constraints stable names so Alembic batch migrations
+    # (notably SQLite table rebuilds) can safely add and remove them. Explicit
+    # names supplied through __table_args__ or ForeignKeyField are preserved.
+    metadata = MetaData(naming_convention={
+        "ix": "ix_%(table_name)s_%(column_0_name)s",
+        "uq": "uq_%(table_name)s_%(column_0_N_name)s",
+        "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+        "pk": "pk_%(table_name)s",
+    })
 
     get = _ModelManagerDescriptor()
     adelete = _AsyncDeleteDescriptor()

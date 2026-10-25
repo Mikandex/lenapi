@@ -971,6 +971,18 @@ class Invoice(model.Model):
 
 Table names are inferred from model class names in lowercase (`Student` becomes `student`); no table-name declaration is needed. Import `model` from `lenapi` and access the model base class, fields, and relationship behaviors through it, such as `model.Model`, `model.StringField`, and `model.ForeignKeyField`.
 
+LenApi assigns stable names to generated primary-key, foreign-key, index, and unique constraints. For a custom unique constraint name, declare it in `__table_args__` with `model.UniqueConstraint` (omit `unique=True` on the field to avoid creating a second constraint):
+
+```python
+class Student(model.Model):
+    phone = model.PhoneField(max_length=32, nullable=False)
+    __table_args__ = (
+        model.UniqueConstraint("phone", name="uq_student_phone"),
+    )
+```
+
+Foreign-key names can be set directly on the field with `constraint_name="fk_student_classroom_id_classroom"`.
+
 From the project root, run one command to detect model changes, write a migration under `migrations/versions/`, and apply it to the configured database:
 
 ```bash
