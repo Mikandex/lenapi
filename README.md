@@ -914,7 +914,29 @@ async def billing_webhook(
 
 ## Databases
 
-`Application()` uses SQLite by default and creates the `lenapi.db` file in the current working directory. Tables are managed by migrations, not created automatically at startup. `Database` accepts a SQLAlchemy URL when you want a different relational database. SQLAlchemy-backed models support SQLite, MySQL, and PostgreSQL. MongoDB is available through a separate optional Pydantic document API; it does not use SQL migrations or the SQLAlchemy `Model` base. Install optional drivers with `pip install '.[mysql]'`, `pip install '.[postgres]'`, or `pip install '.[mongodb]'`.
+`DATABASE_TYPE` chooses one backend and `DATABASE_URL` connects to it. The generated project defaults to SQLite. SQLite, MySQL, and PostgreSQL use SQLAlchemy models and Alembic revisions; MongoDB uses the separate `MongoDocument` API and does not have SQL schema revisions. `ACTIVATE_ASYNC = True` enables async access to the same database URL. Keep production credentials out of committed settings and URL-encode reserved characters in credentials.
+
+```python
+# settings.py — choose one backend and its URL
+DATABASE_TYPE = "sqlite"
+DATABASE_URL = f"sqlite:///{BASE_DIR / 'lenapi.db'}"
+
+# MySQL: install `python -m pip install 'lenapi[mysql]'`
+# DATABASE_TYPE = "mysql"
+# DATABASE_URL = "mysql://user:password@localhost:3306/app_db"
+
+# PostgreSQL: install `python -m pip install 'lenapi[postgres]'`
+# DATABASE_TYPE = "postgresql"
+# DATABASE_URL = "postgresql://user:password@localhost:5432/app_db"
+
+# MongoDB: install `python -m pip install 'lenapi[mongodb]'`
+# DATABASE_TYPE = "mongodb"
+# DATABASE_URL = "mongodb://user:password@localhost:27017/app_db"
+
+ACTIVATE_ASYNC = False
+```
+
+LenAPI chooses the supported synchronous driver for a selected MySQL or PostgreSQL URL. Async access uses `aiosqlite` for SQLite; install `lenapi[async-mysql]` for MySQL or `lenapi[async-postgres]` for PostgreSQL. MongoDB uses its separate sync/async document API.
 
 ### MongoDB documents
 
@@ -1026,15 +1048,52 @@ class Enrollment(model.Model):
 
 `ForeignKeyField.constraint_name` is also optional; set it only when you need a specific foreign-key name.
 
-From the project root, run one command to detect model changes, write a migration under `migrations/versions/`, and apply it to the configured database:
+### Migration commands
+
+Run the commands from the generated project root. Import application models before migration discovery, normally by importing them in `main.py`.
+
+`migration` detects schema changes against imported model metadata, creates a new Alembic revision if needed, and applies pending revisions. It does not upgrade the database when there is no new revision. Use it during development after changing relational models:
 
 ```bash
 python lenora.py migration
+python lenora.py migration --message "add student phone"
 ```
 
-After changing models, run the same command again; it creates and applies the next migration. Use `--message "describe change"` to name a migration. Existing unversioned SQLite databases that already match the models are adopted without changing their data. Inside a request, models provide these query helpers:
+An existing unversioned SQLite database is adopted only when its schema matches the migration history; adoption preserves its data.
 
-Inspect migration state with `python lenora.py showmigrations`; it lists each local revision, whether it is applied, and database revision IDs whose files are missing. If the database references a missing revision, `python lenora.py repair-migrations` checks that the live schema exactly matches the current models before stamping the database to the local head. `python lenora.py delete_migrations` prompts for y/n confirmation, then drops all tables and views in the configured database and removes local migration revision files. It is destructive and intended only for a full reset. `python lenora.py clear_migrations` remains limited to an empty database.
+`migrate` applies pending migration files already in `migrations/versions/`; it does not generate a revision. A common release workflow is to generate and inspect a revision during development, commit the revision with the code, then run `migrate` during deployment:
+
+```bash
+# Development
+python lenora.py migration
+
+# Deployment after the revision file is checked in
+python lenora.py migrate
+```
+
+`showmigrations` reports local revision files and whether each is applied. It also flags revision IDs that the database or local revision chain references but whose files are missing:
+
+```bash
+python lenora.py showmigrations
+```
+
+`repair-migrations` repairs only migration history. It compares the live SQL schema with the current models, then stamps the local head only when they match; it preserves schema and data and refuses mismatches. If a revision file is missing, restore it when possible; use repair only after confirming the live schema matches current model metadata. On an empty database with no revisions, use `migration` to create a new initial revision instead. MongoDB has no Alembic history and does not support this repair command.
+
+```bash
+python lenora.py repair-migrations
+```
+
+`clear_migrations` removes local revision files and the Alembic version table only when there are no application tables. It is for resetting an empty SQL project, not for reconciling an existing schema.
+
+`delete_migrations` is a destructive full reset. After an interactive y/n confirmation, it drops every table and view in the selected SQL database (or every collection in MongoDB) and deletes local revision files. This also deletes application data. Back up first and use it only when a clean database is intended:
+
+```bash
+python lenora.py delete_migrations
+```
+
+For MongoDB, `migration` and `migrate` initialize missing framework and imported document collections; they do not create Alembic revisions or migrate document fields. `showmigrations` reports that MongoDB has no Alembic revisions; `repair-migrations` and `clear_migrations` are SQL-only; `delete_migrations` drops all collections after confirmation.
+
+Inside a request, models provide these query helpers:
 
 ```python
 student = Student.create(person_name="Ifeanyi", course="Python")
