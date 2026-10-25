@@ -1125,7 +1125,7 @@ async_student = await Student.acreate(person_name="Ada", course="Python")
 
 # 2. Get all rows
 students = Student.get.all()
-async_students = await Student.afilter().all()
+async_students = await Student.aget.all()
 
 # 3. Get one row by a unique value or primary key
 student = Student.get(id=1).get()
@@ -1170,7 +1170,7 @@ async_total = async_page.total_count
 async_pages = async_page.page_count
 ```
 
-`Student.get(...)` builds a single-row lookup; call `.get()` for the model instance or `.exists()` for a boolean. Multiple matches are an error rather than an arbitrary row selection. `Student.get("field", ...).get(...)` selects one or more columns; one selected column returns a scalar and multiple columns return a mapping. This is a query projection, not a uniqueness constraint. To make the database reject duplicates, declare `unique=True` on the field.
+`Student.get.all()` returns all rows synchronously; its async counterpart is `await Student.aget.all()`. For filtered async lists, use `await Student.afilter(...).all()`. `Student.get(...)` builds a single-row lookup; call `.get()` for the model instance or `.exists()` for a boolean. The async single-row counterpart is `await Student.aget(...)`. Multiple matches are an error rather than an arbitrary row selection. `Student.get("field", ...).get(...)` selects one or more columns; one selected column returns a scalar and multiple columns return a mapping. This is a query projection, not a uniqueness constraint. To make the database reject duplicates, declare `unique=True` on the field.
 
 `filter(...)` accepts equality filters and lookups such as `course__icontains="py"`, `id__gte=10`, `id__in=[1, 2]`, and `classroom_id__isnull=True`. Supported lookup suffixes are `exact`, `iexact`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notin`, `contains`, `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`, and `isnull`. Query methods include `.values(...)`, `.order(field)` (prefix with `-` for descending), `.limit(n)`, `.offset(n)`, and terminal operations `.all()`, `.first()`, `.one_or_none()`, `.count()`, `.aggregate(...)`, and `.delete()`. Async query builders use `afilter()`, `asearch()`, and `asearch_any()`; await terminal methods such as `.all()`, `.get()`, `.count()`, `.aggregate()`, or `.delete()`.
 

@@ -619,6 +619,28 @@ class _ModelManagerDescriptor:
         return _ModelManager(owner)
 
 
+class _AsyncModelManager:
+    """Async counterpart to the model manager for ``aget`` operations."""
+
+    def __init__(self, model):
+        self.model = model
+
+    async def all(self, *, limit=None, offset=0, session=None):
+        """Return all model rows asynchronously, with optional pagination."""
+        return await _AsyncQuerySet(
+            self.model, limit=limit, offset=offset
+        ).all(session=session)
+
+    async def __call__(self, *, session=None, **filters):
+        """Return the sole matching model instance asynchronously, or None."""
+        return await _AsyncQuerySet(self.model, **filters).one_or_none(session=session)
+
+
+class _AsyncModelManagerDescriptor:
+    def __get__(self, instance, owner):
+        return _AsyncModelManager(owner)
+
+
 class _AsyncDeleteDescriptor:
     """Support both ``await Model.adelete(**filters)`` and instance deletion."""
 
@@ -662,6 +684,7 @@ class Model(DeclarativeBase):
     })
 
     get = _ModelManagerDescriptor()
+    aget = _AsyncModelManagerDescriptor()
     adelete = _AsyncDeleteDescriptor()
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -687,11 +710,6 @@ class Model(DeclarativeBase):
         instance = cls(**values)
         await instance.asave(session=session)
         return instance
-
-    @classmethod
-    async def aget(cls, *, session=None, **filters):
-        """Return the sole matching row asynchronously, or None if it is absent."""
-        return await _AsyncQuerySet(cls, **filters).one_or_none(session=session)
 
     @classmethod
     def afilter(cls, **filters):
