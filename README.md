@@ -1283,6 +1283,63 @@ async_pages = async_page.page_count
 
 `Student.get.all()` returns all rows synchronously; its async counterpart is `await Student.aget.all()`. For filtered async lists, use `await Student.afilter(...).all()`. `Student.get(...)` builds a single-row lookup; call `.get()` for the model instance or `.exists()` for a boolean. The async single-row counterpart is `await Student.aget(...)`, and its existence check is `await Student.aget(...).exists()`. Multiple matches are an error rather than an arbitrary row selection. `Student.get("field", ...).get(...)` selects one or more columns; one selected column returns a scalar and multiple columns return a mapping. This is a query projection, not a uniqueness constraint. To make the database reject duplicates, declare `unique=True` on the field.
 
+### Fetch related records
+
+With a `ForeignKeyField` such as `Student.classroom_id`, sync code can resolve the target row using `.special("classroom_id")`. It returns a proxy where that same attribute contains the related `Classroom` instance (or `None` if the foreign key is null):
+
+```python
+from app.models import Classroom, Student
+
+student = Student.get(id=1).special("classroom_id")
+classroom = student.classroom_id
+if classroom is not None:
+    print(classroom.name)
+```
+
+For async code, use the stored foreign-key ID for a second async lookup. `.special()` is a sync helper:
+
+```python
+student = await Student.aget(id=1)
+classroom = None
+if student is not None and student.classroom_id is not None:
+    classroom = await Classroom.aget(id=student.classroom_id)
+```
+
+For `ManyToManyField`, the related collection is available as an attribute. In sync code, call `.all()` to get its related model instances:
+
+```python
+from app.models import Teacher
+
+teacher = Teacher.get(id=1).get()
+courses = teacher.courses.all()
+print([course.name for course in courses])
+```
+
+In async routes, eager-load the collection with SQLAlchemy's `selectinload` and the injected `AsyncSession` before reading it. Direct lazy access would try to perform database I/O during ordinary attribute access:
+
+```python
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from lenapi import HTTPException
+from app.models import Teacher
+
+@app.get("/teachers/{teacher_id}/courses")
+async def teacher_courses(teacher_id: int, db: AsyncSession):
+    result = await db.scalars(
+        select(Teacher)
+        .options(selectinload(Teacher.courses))
+        .where(Teacher.id == teacher_id)
+    )
+    teacher = result.one_or_none()
+    if teacher is None:
+        raise HTTPException(404, "Teacher not found")
+    return [{"id": course.id, "name": course.name}
+            for course in teacher.courses.all()]
+```
+
+Declare the relationships in `app/models.py` and run `python lenora.py migration` before querying them. Async relationship loading requires `ACTIVATE_ASYNC = True` and the matching async driver.
+
 `filter(...)` accepts equality filters and lookups such as `course__icontains="py"`, `id__gte=10`, `id__in=[1, 2]`, and `classroom_id__isnull=True`. Supported lookup suffixes are `exact`, `iexact`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notin`, `contains`, `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`, and `isnull`. Query methods include `.values(...)`, `.order(field)` (prefix with `-` for descending), `.limit(n)`, `.offset(n)`, and terminal operations `.all()`, `.first()`, `.one_or_none()`, `.count()`, `.aggregate(...)`, and `.delete()`. Async query builders use `afilter()`, `asearch()`, and `asearch_any()`; await terminal methods such as `.all()`, `.get()`, `.count()`, `.aggregate()`, or `.delete()`.
 
 `search(**terms)` applies case-insensitive substring matching and combines supplied terms with AND. `search_any(query, *fields)` searches one term across string columns and combines fields with OR. Paginated results remain list-like and expose `.total_count`, `.page_count`/`.total_pages`, and `.pagination`; `limit` and `offset` must be non-negative integers. Annotate a route argument as SQLAlchemy's `Session` when you need transaction control directly.
