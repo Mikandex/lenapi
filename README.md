@@ -987,6 +987,23 @@ class Invoice(model.Model):
 
 Table names are inferred from model class names in lowercase (`Student` becomes `student`); no table-name declaration is needed. Import `model` from `lenapi` and access the model base class, fields, and relationship behaviors through it, such as `model.Model`, `model.StringField`, and `model.ForeignKeyField`.
 
+`model.Model` is the base class for SQL-backed models. Subclass it to declare a table; each field assignment declares a database column, and the framework supplies an integer `id` primary key unless you define one yourself. Field declarations describe storage and database constraints; use Pydantic schemas to validate API input.
+
+The field helpers include `AutoField`, `IntegerField`, `BigIntegerField`/`BigIntField`, `StringField`, `TextField`, `EmailField`, `PhoneField`, `IPField`, `BooleanField`, `FloatField`, `DecimalField`, `DateTimeField`, `JSONField`/`Json`, `UUIDField`, `ImageField`, `ForeignKeyField`, and `ManyToManyField`. Fields normally default to `nullable=True` and `blank=True`; `BooleanField` defaults to `True`. `JSONField` and its alias `Json` store JSON-compatible Python values. Use a factory such as `default=dict` for a fresh mutable value on each new row:
+
+```python
+class Student(model.Model):
+    username = model.StringField(max_length=120, unique=True)
+    profile = model.Json(default=dict)
+
+student = Student.create(
+    username="ada",
+    profile={"course": "Python", "active": True},
+)
+```
+
+`unique=True` is a database constraint that prevents duplicate values in that column. Constraint names are generated automatically; explicit names are optional. `Model.get.unique("field")` is a query projection that selects a field while looking up a row. It does not add a uniqueness constraint to the schema. Put `unique=True` on the field when the database itself must guarantee that only one row can have that value.
+
 Constraint names are optional in model declarations. LenApi automatically assigns stable names to generated primary-key, foreign-key, index, and unique constraints, so a normal `unique=True` field needs no explicit name and works with Alembic, including SQLite batch migrations. Use `__table_args__` only when you want to choose the exact unique-constraint name; omit `unique=True` on that field to avoid creating a second constraint:
 
 ```python
@@ -1038,7 +1055,7 @@ new_student = Student(person_name="Ada", course="Databases")
 new_student.save()  # commits and refreshes the instance
 ```
 
-`Student.get(...)` builds a single-row lookup; call `.get()` for the full model instance or `.exists()` for a boolean. Multiple matches raise a multiple-results error. Pass column names to `Student.get(...)` to return only those fields, either as a scalar or a dictionary. `filter(...)` accepts exact field matches and Django-style lookups such as `course__icontains="py"`, `id__gte=10`, `id__in=[1, 2]`, and `classroom_id__isnull=True`. Supported lookups include `exact`, `iexact`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notin`, `contains`, `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`, and `isnull`. `search(...)` applies case-insensitive substring matching across all provided string fields (all terms must match); `search_any(query, *fields)` searches one term across fields and returns rows matching any field. Use `.values()` to select all columns as dictionaries or `.values("field", ...)` for selected columns; chain `.order("field")` (prefix with `-` for descending) and then `.all()` to execute. Annotate a route argument as SQLAlchemy's `Session` when you need transaction control directly.
+`Student.get(...)` builds a single-row lookup; call `.get()` for the full model instance or `.exists()` for a boolean. Multiple matches raise a multiple-results error. Pass column names to `Student.get(...)` to return only those fields, either as a scalar or a dictionary. The `Model.get.unique("field")` spelling also selects a field for a lookup; `unique` in this query API is not the same as the field option `unique=True`. `filter(...)` accepts exact field matches and Django-style lookups such as `course__icontains="py"`, `id__gte=10`, `id__in=[1, 2]`, and `classroom_id__isnull=True`. Supported lookups include `exact`, `iexact`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notin`, `contains`, `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`, and `isnull`. `search(...)` applies case-insensitive substring matching across all provided string fields (all terms must match); `search_any(query, *fields)` searches one term across fields and returns rows matching any field. Use `.values()` to select all columns as dictionaries or `.values("field", ...)` for selected columns; chain `.order("field")` (prefix with `-` for descending) and then `.all()` to execute. `Model.count()` counts all rows; `Model.filter(...).count()` counts only matches. Annotate a route argument as SQLAlchemy's `Session` when you need transaction control directly.
 
 The sample API exposes these operations as `GET /students/filter?course__icontains=py&id__gte=1&order_by=-id&limit=20&offset=0`. Use comma-separated values for `__in`, for example `GET /students/filter?id__in=1,2,3`. Search using `GET /students/search?q=python` (searches `person_name` and `course` by default), or choose fields with `GET /students/search?q=ada&fields=person_name,course`.
 
