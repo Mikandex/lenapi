@@ -1,13 +1,18 @@
 """Django-inspired model base and field helpers backed by SQLAlchemy."""
 
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from contextvars import ContextVar
+import ipaddress
 import math
+import re
 import uuid
+from urllib.parse import urlsplit
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, MetaData, Numeric, String, Table, Text, Uuid, UniqueConstraint, and_, delete, func, inspect, or_, select
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, Float, ForeignKey, Integer, Interval, JSON, MetaData, Numeric, String, Table, Text, Time, Uuid, UniqueConstraint, and_, delete, func, inspect, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, declared_attr, mapped_column, relationship
+from sqlalchemy import event
 
 from .response import HTTPException
 
@@ -710,7 +715,22 @@ class Model(DeclarativeBase):
     aget = _AsyncModelManagerDescriptor()
     adelete = _AsyncDeleteDescriptor()
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    @declared_attr
+    def id(cls):
+        # If a model declares any primary key locally, use that instead of
+        # silently adding ``id`` and turning the key into a composite key.
+        # Single-table subclasses inherit their parent's key unchanged.
+        if any(getattr(base, "__table__", None) is not None for base in cls.__bases__):
+            return None
+        has_local_primary_key = any(
+            isinstance(value, MappedColumn)
+            and getattr(getattr(value, "column", None), "primary_key", False)
+            for name, value in cls.__dict__.items()
+            if name != "id"
+        )
+        if has_local_primary_key:
+            return None
+        return mapped_column(Integer, primary_key=True, autoincrement=True)
 
     @declared_attr.directive
     def __tablename__(cls) -> str | None:
@@ -818,6 +838,7 @@ class Model(DeclarativeBase):
 
     def save(self):
         """Insert or update this model instance, commit, and refresh it."""
+        _validate_instance(self)
         session = _session()
         mapper = inspect(type(self))
         state = inspect(self)
@@ -836,15 +857,23 @@ class Model(DeclarativeBase):
             if session.scalar(statement) is not None:
                 raise HTTPException(
                     409,
-                    f"Double entries are not allowed: {self.__class__.__name__}.{column.key}",
+                    _validation_error(
+                        column, "unique",
+                        f"Double entries are not allowed: {self.__class__.__name__}.{column.key}",
+                    ),
                 )
         session.add(self)
-        session.commit()
-        session.refresh(self)
+        try:
+            session.commit()
+            session.refresh(self)
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(409, "Duplicate or conflicting data") from exc
         return self
 
     async def asave(self, *, session=None):
         """Insert or update this model instance asynchronously and refresh it."""
+        _validate_instance(self)
         active_session = _async_session(session)
         mapper = inspect(type(self))
         state = inspect(self)
@@ -863,7 +892,10 @@ class Model(DeclarativeBase):
             if (await active_session.scalar(statement)) is not None:
                 raise HTTPException(
                     409,
-                    f"Double entries are not allowed: {self.__class__.__name__}.{column.key}",
+                    _validation_error(
+                        column, "unique",
+                        f"Double entries are not allowed: {self.__class__.__name__}.{column.key}",
+                    ),
                 )
         active_session.add(self)
         try:
@@ -944,9 +976,27 @@ class Model(DeclarativeBase):
         return _SingleQuery(cls, **filters)
 
 
+@event.listens_for(Column, "after_parent_attach")
+def _install_non_negative_constraint(column, table):
+    """Add a DB CHECK constraint as soon as a Positive* column joins a table."""
+    if not column.info.get("lenapi_non_negative"):
+        return
+    name = f"ck_{table.name}_{column.name}_non_negative"
+    if not any(constraint.name == name for constraint in table.constraints):
+        table.append_constraint(CheckConstraint(column >= 0, name=name))
+
+
 def _field(sql_type: Any, **kwargs):
     blank = kwargs.pop("blank", True)
     info = dict(kwargs.pop("info", {}) or {})
+    error_messages = kwargs.pop("error_messages", None)
+    if error_messages is not None:
+        if not isinstance(error_messages, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in error_messages.items()
+        ):
+            raise TypeError("error_messages must be a mapping of rule names to message strings")
+        info["error_messages"] = dict(error_messages)
     info.setdefault("blank", blank)
     kwargs["info"] = info
     kwargs.setdefault("nullable", True)
@@ -965,12 +1015,29 @@ def IntegerField(**kwargs):
     return _field(Integer, **kwargs)
 
 
+def PositiveIntegerField(**kwargs):
+    """Declare a non-negative integer with a database CHECK constraint."""
+    return _positive_field(Integer, **kwargs)
+
+
 def BigIntegerField(**kwargs):
     """Declare a signed 64-bit integer column."""
     return _field(BigInteger, **kwargs)
 
 
 BigIntField = BigIntegerField
+
+
+def PositiveBigIntegerField(**kwargs):
+    """Declare a non-negative 64-bit integer with a database CHECK constraint."""
+    return _positive_field(BigInteger, **kwargs)
+
+
+def _positive_field(sql_type, **kwargs):
+    info = dict(kwargs.pop("info", {}) or {})
+    info["lenapi_non_negative"] = True
+    info["lenapi_validation"] = "non_negative"
+    return _field(sql_type, info=info, **kwargs)
 
 
 def StringField(max_length: int = 255, **kwargs):
@@ -980,32 +1047,66 @@ def StringField(max_length: int = 255, **kwargs):
 def UUIDField(**kwargs):
     """Declare a native UUID column, generating a UUID4 when omitted."""
     kwargs.setdefault("default", uuid.uuid4)
-    return _field(Uuid(as_uuid=True), **kwargs)
+    info = dict(kwargs.pop("info", {}) or {})
+    info["lenapi_validation"] = "uuid"
+    return _field(Uuid(as_uuid=True), info=info, **kwargs)
+
+
+def _upload_field(upload_to: str, max_length: int, media_type: str, **kwargs):
+    upload_to = upload_to.strip("/")
+    if not upload_to or any(part in {".", ".."} for part in upload_to.split("/")):
+        raise ValueError("upload_to must be a safe relative directory")
+    max_size = kwargs.pop("max_size", None)
+    if max_size is not None and (isinstance(max_size, bool) or not isinstance(max_size, int) or max_size <= 0):
+        raise ValueError("max_size must be a positive integer")
+    info = dict(kwargs.pop("info", {}) or {})
+    info.update({"upload_to": upload_to, "media_type": media_type})
+    if max_size is not None:
+        info["max_size"] = max_size
+    return _field(String(max_length), info=info, **kwargs)
 
 
 def ImageField(upload_to: str = "uploads/images", max_length: int = 500, **kwargs):
     """Store a relative image path; upload bytes through ``Request.form()``."""
-    upload_to = upload_to.strip("/")
-    if not upload_to or any(part in {".", ".."} for part in upload_to.split("/")):
-        raise ValueError("upload_to must be a safe relative directory")
-    info = dict(kwargs.pop("info", {}) or {})
-    info.update({"upload_to": upload_to, "media_type": "image"})
-    return _field(String(max_length), info=info, **kwargs)
+    return _upload_field(upload_to, max_length, "image", **kwargs)
+
+
+def FileField(upload_to: str = "uploads/files", max_length: int = 500, **kwargs):
+    """Store a path for non-image uploads; use UploadFile.save(type='file')."""
+    return _upload_field(upload_to, max_length, "file", **kwargs)
+
+
+def FileImageField(upload_to: str = "uploads", max_length: int = 500, **kwargs):
+    """Store a path for either image or non-image uploads."""
+    return _upload_field(upload_to, max_length, "file_image", **kwargs)
 
 
 def EmailField(max_length: int = 254, **kwargs):
     """Declare a string column intended for an email address."""
-    return StringField(max_length=max_length, **kwargs)
+    info = dict(kwargs.pop("info", {}) or {})
+    info["lenapi_validation"] = "email"
+    return _field(String(max_length), info=info, **kwargs)
 
 
 def IPField(max_length: int = 45, **kwargs):
     """Declare a string column sized for IPv4 or IPv6 addresses."""
-    return StringField(max_length=max_length, **kwargs)
+    info = dict(kwargs.pop("info", {}) or {})
+    info["lenapi_validation"] = "ip"
+    return _field(String(max_length), info=info, **kwargs)
 
 
-def PhoneField(max_length: int = 32, **kwargs):
+def PhoneField(max_length: int = 18, **kwargs):
     """Declare a string column intended for an international phone number."""
-    return StringField(max_length=max_length, **kwargs)
+    info = dict(kwargs.pop("info", {}) or {})
+    info["lenapi_validation"] = "phone"
+    return _field(String(max_length), info=info, **kwargs)
+
+
+def URLField(max_length: int = 2048, **kwargs):
+    """Declare a URL string accepting http(s) URLs or www-prefixed URLs."""
+    info = dict(kwargs.pop("info", {}) or {})
+    info["lenapi_validation"] = "url"
+    return _field(String(max_length), info=info, **kwargs)
 
 
 def TextField(**kwargs):
@@ -1036,8 +1137,108 @@ def DecimalField(max_digits: int = 10, decimal_places: int = 2, **kwargs):
     return _field(Numeric(precision=max_digits, scale=decimal_places, asdecimal=True), **kwargs)
 
 
+def _auto_add_now(kwargs, default_factory):
+    auto_add_now = kwargs.pop("auto_add_now", None)
+    if auto_add_now is None:
+        auto_add_now = "default" not in kwargs and "server_default" not in kwargs
+    if not isinstance(auto_add_now, bool):
+        raise TypeError("auto_add_now must be a boolean")
+    if auto_add_now:
+        if "default" in kwargs or "server_default" in kwargs:
+            raise ValueError("auto_add_now cannot be combined with default or server_default")
+        kwargs["default"] = default_factory
+
+
 def DateTimeField(**kwargs):
+    _auto_add_now(kwargs, lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     return _field(DateTime, **kwargs)
+
+
+def DateField(**kwargs):
+    _auto_add_now(kwargs, lambda: datetime.now(timezone.utc).date())
+    return _field(Date, **kwargs)
+
+
+def TimeField(**kwargs):
+    _auto_add_now(kwargs, lambda: datetime.now(timezone.utc).time().replace(tzinfo=None))
+    return _field(Time, **kwargs)
+
+
+def DurationField(*, weeks=0, days=0, hours=0, minutes=0, seconds=0,
+                  milliseconds=0, microseconds=0, **kwargs):
+    """Store a fixed time interval as a ``datetime.timedelta``.
+
+    Pass one or more ``timedelta`` units as the default, e.g.
+    ``DurationField(weeks=1)``. Calendar months and years are not fixed
+    durations; calculate those expiry dates with calendar-aware logic.
+    """
+    units = {"weeks": weeks, "days": days, "hours": hours, "minutes": minutes,
+             "seconds": seconds, "milliseconds": milliseconds, "microseconds": microseconds}
+    if any(value != 0 for value in units.values()):
+        if "default" in kwargs or "server_default" in kwargs:
+            raise ValueError("DurationField unit arguments cannot be combined with default or server_default")
+        kwargs["default"] = timedelta(**units)
+    elif "default" in kwargs and not isinstance(kwargs["default"], (timedelta, type(None))):
+        raise TypeError("DurationField default must be a datetime.timedelta")
+    return _field(Interval(), **kwargs)
+
+
+def _validation_error(column, rule: str, default_message: str):
+    messages = column.info.get("error_messages", {})
+    return messages.get(rule, default_message)
+
+
+def _validate_instance(instance):
+    for column in instance.__table__.columns:
+        rule = column.info.get("lenapi_validation")
+        value = getattr(instance, column.key)
+        if value is None or rule is None:
+            continue
+        message = None
+        if rule == "email":
+            valid = isinstance(value, str) and re.fullmatch(r"[^\s@]+@[^\s@]+", value) is not None
+            message = _validation_error(column, rule, "Enter a valid email address")
+        elif rule == "phone":
+            valid = isinstance(value, str) and re.fullmatch(r"\+[1-9][0-9]{0,16}", value) is not None
+            message = _validation_error(column, rule, "Phone must start with + and contain at most 18 digits")
+        elif rule == "ip":
+            try:
+                ipaddress.ip_address(value)
+                valid = isinstance(value, str)
+            except (ValueError, TypeError):
+                valid = False
+            message = _validation_error(column, rule, "Enter a valid IPv4 or IPv6 address")
+        elif rule == "url":
+            valid = False
+            if isinstance(value, str) and value and not any(char.isspace() for char in value):
+                lowered = value.lower()
+                if lowered.startswith("www."):
+                    candidate = f"https://{value}"
+                elif lowered.startswith(("http://", "https://")):
+                    candidate = value
+                else:
+                    candidate = ""
+                try:
+                    parsed = urlsplit(candidate)
+                    valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+                except ValueError:
+                    valid = False
+            message = _validation_error(column, rule, "Enter a valid http, https, or www URL")
+        elif rule == "uuid":
+            try:
+                normalized = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+                setattr(instance, column.key, normalized)
+                valid = True
+            except (ValueError, TypeError, AttributeError):
+                valid = False
+            message = _validation_error(column, rule, "Enter a valid UUID")
+        elif rule == "non_negative":
+            valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            message = _validation_error(column, "min_value", "Value must be zero or greater")
+        else:
+            continue
+        if not valid:
+            raise HTTPException(422, message)
 
 
 def JSONField(**kwargs):
@@ -1072,6 +1273,14 @@ def ForeignKeyField(target: str, *, model=PROTECT, on_delete: str | None = None,
         nullable=nullable,
         **kwargs,
     )
+
+
+def OneToOneField(target: str, *, model=PROTECT, on_delete: str | None = None, **kwargs):
+    """Declare a unique foreign key, giving the relationship one-to-one semantics."""
+    if kwargs.get("unique") is False:
+        raise ValueError("OneToOneField always enforces uniqueness")
+    kwargs["unique"] = True
+    return ForeignKeyField(target, model=model, on_delete=on_delete, **kwargs)
 
 
 class _ManyRelatedSet(set):
@@ -1110,15 +1319,46 @@ def ManyToManyField(target, *, table_name: str | None = None, back_populates: st
         association_name = table_name or f"{source_table}_{field_name}"
         association = cls.metadata.tables.get(association_name)
         if association is None:
+            source_pk = next((
+                value.column for name, value in cls.__dict__.items()
+                if name != field_name and isinstance(value, MappedColumn)
+                and getattr(value.column, "primary_key", False)
+            ), None)
+            source_pk_name = source_pk.name if source_pk is not None and source_pk.name else next((
+                name for name, value in cls.__dict__.items()
+                if name != field_name and isinstance(value, MappedColumn)
+                and getattr(value.column, "primary_key", False)
+            ), "id")
+            source_pk_type = source_pk.type if source_pk is not None else Integer
+            target_table_obj = cls.metadata.tables.get(target_table)
+            target_pk = (
+                next(iter(target_table_obj.primary_key.columns))
+                if target_table_obj is not None
+                else None
+            )
+            if source_table == target_table:
+                target_pk_name = source_pk_name
+                target_pk_type = source_pk_type
+            else:
+                target_pk_name = target_pk.name if target_pk is not None else "id"
+                target_pk_type = target_pk.type if target_pk is not None else Integer
             if source_table == target_table:
                 source_column, target_column = f"{field_name}_source_id", f"{field_name}_target_id"
             else:
-                source_column, target_column = f"{source_table}_id", f"{target_table}_id"
+                source_key = source_pk_name
+                target_key = target_pk_name
+                source_column = f"{source_table}_{source_key}"
+                target_column = f"{target_table}_{target_key}"
             association = Table(
                 association_name,
                 cls.metadata,
-                Column(source_column, ForeignKey(f"{source_table}.id", ondelete="CASCADE"), primary_key=True),
-                Column(target_column, ForeignKey(f"{target_table}.id", ondelete="CASCADE"), primary_key=True),
+                Column(source_column, source_pk_type, ForeignKey(f"{source_table}.{source_pk_name}", ondelete="CASCADE"), primary_key=True),
+                Column(
+                    target_column,
+                    target_pk_type,
+                    ForeignKey(f"{target_table}.{target_pk_name}", ondelete="CASCADE"),
+                    primary_key=True,
+                ),
             )
         return relationship(
             target if target_class is not None else target_name,

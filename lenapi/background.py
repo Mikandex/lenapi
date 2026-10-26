@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import math
 import threading
 import time
 import uuid
@@ -101,14 +102,26 @@ class BackgroundQueue:
             return function
         return register
 
-    async def enqueue(self, task_name: str, *args, **kwargs) -> str:
-        """Queue a named task and return its job ID."""
+    async def enqueue(self, task_name: str, *args, delay_seconds: float = 0, **kwargs) -> str:
+        """Queue a named task and return its job ID.
+
+        ``delay_seconds`` sets the earliest time the job can be claimed. It is
+        queue metadata and is not passed to the registered task function.
+        """
         if not isinstance(task_name, str) or not task_name or len(task_name) > 200:
             raise ValueError("task_name must contain 1 to 200 characters")
+        if (
+            isinstance(delay_seconds, bool)
+            or not isinstance(delay_seconds, (int, float))
+            or not math.isfinite(delay_seconds)
+            or delay_seconds < 0
+        ):
+            raise ValueError("delay_seconds must be a finite, non-negative number")
         payload = {"args": args, "kwargs": kwargs}
         encoded = json.dumps(payload, separators=(",", ":"))
         job_id = uuid.uuid4().hex
         now = time.time()
+        available_at = now + delay_seconds
 
         if self.backend == "memory":
             with _MEMORY_QUEUE_LOCK:
@@ -118,7 +131,7 @@ class BackgroundQueue:
                     "payload": json.loads(encoded),
                     "status": "queued",
                     "attempts": 0,
-                    "available_at": now,
+                    "available_at": available_at,
                     "locked_until": None,
                     "last_error": None,
                     "created_at": now,
@@ -132,7 +145,7 @@ class BackgroundQueue:
                 "task_name": task_name,
                 "payload": encoded,
                 "attempts": "0",
-                "available_at": str(now),
+                "available_at": str(available_at),
             })
             await self._redis.hset(self._redis_state_key(job_id), mapping={
                 "status": "queued", "attempts": "0", "task_name": task_name,
@@ -148,7 +161,7 @@ class BackgroundQueue:
                     payload=json.loads(encoded),
                     status="queued",
                     attempts=0,
-                    available_at=now,
+                    available_at=available_at,
                     created_at=now,
                 ))
 

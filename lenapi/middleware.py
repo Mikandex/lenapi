@@ -250,7 +250,7 @@ class DocsAuthMiddleware:
         app.add_middleware(
             DocsAuthMiddleware,
             auth=authentication("basic_login"),
-            paths=(app.docs_url, app.openapi_url),
+            paths=(app.docs_url, app.redoc_url, app.openapi_url),
         )
     """
 
@@ -259,7 +259,7 @@ class DocsAuthMiddleware:
         app,
         *,
         auth,
-        paths=('/docs/', '/openapi.json'),
+        paths=('/docs/', '/redoc/', '/openapi.json'),
         session_factory=None,
         async_session_factory=None,
     ) -> None:

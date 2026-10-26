@@ -8,6 +8,13 @@ LenAPI aims to reduce repetitive code and simplify common integrations, helping 
 
 **LenAPI — Compact by Design, Powerful by Capability.**
 
+## Python versions
+
+LenAPI is tested and supported on Python 3.11 through 3.14. Python 3.10 reached
+end of life on October 1, 2026 and is unsupported; installing LenAPI requires
+Python 3.11 or newer, and importing the framework on Python 3.10 reports this
+requirement explicitly.
+
 ```python
 from pydantic import BaseModel, ConfigDict
 from lenapi import LENAPI, Router
@@ -50,7 +57,17 @@ LenApi prints `INFO` and higher by default. You can change the level or add your
 
 ## WebSockets
 
-Register WebSocket handlers with `@app.websocket(...)` and use the connection helpers from `lenapi.service`:
+WebSockets keep one connection open so a client and server can send messages in
+both directions without creating a new HTTP request for every update. Use them
+for chat, live status, notifications, and WebRTC signaling. They are separate
+from normal HTTP routes and do not appear as ordinary request/response
+operations in Swagger.
+
+### Low-level WebSocket handler
+
+Use `@app.websocket(...)` when you need to control the protocol yourself. A
+handler accepts the connection, receives and sends messages until the client
+disconnects, then cleans up:
 
 ```python
 from lenapi import LENAPI
@@ -69,15 +86,51 @@ async def room_socket(websocket: WebSocket, room_id: int):
         pass
 ```
 
-`WebSocket` supports text, bytes, and JSON messages, explicit acceptance, and close codes. WebSocket paths can also be registered on a `Router` and mounted with `include_router()` or `add_router()`.
+`WebSocket` provides `accept()`, `receive_text()`, `receive_json()`,
+`receive_bytes()`, `send_text()`, `send_json()`, `send_bytes()`, and `close()`.
+Catch `WebSocketDisconnect` to handle a normal client disconnect. WebSocket
+handlers can also be registered on a `Router` and mounted with
+`include_router()`.
 
-For a ready-made room relay, use `WebSocketService`. The primary types are `chat`, `video`, `json`, `message`, and `byte`; `chat_video` is also available for combined chat and video signaling. Chat/video use JSON message objects, video relays WebRTC `offer`, `answer`, and `candidate` messages, `json` accepts JSON values, `message` relays text, and `byte` relays binary data. Rooms can be selected with a `{room_id}` path parameter or `?room=...` query parameter. The `json`, `message`, and `byte` types can use fixed paths without a room ID.
+### Ready-made room service
+
+`WebSocketService` handles connection tracking and relaying for common message
+types. The supported public types are `chat`, `video`, `json`, `message`, and
+`byte`; `chat_video` is available for combined chat and video signaling. The
+`chat` and `video` types use JSON objects, `json` accepts any JSON value,
+`message` carries plain text, and `byte` carries binary data. Rooms are chosen
+with `{room_id}` in the path or with a `?room=...` query parameter. JSON, text,
+and byte services can also use a fixed path without a room ID.
+
+Configure trusted browser origins in generated `settings.py`. The default
+`[]` rejects WebSocket handshakes until you explicitly allow the page's exact
+origin:
+
+```python
+# settings.py
+WEBSOCKET_ALLOWED_ORIGINS = [
+    "http://127.0.0.1:8009",  # local browser origin
+    "https://app.example.com",
+]
+```
+
+Origin checks protect browser connections from untrusted sites, but they do not
+authenticate a user. Add `auth` when the socket is private. A service
+authenticator is a sync or async callable that receives a `Request`; return an
+identity to accept the connection or `None`/`False` to reject it. Browsers
+cannot set arbitrary WebSocket headers, so browser clients normally authenticate
+with a secure cookie or a short-lived credential your authenticator can verify.
 
 ```python
 from lenapi import LENAPI, WebSocketService
 
 app = LENAPI()
-# Add the browser origins your app trusts in settings.py. The default is [].
+
+def authenticate(request):
+    # Replace with your real cookie/token verification.
+    session_id = request.cookies.get("session_id")
+    return {"user_id": "123"} if session_id == "valid-session" else None
+
 chat = WebSocketService(
     path="/ws/chat/{room_id}",
     type="chat",  # "video", "json", "message", or "byte"
@@ -90,9 +143,24 @@ chat = WebSocketService(
 app.include_router(chat.router())
 ```
 
-The relay broadcasts each message to the connected clients in its room. For chat, send a JSON object such as `{"type": "chat.message", "text": "Hello"}`. The `json` type accepts JSON values on a fixed path such as `/ws/json`, without a room ID; its clients share the default channel. The heartbeat uses JSON `{"type":"lenapi.ping"}` and expects `{"type":"lenapi.pong"}`. By default, `WebSocketService` reads `WEBSOCKET_ALLOWED_ORIGINS` from project `settings.py`. Set that list to the exact browser origins you trust; the generated setting is `[]`, which rejects WebSocket connections until you configure an origin. An explicit `allowed_origins=[...]` argument overrides the project setting. Missing and non-matching `Origin` headers are rejected. Origin checks do not authenticate clients: use `auth` for private services. `max_connections` caps one room; `max_total_connections` defaults to 100 connections across all rooms in this process (`None` disables that cap). These connection counters and the built-in room manager are process-local, so each worker enforces its own limit. Multi-worker deployments also need a shared pub/sub backend. Browser clients should use cookie-based auth or a custom WebSocket authenticator because the browser WebSocket API cannot set arbitrary request headers.
+The relay broadcasts each incoming message to all currently connected clients in
+the same room, including the sender. A chat JSON object could look like:
 
-Create an invite ID with a normal HTTP endpoint, then share the WebSocket path with participants. The room is joined when the first client connects; the ID itself is not persisted by the service.
+```json
+{"type":"chat.message","text":"Hello","sender":"Ada"}
+```
+
+`heartbeat_seconds=30` sends `{"type":"lenapi.ping"}` after an idle interval;
+clients should answer with `{"type":"lenapi.pong"}`. Set it to `None` to
+disable application-level heartbeat checks. `max_message_size` limits incoming
+and outgoing payload size in bytes. `max_connections` limits one room;
+`max_total_connections` limits all connections handled by this process.
+
+### Create room IDs and join from a browser
+
+Create a room over HTTP, then give participants the returned path. The service
+creates the in-memory room when the first participant connects; generating the
+ID does not store a room record or make the ID a secret access credential.
 
 ```python
 from uuid import uuid4
@@ -113,10 +181,68 @@ async def publish_message(room_id: str, data: ChatMessage):
     return {"room_id": room_id, "delivered": delivered}
 ```
 
-`WebSocketService.send(room_id, data)` sends to all clients currently connected
-to that room and returns the delivery count. `WebSocketService.disconnect(room_id)`
-closes every connection in the room. A POST route can call these methods, but
-WebSocket `accept()` still belongs inside the WebSocket handshake handler.
+Minimal browser chat client (open the page with `?room=<room_id>`):
+
+```html
+<ul id="messages"></ul>
+<form id="chat-form">
+  <input id="message" placeholder="Message" autocomplete="off">
+  <button type="submit">Send</button>
+</form>
+<script>
+  const roomId = new URLSearchParams(location.search).get("room");
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${scheme}//${location.host}/ws/chat/${roomId}`);
+
+  socket.addEventListener("open", () => console.log("Connected to room", roomId));
+  socket.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "lenapi.ping") {
+      socket.send(JSON.stringify({ type: "lenapi.pong" }));
+      return;
+    }
+    const item = document.createElement("li");
+    item.textContent = message.text ?? JSON.stringify(message); // Do not insert untrusted HTML.
+    document.querySelector("#messages").append(item);
+  });
+  document.querySelector("#chat-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (socket.readyState !== WebSocket.OPEN) return;
+    const input = document.querySelector("#message");
+    socket.send(JSON.stringify({ type: "chat.message", text: input.value }));
+    input.value = "";
+  });
+</script>
+```
+
+For a fixed-path JSON service, connect to `/ws/json` and send `JSON.stringify(value)`.
+For `message`, call `socket.send("plain text")`. For `byte`, send an
+`ArrayBuffer` or `Blob` from the browser; set
+`socket.binaryType = "arraybuffer"` to receive binary frames as buffers.
+
+`WebSocketService.send(room_id, data)` sends to clients currently connected to
+that room and returns the delivered count. `disconnect(room_id)` closes all
+connections in the room. These methods do not create or persist rooms; the room
+must have active connections to receive a broadcast.
+
+### Video signaling is not video transport
+
+`type="video"` relays only JSON signaling messages with a `type` of `offer`,
+`answer`, or `candidate`. Browser code still needs the WebRTC APIs
+(`RTCPeerConnection`, camera/microphone capture, and ICE candidate handling).
+For real networks, configure STUN/TURN; for larger multi-person calls, use an
+SFU to forward media. LenAPI's room relay is not an SFU and does not carry raw
+audio/video tracks. Video rooms default to two participants unless you set
+`max_connections` explicitly.
+
+### Deployment boundaries
+
+Room membership and broadcasts are held in process memory. With multiple
+workers or hosts, clients connected to different processes cannot see one
+another; use a shared pub/sub layer or an external WebSocket broker for that
+deployment. Connection limits are also per process. Keep room authorization
+separate from origin checks, and validate permissions for each room ID before
+accepting a private connection.
 
 Use the optional Faker service to generate realistic sample data. From the lenApi repository root, install it with `python -m pip install -e '.[faker]'`:
 
@@ -136,29 +262,30 @@ Install the optional HTTP client with `python -m pip install -e '.[ai]'`. Both c
 
 ```python
 import asyncio
+import os
 from lenapi import OpenAI, Ollama
 
 async def main():
     async with OpenAI(
         model="gpt-4.1-mini",
-        base_url="https://api.openai.com/v1",
+        api_key=os.environ["OPENAI_API_KEY"],
     ) as openai:
-        answer = await openai.responses("Explain LenApi in one sentence.")
+        answer = await openai.responses("Explain what an API is in one sentence.")
         print(answer.get("output_text", answer))
 
     async with Ollama(
-        model="llama3.2",
+        model="qwen3:0.6b",
         base_url="http://127.0.0.1:11434",
     ) as ollama:
         answer = await ollama.chat([
-            {"role": "user", "content": "Explain LenApi in one sentence."},
+            {"role": "user", "content": "Explain what an API is in one sentence."},
         ])
         print(answer["message"]["content"])
 
 asyncio.run(main())
 ```
 
-`OpenAI` reads `OPENAI_API_KEY` from the environment unless `api_key=` is passed directly. Its `base_url` defaults to `https://api.openai.com/v1`; override it for an OpenAI-compatible endpoint. It supports the Responses API, chat completions, and embeddings. `Ollama` defaults to `http://127.0.0.1:11434`; set `base_url=` to use another Ollama host. Ollama must be running and the requested model must be available there. These calls are non-streaming and raise HTTPX errors for unsuccessful provider responses. The OpenAI Responses API is the recommended starting point for new projects; chat completions are included for compatibility. ([OpenAI API](https://platform.openai.com/docs/api-reference/responses), [Ollama chat API](https://docs.ollama.com/api/chat), [Ollama generate API](https://docs.ollama.com/api/generate))
+`OpenAI` reads `OPENAI_API_KEY` from the environment unless `api_key=` is passed directly. Its `base_url` defaults to `https://api.openai.com/v1`; override it for an OpenAI-compatible endpoint. It supports the Responses API, chat completions, and embeddings. `Ollama` defaults to `http://127.0.0.1:11434`; set `base_url=` to the URL of your own Ollama server. Pull the model on that server first, for example `ollama pull qwen3:0.6b`. Do not add `/api/chat` to `base_url`; the client appends the endpoint. These calls are non-streaming and raise HTTPX errors for unsuccessful provider responses. The OpenAI Responses API is the recommended starting point for new projects; chat completions are included for compatibility. ([OpenAI API](https://platform.openai.com/docs/api-reference/responses), [Ollama chat API](https://docs.ollama.com/api/chat), [Ollama generate API](https://docs.ollama.com/api/generate))
 
 You can also define a router without a prefix and mount it with the Django Ninja style `add_router(prefix, router)` call. Prefixes with or without trailing slashes are normalized:
 
@@ -235,6 +362,32 @@ app.include_router(api)
 Rate strings accept seconds, minutes, hours, or days, for example `"10/second"`, `"60/minute"`, and `"1000/day"`. Throttling uses a fixed window that starts with the first request. `ip` counts every request from the client address before authentication. `anonymous` counts public calls and, on routes using `auth=`, all requests from that IP before credentials are verified. This intentionally includes successful logins so repeated password checks are stopped before they consume CPU. `authenticated` counts successful route-level authentication by a stable identity returned from `auth=`. Routes using `BasicAuth` receive a default `ip` limit of 10 requests per minute if no pre-auth `ip` or `anonymous` limit is configured. Set `throttle={}` to deliberately disable the inherited and default limit. Route and router `throttle=` values otherwise override inherited limits; an empty mapping disables inherited limits for that route or router. Endpoint-only auth declared with `Depends(...)` does not supply the identity to the authenticated quota; attach it with `auth=` when you want identity-based quotas.
 
 When a quota is exceeded, LenAPI returns `429 Too Many Requests` with `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers. Quota counters use the same security backend as IP cooldowns. Choose `SECURITY_STORAGE = "database"` or `"redis"` in project `settings.py`. Database mode stores state in the internal `lenapi_security_store` table or MongoDB collection, initialized by migrations. Redis mode uses `REDIS_URL` and requires `pip install 'lenapi[redis]'` plus a running Redis server. The generated settings default to database storage and include `REDIS_URL = "redis://127.0.0.1:6379/0"` for switching to Redis. Shared database or Redis storage coordinates limits across workers. `SECURITY_STORAGE = "memory"` keeps counters in each process, so use it only for single-process development. LenAPI uses the ASGI connection's client address and does not trust forwarded-IP headers automatically; configure trusted proxy handling at your deployment edge before relying on IP quotas behind a proxy.
+
+For example, app-level limits are inherited by routes that do not set their own throttle. A route-specific mapping replaces the inherited mapping, so repeat any global scopes that you still want on that route:
+
+```python
+app = LENAPI(throttle={
+    "ip": "300/minute",
+    "anonymous": "30/minute",
+    "authenticated": "600/minute",
+})
+
+# Uses all app-level limits.
+@app.get("/items")
+def items():
+    return {"items": []}
+
+# Replaces the app-level mapping on this route.
+# Keep both limits you want enforced on login.
+@app.post("/login", throttle={
+    "ip": "5/minute",
+    "anonymous": "30/minute",
+})
+def login(data: LoginInput):
+    return verify_credentials(data)
+```
+
+If `/login` instead sets only `throttle={"ip": "5/minute"}`, the anonymous and authenticated global limits do not apply to that route. Use `throttle={}` to disable inherited limits deliberately.
 
 Model helpers include `model.EmailField()`, `model.IPField()`, `model.PhoneField()`, and `model.TextField()`:
 
@@ -413,13 +566,38 @@ docs_auth = authentication("basic_login", settings=settings, app=app)
 app.add_middleware(
     DocsAuthMiddleware,
     auth=docs_auth,
-    paths=(app.docs_url, app.openapi_url),
+    paths=(app.docs_url, app.redoc_url, app.openapi_url),
     session_factory=app.session_factory,
     async_session_factory=app.async_session_factory,
 )
 ```
 
 `GZipMiddleware` uses Python's standard library, compresses eligible response types when the request accepts gzip, and streams responses after buffering up to `minimum_size` (500 bytes by default). It adds `Content-Encoding: gzip` and `Vary: Accept-Encoding`, skips already-encoded and partial responses, and supports `compresslevel` from 0 to 9. It does not require Starlette. Custom middleware follows the ASGI callable contract: `Middleware(app, **options)` and `await app(scope, receive, send)`. Request IDs and elapsed time are returned in `X-Request-ID` and `X-Process-Time-Ms`.
+
+The middleware in this example is optional; add only the behavior your app needs:
+
+- `CORSMiddleware` controls which browser origins may read responses. List explicit origins for production. For cookie credentials, set `allow_credentials=True` and list exact origins; wildcard origin cannot be combined with credentials. `allow_methods` and `allow_headers` must include the methods and request headers your frontend uses.
+- `GZipMiddleware` compresses eligible response content when the client sends `Accept-Encoding: gzip`. `minimum_size` controls the response size threshold, while `compresslevel` trades CPU time for compression ratio. Already-compressed, partial, `HEAD`, and no-transform responses are passed through.
+- `RequestIDMiddleware` accepts a safe incoming `X-Request-ID` or creates a random ID, stores it in ASGI request state, and returns it in the response header. Use it to correlate a request with logs.
+- `TimingMiddleware` returns elapsed application time in `X-Process-Time-Ms`. This is the time measured by the app middleware, not a full end-to-end network latency measurement.
+- `DocsAuthMiddleware` protects the selected Swagger, ReDoc, and OpenAPI paths with an authentication dependency. The built-in `SAFE_GUARD_DOCS_URL` option is an alternative for database-backed admin login.
+
+For example, allow a browser frontend to send bearer tokens and a partner HMAC header, expose the request ID to browser JavaScript, and enable gzip:
+
+```python
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(TimingMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=6)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://frontend.example"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["authorization", "content-type", "X-Flutterwave"],
+    expose_headers=["X-Request-ID", "X-Process-Time-Ms"],
+)
+```
+
+When adding `DocsAuthMiddleware` directly, include every configured documentation URL in its `paths`, including `app.redoc_url` if ReDoc is enabled. Middleware order affects which component sees the request and response first.
 
 ## Database transactions
 
@@ -435,7 +613,17 @@ For async work, use `async with app.async_database.transaction() as db:` and awa
 
 ## Cache service
 
-`app.cache` is an async JSON-value cache. Set `CACHE_BACKEND` in `settings.py` to `"memory"` (default), `"database"`, or `"redis"`. SQL database-backed cache uses the shared `lenapi_security_store` table, so run `python lenora.py migration` first. Redis mode uses `REDIS_URL` and requires `pip install '.[redis]'`.
+`app.cache` is an async JSON-value cache. Set `CACHE_BACKEND` in `settings.py` to `"memory"` (default), `"database"`, or `"redis"`. SQL database-backed cache uses the shared `lenapi_security_store` table, so run `python lenora.py migration` first. To use Redis, set `CACHE_BACKEND = "redis"` and configure `REDIS_URL`:
+
+```python
+# settings.py
+REDIS_URL = "redis://127.0.0.1:6379/0"
+CACHE_BACKEND = "redis"
+```
+
+The URL format is `redis://<host>:<port>/<database-number>`; this example connects to Redis on the same machine, port 6379, database 0. Install the Python Redis client extra into the project's active environment with `python -m pip install 'lenapi[redis]'`. The extra installs the Python client library, not the Redis server. Install and start Redis separately, then check connectivity with `redis-cli ping` (it should return `PONG`). In zsh, keep the square brackets quoted as shown so the shell does not interpret them as a filename pattern.
+
+`CACHE_BACKEND = "redis"` selects Redis for `app.cache` only. To use Redis as the shared store for sessions, opaque bearer tokens, IP cooldowns, request throttles, and HMAC nonce replay checks, also set `SECURITY_STORAGE = "redis"`. Both settings use `REDIS_URL`. You can choose one Redis-backed feature without moving the others; for example, keep `SECURITY_STORAGE = "database"` while setting `CACHE_BACKEND = "redis"`.
 
 ```python
 await app.cache.set("profile:42", {"name": "Ada"}, ttl=300)
@@ -443,9 +631,123 @@ profile = await app.cache.get("profile:42")
 await app.cache.delete("profile:42")
 ```
 
+## Webhooks
+
+A webhook is an HTTP request one service sends to another when an event occurs.
+Start with a plain endpoint that accepts an event body; add sender verification
+when the integration requires it. LenAPI offers `webhook_auth()` for providers
+that sign the raw body and `hmac_auth()` for partners that can use LenAPI's
+canonical request-signing format. These are different formats; choose the
+helper that matches the sender.
+
+### Plain webhook without verification
+
+This minimal route accepts and returns arbitrary JSON. It has no signature or
+authentication check, so use it for local testing, trusted internal traffic,
+or nonsensitive events. HTTPS protects the connection but does not verify who
+sent the event.
+
+```python
+from typing import Any
+from lenapi import Body, LENAPI
+
+app = LENAPI()
+
+@app.post("/webhooks/events")
+async def receive_event(payload: Any = Body()):
+    # Inspect or validate the event before processing it.
+    return {"received": True, "event": payload}
+```
+
+Before exposing this route publicly or triggering sensitive actions, add one
+of the verification options below. Do not rely on a hard-to-guess URL as
+authentication.
+
+### Provider raw-body HMAC
+
+`webhook_auth()` verifies a signature over the exact request body. Configure
+header names to match the provider. If the provider sends stable event IDs,
+passing `app.security_store` enables deduplication across requests:
+
+```python
+from typing import Any
+from lenapi import Body, Depends
+from lenapi.security import webhook_auth
+import settings
+
+provider_hook = webhook_auth(
+    settings.WEBHOOK_SECRET,  # at least 32 bytes
+    security_store=app.security_store,
+    provider="billing",
+    signature_header="x-webhook-signature",
+    event_id_header="x-webhook-id",
+    timestamp_header="x-webhook-timestamp",  # omit if provider has none
+    tolerance_seconds=300,
+)
+
+@app.post("/webhooks/billing", auth=provider_hook)
+async def receive_event(
+    payload: Any = Body(),
+    verified=Depends(provider_hook),
+):
+    # Validate event type and fields before changing application data.
+    return {"received": True, "event_id": verified["event_id"]}
+```
+
+When `timestamp_header` is configured, LenAPI verifies freshness and signs the
+timestamp together with the raw body. With `security_store` and an event ID
+header, duplicate event IDs are acknowledged with HTTP 200 without running the
+handler again. Database-backed security storage requires
+`python lenora.py migration`; Redis can be used for shared multi-worker state.
+
+### Partner HMAC requests
+
+Use `hmac_auth()` when both services can share a secret and the sender can sign
+LenAPI's canonical message: timestamp, method, path and query, SHA-256 digest
+of the exact body, and a unique nonce. It checks timestamp freshness and nonce
+reuse. The sender must sign and transmit the same body bytes and agree on the
+signature header. See the [HMAC section](#hmac-request-authentication) below for
+complete server and client examples.
+
+### Providers without HMAC
+
+If a provider cannot sign requests but supports a bearer token or secret header,
+require that credential and compare it in constant time. This example uses a
+dedicated header; it does not authenticate or sign the payload itself:
+
+```python
+import hmac
+from typing import Any
+from lenapi import Body, Depends, HTTPException, Request
+import settings
+
+async def verify_provider_key(request: Request):
+    supplied = request.headers.get("x-provider-key", "")
+    expected = settings.PROVIDER_WEBHOOK_KEY
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(401, "Invalid webhook credential")
+    return {"provider": "billing"}
+
+@app.post("/webhooks/provider", auth=verify_provider_key)
+async def receive_provider_event(
+    payload: Any = Body(),
+    identity=Depends(verify_provider_key),
+):
+    # Validate the payload and deduplicate its provider event ID.
+    return {"received": True, "provider": identity["provider"]}
+```
+
+Use HTTPS, keep the key out of source control, restrict the endpoint at a
+trusted network boundary when possible, and rotate the key if exposed. A static
+credential does not prove payload integrity or freshness and does not prevent a
+captured request from being replayed. Do not leave a state-changing webhook
+public merely because its URL is hard to guess. If a sender supports no
+signature or credential, only accept events through a trusted gateway or keep
+the endpoint non-sensitive and read-only.
+
 ## Durable background jobs
 
-`BackgroundTasks` remains useful for short in-process work after a response. For a worker queue, `BackgroundQueue` supports `database`, `redis`, or `cache`/`memory` backends. The database queue table is excluded from ordinary migrations. Export a `queue` or `background_queue` from `main.py`, then run `python lenora.py background-worker`; it creates and applies the queue migration before starting the worker. Redis mode requires `pip install '.[redis]'` and Redis persistence configured for the durability you need. The cache/memory backend is process-local and ephemeral: queued jobs are lost when the process exits and cannot be shared with a separate worker process. Jobs on database and Redis backends are delivered at least once; write task handlers to be idempotent.
+`BackgroundTasks` remains useful for short in-process work after a response. For a worker queue, `BackgroundQueue` supports `database`, `redis`, or `cache`/`memory` backends. The database queue table is excluded from ordinary migrations. Export a `queue` or `background_queue` from `main.py`, then run `python lenora.py background-worker`; it creates and applies the queue migration before starting the worker. Redis mode requires `python -m pip install 'lenapi[redis]'` and Redis persistence configured for the durability you need. The cache/memory backend is process-local and ephemeral: queued jobs are lost when the process exits and cannot be shared with a separate worker process. Jobs on database and Redis backends are delivered at least once; write task handlers to be idempotent.
 
 ```python
 from lenapi import BackgroundQueue
@@ -470,7 +772,7 @@ python lenora.py background-worker
 
 The API process and worker must register the same task names and handlers. `run_once()` is available for one-job execution in tests or custom worker loops; `status(job_id)` returns the persisted job status.
 
-Swagger UI is available at [http://127.0.0.1:8009/docs/](http://127.0.0.1:8009/docs/), and the generated OpenAPI document is at [http://127.0.0.1:8009/openapi.json](http://127.0.0.1:8009/openapi.json). These are enabled by default. Set `API_TITLE`, `API_VERSION`, `DOCS_URL`, and `OPENAPI_URL` in `settings.py` to configure the Swagger metadata and paths, or override them directly with `LENAPI(title="My API", version="1.0.0", docs_url="/docs/", openapi_url="/openapi.json")`.
+Swagger UI is available at [http://127.0.0.1:8009/docs/](http://127.0.0.1:8009/docs/), ReDoc at [http://127.0.0.1:8009/redoc/](http://127.0.0.1:8009/redoc/), and the generated OpenAPI document at [http://127.0.0.1:8009/openapi.json](http://127.0.0.1:8009/openapi.json). All three are enabled by default and use the same OpenAPI schema. Set `API_TITLE`, `API_VERSION`, `DOCS_URL`, `REDOC_URL`, and `OPENAPI_URL` in `settings.py` to configure the documentation metadata and paths; set `REDOC_URL = None` to disable ReDoc. You can also pass overrides directly to `LENAPI(title="My API", version="1.0.0", docs_url="/docs/", redoc_url="/redoc/", openapi_url="/openapi.json")`.
 
 Protect both the Swagger page and its OpenAPI JSON with `DocsAuthMiddleware`. It accepts the same callable authentication dependencies used by routes; pass the configured docs paths so customized URLs are protected too:
 
@@ -483,7 +785,7 @@ docs_auth = authentication("basic_login")
 app.add_middleware(
     DocsAuthMiddleware,
     auth=docs_auth,
-    paths=(app.docs_url, app.openapi_url),
+    paths=(app.docs_url, app.redoc_url, app.openapi_url),
     session_factory=app.session_factory,
     async_session_factory=app.async_session_factory,
 )
@@ -491,9 +793,9 @@ app.add_middleware(
 
 The session factories let database-backed authentication such as Basic or API-key auth query the configured user model. This middleware only protects the documentation endpoints; it does not secure API routes. Omit it to keep the default public docs, or pass another authentication dependency such as JWT or API-key auth.
 
-For the built-in docs login, set `SAFE_GUARD_DOCS_URL = True` in `settings.py`. The app then serves an administrator sign-in page at `/`, redirects unauthenticated requests for `/docs/` or `/openapi.json` to it, and redirects successful logins to Swagger. Failed sign-ins are limited to 5 per client IP in a 300-second window by default; configure `DOCS_LOGIN_MAX_ATTEMPTS` and `DOCS_LOGIN_WINDOW_SECONDS` to adjust this. With `SECURITY_STORAGE = "database"` or `"redis"`, the limiter uses shared storage and coordinates across workers; `"memory"` keeps counters per process and is intended for single-process development. Create an administrator with `python lenora.py admin` after `python lenora.py migration`; the password prompt is hidden and the framework stores only a password hash. The framework's `AdminUser` and expiring session storage are created by the first migration. Admin records and sessions use the selected application database, including MongoDB; Redis is used only for attempt counters when selected. The session cookie is HttpOnly and expires after `DOCS_SESSION_LIFETIME_SECONDS` (default 3600 seconds). `DOCS_COOKIE_SECURE` follows the ASGI scheme by default; set it to `True` when TLS terminates at a reverse proxy.
+For the built-in docs login, set `SAFE_GUARD_DOCS_URL = True` in `settings.py`. The app then serves an administrator sign-in page at `/` and guards `/docs/`, `/redoc/`, and `/openapi.json`; successful login redirects to Swagger. Failed sign-ins are limited to 5 per client IP in a 300-second window by default; configure `DOCS_LOGIN_MAX_ATTEMPTS` and `DOCS_LOGIN_WINDOW_SECONDS` to adjust this. With `SECURITY_STORAGE = "database"` or `"redis"`, the limiter uses shared storage and coordinates across workers; `"memory"` keeps counters per process and is intended for single-process development. Create an administrator with `python lenora.py admin` after `python lenora.py migration`; the password prompt is hidden and the framework stores only a password hash. The framework's `AdminUser` and expiring session storage are created by the first migration. Admin records and sessions use the selected application database, including MongoDB; Redis is used only for attempt counters when selected. The session cookie is HttpOnly and expires after `DOCS_SESSION_LIFETIME_SECONDS` (default 3600 seconds). `DOCS_COOKIE_SECURE` follows the ASGI scheme by default; set it to `True` when TLS terminates at a reverse proxy.
 
-The docs gate only handles `/`, `/logout`, the configured Swagger path, and the configured OpenAPI path. Regular application routes do not query the admin or session tables; they pass through a small path check. Opening protected Swagger or OpenAPI does validate the session against the configured database, which is the expected cost of revocable server-side sessions.
+The docs gate only handles `/`, `/logout`, the configured Swagger and ReDoc paths, and the configured OpenAPI path. Regular application routes do not query the admin or session tables; they pass through a small path check. Opening protected docs or OpenAPI does validate the session against the configured database, which is the expected cost of revocable server-side sessions.
 
 To remove the gate, set `SAFE_GUARD_DOCS_URL = False` and restart the app. The admin tables may remain in the database; they are not queried while the feature is disabled.
 
@@ -515,18 +817,19 @@ Use the same `students` wrapper for batch updates, with an `id` on each item. Ba
 Use `Depends` to share logic across routes. A dependency can accept the same typed path/query parameters and `Request` object as a route, and may be synchronous or asynchronous:
 
 ```python
-from lenapi import Application, Depends
+from lenapi import Depends, LENAPI
 
-app = Application()
+app = LENAPI()
 
 def current_user(user_id: int):
-    # Replace this with real authentication logic.
-    return {"id": user_id, "name": "Ada"}
+    return {"id": user_id, "name": "Tolu"}
 
-@app.get("/profile")
+@app.post("/profile/{user_id}")
 def profile(user: dict = Depends(current_user)):
     return user
 ```
+
+When a request calls `POST /profile/12`, LenAPI resolves the matching `user_id` path parameter and passes it into `current_user`. The dependency's returned dictionary is injected as `user` into `profile`.
 
 Dependencies are cached once per request, so if multiple parameters use the same dependency callable, it runs once. Synchronous routes, dependencies, authentication and token-lookup callbacks, HMAC nonce-store methods, and `DocsAuthMiddleware` authenticators run in a worker thread so blocking I/O in them does not block the ASGI event loop. Async callbacks run on the event loop; use async I/O there or explicitly offload blocking work yourself.
 
@@ -811,56 +1114,131 @@ The token endpoint above uses a sample identity to demonstrate the storage flow;
 
 ### HMAC request authentication
 
-HMAC is useful for service-to-service requests and webhook-style clients that can hold a shared secret. It signs the timestamp, method, path and query, exact body bytes, and a unique nonce. The secret must contain at least 32 bytes; the nonce store prevents replay across workers.
+HMAC is useful when another service sends webhooks to your API, or when your service signs requests sent to another HMAC-enabled API. Both parties share a secret. The sender signs the timestamp, HTTP method, path and query, exact request-body bytes, and a unique nonce; the receiver recomputes the signature and compares it before calling the route. HMAC does not issue bearer tokens or replace user login. The shared secret must contain at least 32 bytes.
 
 ```python
-import os
-from lenapi import Depends
+# Add a securely generated, stable secret to your settings.py, or load it
+# from your preferred secret manager. Share it with the partner securely.
+PARTNER_HMAC_SECRET = "<same random secret configured for the partner>"
+
+from typing import Any
+from lenapi import Depends, LENAPI, Request
 from lenapi.security import hmac_auth
 
-HMAC_SECRET = os.environ["LENAPI_HMAC_SECRET"]
-signed_request = hmac_auth(
-    HMAC_SECRET,
-    header_name="flutter_api_auth",
+app = LENAPI()  # SECURITY_STORAGE defaults to the database.
+partner_auth = hmac_auth(
+    PARTNER_HMAC_SECRET,
+    tolerance_seconds=300,
+    nonce_store=app.security_store,
+    header_name="X-Flutterwave",
 )
 
-@app.post("/webhooks/signed", auth=signed_request)
-async def signed_webhook(identity=Depends(signed_request)):
-    return {"accepted": True}
+@app.post("/partner/webhook", auth=partner_auth)
+async def receive_partner_webhook(
+    request: Request,
+    identity=Depends(partner_auth),
+):
+    body: Any = await request.json()
+    # Validate event structure and business rules before processing it.
+    return {"accepted": True, "body": body}
 ```
 
-The client can use `hmac_request_signature(secret, method, path, timestamp, body, nonce=nonce)` to calculate the signature. The default signature header is `X-LenAPI-Signature`; set `header_name="flutter_api_auth"` to read the signature from a partner-specific header. The timestamp and nonce headers remain `X-LenAPI-Timestamp` and `X-LenAPI-Nonce`. The signed path includes the query string, and `body` must be the exact bytes sent. `tolerance_seconds` defaults to 300 and `nonce_store` is optional; pass `app.security_store` as the nonce store for replay protection shared across workers.
+`header_name` names the signature header only. The timestamp and nonce headers remain `X-LenAPI-Timestamp` and `X-LenAPI-Nonce`. Passing `app.security_store` as `nonce_store` makes replay checks shared across workers; without it, replay tracking is process-local. HMAC verification signs the raw body bytes before the handler parses arbitrary JSON with `request.json()`.
+
+The partner does not need to install LenAPI. This standalone Python client uses the standard library to sign a compact JSON body and sends those exact bytes with `requests`:
 
 ```python
+import hashlib
+import hmac
+import json
 import secrets
 import time
-from lenapi.security import hmac_request_signature
+import requests
 
-body = b'{"event":"payment.completed"}'
+client_secret = "same-shared-secret-configured-on-the-server"
+url = "https://api.example.com/partner/webhook"
+method = "POST"
+path = "/partner/webhook"
+payload = {"event": "payment.completed", "reference": "order-123"}
+
+# Serialize once, sign these bytes, and send the same bytes unchanged.
+body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
 timestamp = str(int(time.time()))
 nonce = secrets.token_urlsafe(16)
-signature = hmac_request_signature(
-    HMAC_SECRET, "POST", "/webhooks/signed", timestamp, body, nonce=nonce
-)
+body_digest = hashlib.sha256(body).hexdigest()
+message = f"{timestamp}\n{method}\n{path}\n{body_digest}\n{nonce}".encode("utf-8")
+signature = hmac.new(client_secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
 headers = {
     "Content-Type": "application/json",
     "X-LenAPI-Timestamp": timestamp,
     "X-LenAPI-Nonce": nonce,
-    "flutter_api_auth": signature,
+    "X-Flutterwave": signature,
 }
-# Send these headers and `body` unchanged to the LenAPI endpoint over HTTPS.
+response = requests.post(url, data=body, headers=headers, timeout=15)
+print(response.status_code, response.json())
+```
+
+The signature is HMAC-SHA256 over `timestamp + newline + uppercase method + newline + path-and-query + newline + lowercase-hex SHA-256 body digest + newline + nonce`. The signature header must match the server's `header_name`; path and body must exactly match what the server receives. Use HTTPS and never place a production secret in source code or logs.
+
+#### Sign an outgoing request from a LenAPI application
+
+HMAC uses a shared secret rather than issuing a separate token per request. Generate and provision the secret to the partner through a secure channel. A LenAPI client can use `hmac_request_signature()` for an outbound request; the receiving service must verify the same message format and header names.
+
+```python
+import json
+import secrets
+import time
+import requests
+from lenapi.security import hmac_request_signature
+
+shared_secret = "same-secret-provisioned-to-the-receiver"
+url = "https://partner.example.com/events"
+method = "POST"
+path = "/events"
+payload = {"event": "account.updated", "account_id": "acct-42"}
+body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+timestamp = str(int(time.time()))
+nonce = secrets.token_urlsafe(16)
+signature = hmac_request_signature(
+    shared_secret, method, path, timestamp, body, nonce=nonce
+)
+
+response = requests.post(
+    url,
+    data=body,
+    headers={
+        "Content-Type": "application/json",
+        "X-LenAPI-Timestamp": timestamp,
+        "X-LenAPI-Nonce": nonce,
+        "X-LenAPI-Signature": signature,
+    },
+    timeout=15,
+)
+print(response.status_code, response.text)
 ```
 
 ### OIDC bearer-token validation
 
-Use `oidc_auth()` when a client already has an access token from an identity provider. Its callback must validate the token with a maintained OIDC/JWT library; do not merely decode its claims. Verify the signature using trusted provider keys and validate issuer, audience, and expiry (plus nonce where applicable):
+LenAPI has two distinct ways to use provider identity:
+
+- Use **`SocialAuth`** when you want LenAPI to provide browser sign-in and callback routes for a supported provider. After sign-in it can find or create a local user and return a LenAPI JWT for your API.
+- Use **`oidc_auth()`** when the client already obtains an OIDC token through a separate login flow and sends it as `Authorization: Bearer <token>`. Your verification callback validates the token and returns identity claims; LenAPI uses those claims to protect routes.
+
+Choose `oidc_auth()` when your frontend/mobile client owns the OIDC flow, your API trusts an external provider directly, or you need a provider flow not handled by built-in `SocialAuth`. It does not create login/callback endpoints, register users, or issue a new token.
+
+#### Protect a route with an externally issued OIDC token
+
+The verifier must use a maintained OIDC/JWT library to validate the token cryptographically: verify its signature against trusted provider keys and check issuer, audience, expiry, and any required nonce. Merely decoding a JWT is not validation.
 
 ```python
-from lenapi import Depends
+from lenapi import Depends, LENAPI
 from lenapi.security import oidc_auth
 
+app = LENAPI()
+
 def verify_provider_token(token: str):
-    # Replace with your OIDC library's verified token-validation call.
+    # Replace this adapter with your OIDC library's verified validation call.
     claims = verify_with_provider_keys(
         token,
         issuer="https://issuer.example",
@@ -868,7 +1246,11 @@ def verify_provider_token(token: str):
     )
     if claims is None:
         return None
-    return {"sub": claims["sub"], "email": claims.get("email")}
+    return {
+        "sub": claims["sub"],
+        "email": claims.get("email"),
+        "scope": claims.get("scope", ""),
+    }
 
 provider_auth = oidc_auth(verify_provider_token)
 
@@ -877,13 +1259,13 @@ def oidc_profile(identity=Depends(provider_auth)):
     return identity
 ```
 
-`verify_with_provider_keys` above represents your chosen OIDC library's verified validation function. This dependency validates incoming provider tokens; `SocialAuth` is the separate built-in authorization-code login and callback flow.
+`verify_with_provider_keys` is a placeholder for your provider library's verified validation function. Return `None` when verification fails; return only the identity claims your app needs. The client calls this route with `Authorization: Bearer <provider_access_token>`. `auth=` enforces the check, and `Depends(provider_auth)` injects the verified identity. Add authorization checks for roles or permissions separately.
 
 `SECURITY_STORAGE` selects the shared store used by sessions, opaque bearer tokens, IP flags, and HMAC replay checks. Its async methods include `get(key)`, `set(key, value, ttl=...)`, `delete(key)`, and atomic `claim(key, ttl)`. The generated project defaults to database storage. Database storage needs the framework migration; Redis requires a running Redis server and the Redis extra. Memory storage is process-local and is not shared across workers.
 
 ## Social login
 
-`SocialAuth` generates provider login and callback routes for Google, GitHub, and LinkedIn. X and Facebook are temporarily disabled; if either is listed in `providers`, it is ignored, so no login or callback route is generated for it. Other unknown provider names remain configuration errors. Configure each available provider's client ID, client secret, and exact callback URI in the generated `settings.py` (or load them from environment variables). The generated settings leave credentials blank. Register each callback URI with the matching provider.
+`SocialAuth` is the managed browser sign-in flow. It differs from `oidc_auth()`, which verifies a token already presented to an API route. `SocialAuth` generates provider login and callback routes for Google, GitHub, and LinkedIn. X and Facebook are temporarily disabled; if either is listed in `providers`, it is ignored, so no login or callback route is generated for it. Other unknown provider names remain configuration errors. Configure each available provider's client ID, client secret, and exact callback URI in the generated `settings.py` (or load them from environment variables). The generated settings leave credentials blank. Register each callback URI with the matching provider.
 
 ```python
 # settings.py — replace with the exact origin serving your frontend.
@@ -903,7 +1285,29 @@ app = LENAPI()
 app.include_router(auth.router(), prefix="/auth")
 ```
 
-This mounts routes such as `/auth/google/login` and `/auth/google/callback` only on the app that includes the router. The callback exchanges the provider code, validates the OAuth state (and PKCE where supported), fetches the provider profile, and returns a LenApi bearer token when `jwt_enabled=True`. It does not return the provider's access token.
+This mounts routes such as `/auth/google/login` and `/auth/google/callback` only on the app that includes the router. The sign-in flow is:
+
+1. The browser visits `/auth/<provider>/login` and is redirected to the identity provider.
+2. The provider authenticates the person and redirects the browser to the registered callback URL.
+3. LenAPI validates OAuth state (and PKCE where supported), exchanges the authorization code, and fetches the provider profile.
+4. With `auto_register=True`, LenAPI finds or creates the local user and stores the provider-to-user mapping.
+5. With `jwt_enabled=True`, LenAPI issues **one LenAPI JWT access token** for use on protected application routes.
+
+`jwt_enabled` controls only that final LenAPI credential. SocialAuth currently issues a JWT access token; it does not issue an API key, session cookie, opaque bearer token, or refresh token. The provider's OAuth access token is used internally during the callback and is not returned to the client. With `jwt_enabled=False`, the callback response contains the provider `identity` and includes `user_id` when a local user was resolved, but no LenAPI token. For sessions, API keys, or opaque tokens, implement the desired credential issuance after the provider callback using the matching LenAPI auth dependency/store, or build a custom callback flow. Google and LinkedIn use OIDC identity endpoints in this integration; GitHub uses OAuth 2.0 and its profile/email APIs, not OIDC.
+
+For example, with both flags enabled, the callback response includes fields in this shape (identity claims vary by provider):
+
+```json
+{
+  "identity": {"sub": "provider-subject", "email": "ada@example.com"},
+  "user_id": 42,
+  "access_token": "<LenAPI JWT>",
+  "token_type": "bearer",
+  "expires_in": 3600
+}
+```
+
+The client then sends `Authorization: Bearer <access_token>` to routes protected with LenAPI JWT authentication. Store and transmit the token securely; do not use the provider token in place of the LenAPI token.
 
 `allowed_origins` can also be passed directly to `SocialAuth`; otherwise it reads `SOCIAL_AUTH_ALLOWED_ORIGINS` from `settings.py`. When a browser sends an `Origin` header to a provider login route, LenApi requires an exact match in this list and returns `403` otherwise. Replace `https://myapp.com` with the exact origin serving your frontend. Top-level navigations can omit `Origin`; those still rely on the required, random, browser-cookie-bound OAuth `state` check on callback. Do not treat the origin allowlist as a replacement for OAuth state validation, HTTPS, or correct provider callback URL registration. The provider callback itself is not checked against the browser `Origin` header because providers may omit it or send a different origin.
 
@@ -1268,7 +1672,7 @@ Table names are inferred from model class names in lowercase (`Student` becomes 
 
 `model.Model` is the base class for SQL-backed models. Subclass it to declare a table; each field assignment declares a database column, and the framework supplies an integer `id` primary key unless you define one yourself. Field declarations describe storage and database constraints; use Pydantic schemas to validate API input.
 
-The field helpers include `AutoField`, `IntegerField`, `BigIntegerField`/`BigIntField`, `StringField`, `TextField`, `EmailField`, `PhoneField`, `IPField`, `BooleanField`, `FloatField`, `DecimalField`, `DateTimeField`, `JSONField`/`Json`, `UUIDField`, `ImageField`, `ForeignKeyField`, and `ManyToManyField`. Fields normally default to `nullable=True` and `blank=True`; `BooleanField` defaults to `True`. `JSONField` and its alias `Json` store JSON-compatible Python values. Use a factory such as `default=dict` for a fresh mutable value on each new row:
+The field helpers include `AutoField`, signed `IntegerField` and `BigIntegerField`/`BigIntField`, nonnegative `PositiveIntegerField` and `PositiveBigIntegerField`, `StringField`, `TextField`, `EmailField`, `PhoneField`, `IPField`, `URLField`, `BooleanField`, `FloatField`, `DecimalField`, `DateField`, `TimeField`, `DateTimeField`, `DurationField`, `JSONField`/`Json`, `UUIDField`, `ImageField`, `FileField`, `FileImageField`, `ForeignKeyField`, `OneToOneField`, and `ManyToManyField`. Fields normally default to `nullable=True` and `blank=True`; `BooleanField` defaults to `True`. `JSONField` and its alias `Json` store JSON-compatible Python values. Use a factory such as `default=dict` for a fresh mutable value on each new row:
 
 ```python
 class Student(model.Model):
@@ -1281,17 +1685,46 @@ student = Student.create(
 )
 ```
 
+`DateField`, `TimeField`, and `DateTimeField` default to the current UTC date or time when no value or explicit default is supplied. Pass `auto_add_now=False` to disable this behavior, or provide your own `default`. `DurationField(weeks=1)` stores a fixed seven-day `timedelta`; add it to a timestamp when calculating an expiry date. Months and years are calendar intervals and should use calendar-aware date arithmetic.
+
+`PositiveIntegerField` and `PositiveBigIntegerField` reject negative values in LenAPI and add a named database `CHECK` constraint, so direct SQL writes are protected too. `EmailField`, `PhoneField`, `IPField`, `URLField`, and `UUIDField` validate values when a model instance is saved. `PhoneField` accepts a leading `+` followed by country code and digits, up to 18 characters total. `IPField` accepts IPv4 and IPv6. `URLField` accepts `http://`, `https://`, and `www.` URLs. Customize messages with `error_messages`, for example `email = model.EmailField(error_messages={"email": "This is not an email"})`; `unique` is also a supported message key for a unique field.
+
+The base model supplies an auto-incrementing integer `id`. A model may declare its own primary key instead; LenAPI will not add a second `id` key:
+
+```python
+class ExternalRecord(model.Model):
+    external_id = model.StringField(max_length=40, primary_key=True)
+    label = model.StringField(max_length=120)
+```
+
+File model fields describe what kind of path is stored. The matching upload mode enforces the type: `ImageField` uses `await upload.save("profiles", type="image")`, `FileField` uses `await upload.save("documents", type="file")` and rejects image uploads, and `FileImageField` uses `type="file_image"` when either kind is allowed. Pass `max_size` in bytes to enforce a per-file size limit. Continue to store the returned relative path in the model; upload files through an `UploadFile` route parameter so Swagger presents a multipart file picker.
+
+```python
+class Student(model.Model):
+    profile_image = model.ImageField(upload_to="profiles", nullable=True)
+    attachment = model.FileField(upload_to="documents", nullable=True)
+    mixed_upload = model.FileImageField(upload_to="uploads", nullable=True)
+
+@app.post("/students/{student_id}/attachment")
+async def upload_attachment(student_id: int, file: UploadFile = File(...)):
+    student = Student.get_or_404(id=student_id)
+    filename = await file.save("documents", type="file", max_size=10 * 1024 * 1024)
+    student.attachment = f"documents/{filename}"
+    student.save()
+    return {"attachment": student.attachment}
+```
+
 `unique=True` is a database constraint that prevents duplicate values in that column. Constraint names are generated automatically; explicit names are optional. `Model.get.unique("field")` is a query projection that selects a field while looking up a row. It does not add a uniqueness constraint to the schema. Put `unique=True` on the field when the database itself must guarantee that only one row can have that value.
 
 Constraint names are optional in model declarations. LenApi automatically assigns stable names to generated primary-key, foreign-key, index, and unique constraints, so a normal `unique=True` field needs no explicit name and works with Alembic, including SQLite batch migrations. Use `__table_args__` only when you want to choose the exact unique-constraint name; omit `unique=True` on that field to avoid creating a second constraint:
 
 ```python
 class Student(model.Model):
-    phone = model.PhoneField(max_length=32, nullable=False, unique=True)
+    phone = model.PhoneField(max_length=18, nullable=False, unique=True)
 
 # To choose the exact SQL constraint name instead:
 class StudentWithNamedPhone(model.Model):
-    phone = model.PhoneField(max_length=32, nullable=False)
+    phone = model.PhoneField(max_length=18, nullable=False)
     __table_args__ = (
         model.UniqueConstraint("phone", name="uq_student_phone"),
     )
@@ -1622,6 +2055,30 @@ classroom_name = student.classroom_id.name
 
 Here, the field name must be a `ForeignKeyField` targeting a registered lenApi model. The value at `student.classroom_id` is the related model instance; the project example defines this as `classroom_id`.
 
+Use `OneToOneField` when a dependent row must have exactly one owner and the owner may have at most one dependent row. It is a foreign key with a database unique constraint. A one-to-many relation uses an ordinary `ForeignKeyField` on the many-side; query matching rows with `filter()`:
+
+```python
+class Classroom(model.Model):
+    name = model.StringField(max_length=120)
+
+class Learner(model.Model):
+    name = model.StringField(max_length=120)
+    classroom_id = model.ForeignKeyField("classroom.id", nullable=False)
+
+class LearnerProfile(model.Model):
+    learner_id = model.OneToOneField("learner.id", nullable=False)
+    biography = model.TextField()
+
+classroom = Classroom.get_or_404(id=1)
+learners = Learner.filter(classroom_id=classroom.id).all()
+learner = Learner.get_or_404(id=1).special("classroom_id")
+print(learner.classroom_id.name)
+
+profile = LearnerProfile.get(learner_id=learner.id).get()
+```
+
+For many-to-many queries, load the owning model and access its set-like collection. With async routes, await model query methods; use eager loading with SQLAlchemy `selectinload()` when traversing async relationships.
+
 Choose what happens to dependent records when their referenced model is deleted with `model`:
 
 - `CASCADE`: deleting a user also deletes its verification rows.
@@ -1690,8 +2147,23 @@ The engine is disposed on ASGI lifespan shutdown. For response serialization fro
 - optional request-scoped SQLAlchemy `Session` injection
 - `python lenora.py run` development command (default port `8009`; `runserver` remains an alias); `python lenora.py migration` generates and applies model migrations
 - Migration commands compare the database revision with migration files and skip the database upgrade when there is no new revision to apply
-- Swagger UI at `/docs/` and generated OpenAPI 3.1 at `/openapi.json`
+- Swagger UI at `/docs/`, ReDoc at `/redoc/`, and generated OpenAPI 3.1 at `/openapi.json`
 - JSON responses by default, with `Response` and `JSONResponse` for explicit control
 - Request cookie parsing through `request.cookies`, plus `Response.set_cookie()` and `Response.delete_cookie()`
 
 The installable library lives in `lenapi/`; runnable applications and their migrations are kept separately under `app/`. The standalone wheel and source download contain the framework, packaging metadata, documentation, and library tests, but omit application code and local databases.
+
+## License
+
+LenAPI is distributed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full license text.
+
+## Sponsors
+
+LenAPI appreciates the organizations supporting the project.
+
+<p align="center">
+  <a href="https://justjobng.online"><img src="assets/sponsors/justjob.webp" alt="JustJob" height="76"></a>&nbsp;&nbsp;
+  <a href="https://www.letsmeet.date/"><img src="assets/sponsors/letsmeet.jpeg" alt="LetsMeet" height="76"></a>&nbsp;&nbsp;
+  <a href="https://www.litregreprediction.site/"><img src="assets/sponsors/litregre.png" alt="Litregre Prediction" height="76"></a>&nbsp;&nbsp;
+  <a href="https://maekandex.com"><img src="assets/sponsors/maekandex.jpeg" alt="Maekandex" height="76"></a>
+</p>

@@ -262,6 +262,36 @@ def test_save_accepts_selected_pdf_or_any_file(tmp_path):
     assert (tmp_path / "misc" / stored_any).read_bytes() == b"payload"
 
 
+def test_file_upload_rejects_images_but_file_image_accepts_both(tmp_path):
+    image = UploadFile("sample.png", "image/png", PNG_BYTES, media_root=tmp_path)
+    try:
+        asyncio.run(image.save("files", type="file"))
+    except ValueError as exc:
+        assert "does not accept image uploads" in str(exc)
+    else:
+        raise AssertionError("FileField uploads must reject image files")
+
+    image_name = asyncio.run(image.save("mixed", type="file_image"))
+    assert image_name.endswith(".png")
+    assert (tmp_path / "mixed" / image_name).read_bytes() == PNG_BYTES
+
+    document = UploadFile("notes.pdf", "application/pdf", b"%PDF-1.7", media_root=tmp_path)
+    document_name = asyncio.run(document.save("files", type="file"))
+    assert document_name.endswith(".pdf")
+    assert (tmp_path / "files" / document_name).read_bytes() == b"%PDF-1.7"
+
+
+def test_upload_max_size_is_enforced_before_writing(tmp_path):
+    image = UploadFile("sample.png", "image/png", PNG_BYTES, media_root=tmp_path)
+    try:
+        asyncio.run(image.save("photos", max_size=4))
+    except ValueError as exc:
+        assert "maximum size" in str(exc)
+    else:
+        raise AssertionError("Upload size limit should be enforced")
+    assert not (tmp_path / "photos").exists()
+
+
 def test_save_requires_configured_media_root_and_checks_file_type(tmp_path):
     without_root = UploadFile("x.png", "image/png", PNG_BYTES)
     try:

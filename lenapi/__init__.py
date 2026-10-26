@@ -1,5 +1,13 @@
 """lenApi: a small, typed ASGI web framework."""
 
+import sys
+
+if sys.version_info < (3, 11):
+    raise RuntimeError(
+        "LenAPI requires Python 3.11 or newer. Python 3.10 reached end of life "
+        "on 2026-10-01 and is no longer supported."
+    )
+
 __version__ = "0.1.2"
 
 from .application import Application, LENAPI, Router
@@ -22,15 +30,22 @@ from .models import (
     CASCADE,
     Count,
     DateTimeField,
+    DateField,
     DecimalField,
+    DurationField,
     EmailField,
     FloatField,
     ForeignKeyField,
+    FileField,
+    FileImageField,
     ImageField,
     IPField,
     IntegerField,
+    PositiveBigIntegerField,
+    PositiveIntegerField,
     JSONField,
     ManyToManyField,
+    OneToOneField,
     Max,
     Min,
     Model,
@@ -40,6 +55,8 @@ from .models import (
     StringField,
     Sum,
     TextField,
+    TimeField,
+    URLField,
     UUIDField,
     User,
     cascade,
@@ -79,7 +96,7 @@ from . import model
 
 __all__ = [
     "Application", "LENAPI", "Router", "Depends", "BackgroundTasks", "BackgroundQueue", "Cache", "Faker", "OpenAI", "Ollama", "CORSMiddleware", "DocsAuthMiddleware", "GZipMiddleware", "RequestIDMiddleware", "TimingMiddleware", "require_role", "require_permission", "require_owner", "Database", "AsyncDatabase", "MongoDatabase", "MongoDocument", "MultipleDocumentsFound", "Body", "File", "Model", "AdminUser", "AutoField", "logger", "get_logger", "WebSocket", "WebSocketConnection", "WebSocketDisconnect", "WebSocketService",
-    "IntegerField", "BigIntField", "BigIntegerField", "DecimalField", "StringField", "EmailField", "IPField", "PhoneField", "TextField", "UUIDField", "ImageField", "BooleanField", "FloatField", "User",
-    "DateTimeField", "JSONField", "ForeignKeyField", "ManyToManyField", "Count", "Sum", "Min", "Max", "Avg", "Request", "UploadFile", "Response", "JSONResponse",
+    "IntegerField", "PositiveIntegerField", "BigIntField", "BigIntegerField", "PositiveBigIntegerField", "DecimalField", "StringField", "EmailField", "IPField", "PhoneField", "TextField", "UUIDField", "ImageField", "FileField", "FileImageField", "URLField", "BooleanField", "FloatField", "User",
+    "DateTimeField", "DateField", "TimeField", "DurationField", "JSONField", "ForeignKeyField", "OneToOneField", "ManyToManyField", "Count", "Sum", "Min", "Max", "Avg", "Request", "UploadFile", "Response", "JSONResponse",
     "HTTPException", "JWTAuth", "APIKeyAuth", "BasicAuth", "CSRFProtect", "SessionAuth", "OpaqueBearerAuth", "HMACAuth", "OIDCAuth", "WebhookAuth", "hmac_request_signature", "session_auth", "opaque_bearer_auth", "hmac_auth", "oidc_auth", "webhook_auth", "create_authenticator", "authentication", "SocialAuth", "hash_password", "verify_password", "make_password", "check_password", "make_api_key", "hash_api_key", "UNSET", "model", "CASCADE", "SET_NULL", "PROTECT", "cascade", "null", "protected",
 ]

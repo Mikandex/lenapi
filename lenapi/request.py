@@ -73,6 +73,12 @@ class UploadFile:
             raise ValueError("Uploaded file is not a supported image or its content type does not match")
         return detected
 
+    def _has_image_signature(self) -> bool:
+        return (
+            self._data.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"BM"))
+            or (self._data.startswith(b"RIFF") and self._data[8:12] == b"WEBP")
+        )
+
     @staticmethod
     def _safe_name(filename: str) -> str:
         safe_name = Path(filename.replace("\\", "/")).name
@@ -122,6 +128,7 @@ class UploadFile:
         type: str | None = "image",
         keep_filename: bool = False,
         private: bool = False,
+        max_size: int | None = None,
     ) -> str:
         """Save an upload under public or private media storage.
 
@@ -135,6 +142,12 @@ class UploadFile:
         """
         if not isinstance(private, bool):
             raise TypeError("private must be a boolean")
+        if max_size is not None and (
+            isinstance(max_size, bool) or not isinstance(max_size, int) or max_size <= 0
+        ):
+            raise ValueError("max_size must be a positive integer")
+        if max_size is not None and self.size > max_size:
+            raise ValueError(f"Uploaded file exceeds the maximum size of {max_size} bytes")
         root = self.private_media_root if private else self.media_root
         if root is None:
             setting = "PRIVATE_MEDIA_ROOT" if private else "MEDIA_ROOT"
@@ -145,6 +158,22 @@ class UploadFile:
         extension: str
         if type == "image":
             extension = self._image_extension()
+            if keep_filename:
+                suffix = Path(self.filename).suffix.lower()
+                allowed_suffixes = {".jpeg", ".jpg"} if extension == ".jpg" else {extension}
+                if suffix not in allowed_suffixes:
+                    raise ValueError("Image filename extension does not match its image content")
+        elif type == "file":
+            if self.content_type.lower().startswith("image/") or self._has_image_signature():
+                raise ValueError("FileField does not accept image uploads; use ImageField or FileImageField")
+            suffix = Path(self.filename).suffix.lower()
+            extension = suffix if re.fullmatch(r"\.[a-z0-9]{1,10}", suffix) else ".bin"
+        elif type == "file_image":
+            if self.content_type.lower().startswith("image/") or self._has_image_signature():
+                extension = self._image_extension()
+            else:
+                suffix = Path(self.filename).suffix.lower()
+                extension = suffix if re.fullmatch(r"\.[a-z0-9]{1,10}", suffix) else ".bin"
         elif type is None:
             suffix = Path(self.filename).suffix.lower()
             extension = suffix if re.fullmatch(r"\.[a-z0-9]{1,10}", suffix) else ".bin"

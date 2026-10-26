@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
@@ -25,7 +25,7 @@ from .request import (
 from .response import FileResponse, HTTPException, JSONResponse, Response
 from .dependencies import Depends
 from .concurrency import call_sync_or_async
-from .openapi import build_openapi, swagger_html
+from .openapi import build_openapi, redoc_html, swagger_html
 from .parameters import Body, File
 from .database import AsyncDatabase, Database
 from .mongodb import MongoDatabase
@@ -253,7 +253,8 @@ class Application(Router):
                  async_database: AsyncDatabase | None = None,
                  mongodb: MongoDatabase | None = None,
                  title: str = "lenApi", version: str = "0.1.0",
-                 docs_url: str | None = "/docs/", openapi_url: str | None = "/openapi.json",
+                 docs_url: str | None = "/docs/", redoc_url: str | None = "/redoc/",
+                 openapi_url: str | None = "/openapi.json",
                  max_request_body_size: int | None = 10 * 1024 * 1024,
                  request_body_timeout: float | None = 30.0,
                  ip_flag_backend: str | None = None, redis_url: str | None = None,
@@ -295,11 +296,12 @@ class Application(Router):
         self.title = title
         self.version = version
         self.docs_url = docs_url
+        self.redoc_url = redoc_url
         self.openapi_url = openapi_url
         self.safe_guard_docs_url = bool(safe_guard_docs_url)
         self._docs_guard_paths = {
             normalized
-            for configured in (self.docs_url, self.openapi_url)
+            for configured in (self.docs_url, self.redoc_url, self.openapi_url)
             if configured
             for normalized in (configured, configured.rstrip("/"))
         }
@@ -388,6 +390,18 @@ class Application(Router):
                 return
         if self.docs_url is not None and self.openapi_url is not None and path in {self.docs_url, self.docs_url.rstrip("/")} and method == "GET":
             page = swagger_html(self.openapi_url)
+            if self.safe_guard_docs_url:
+                signout = '''<form method="post" action="/logout" style="position:fixed;right:18px;top:14px;z-index:9999">
+<input type="hidden" name="csrf_token"><button style="border:1px solid #64748b;background:#fff;border-radius:7px;padding:8px 12px;cursor:pointer">Sign out</button>
+</form><script>(function(){const c=document.cookie.split('; ').find(x=>x.startsWith('lenapi_docs_csrf='));if(c)document.querySelector('form[action="/logout"] input').value=decodeURIComponent(c.split('=').slice(1).join('='));})();</script>'''
+                page = page.replace("</body>", signout + "</body>")
+            response = Response(page, media_type="text/html; charset=utf-8")
+            await response(route_scope, receive, send)
+            return
+        if self.redoc_url is not None and self.openapi_url is not None and path in {
+            self.redoc_url, self.redoc_url.rstrip("/")
+        } and method == "GET":
+            page = redoc_html(self.openapi_url)
             if self.safe_guard_docs_url:
                 signout = '''<form method="post" action="/logout" style="position:fixed;right:18px;top:14px;z-index:9999">
 <input type="hidden" name="csrf_token"><button style="border:1px solid #64748b;background:#fff;border-radius:7px;padding:8px 12px;cursor:pointer">Sign out</button>
@@ -1038,6 +1052,7 @@ class Application(Router):
                 continue
             if name == "request" and (
                 annotation in (Request, inspect.Parameter.empty)
+                or Request in get_args(annotation)
                 or (isinstance(annotation, str) and annotation.rsplit(".", 1)[-1] == "Request")
             ):
                 values[name] = request
@@ -1085,7 +1100,8 @@ class LENAPI(Application):
                  async_database: AsyncDatabase | None = None,
                  mongodb: MongoDatabase | None = None,
                  title: str | None = None, version: str | None = None,
-                 docs_url: Any = UNSET, openapi_url: Any = UNSET,
+                 docs_url: Any = UNSET, redoc_url: Any = UNSET,
+                 openapi_url: Any = UNSET,
                  max_request_body_size: Any = UNSET,
                  request_body_timeout: Any = UNSET,
                  ip_flag_backend: str | None = None, redis_url: str | None = None,
@@ -1181,6 +1197,7 @@ class LENAPI(Application):
             title=title or getattr(project_settings, "API_TITLE", "lenApi"),
             version=version or getattr(project_settings, "API_VERSION", "0.1.0"),
             docs_url=_setting_override(docs_url, project_settings, "DOCS_URL", "/docs/"),
+            redoc_url=_setting_override(redoc_url, project_settings, "REDOC_URL", "/redoc/"),
             openapi_url=_setting_override(openapi_url, project_settings, "OPENAPI_URL", "/openapi.json"),
             max_request_body_size=_setting_override(
                 max_request_body_size, project_settings, "MAX_REQUEST_BODY_SIZE", 10 * 1024 * 1024

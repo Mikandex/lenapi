@@ -1,6 +1,7 @@
 """OpenAPI generation from lenApi routes and Pydantic models."""
 
 import inspect
+from html import escape
 from typing import Any
 
 from pydantic import BaseModel, TypeAdapter
@@ -223,5 +224,22 @@ def swagger_html(openapi_url: str) -> str:
     <script>
       window.onload = () => SwaggerUIBundle({{ url: {openapi_url!r}, dom_id: '#swagger-ui' }});
     </script>
+  </body>
+</html>'''
+
+
+def redoc_html(openapi_url: str) -> str:
+    """Return a small ReDoc page that loads the app's OpenAPI document."""
+    escaped_url = escape(openapi_url, quote=True)
+    return f'''<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>API reference</title>
+  </head>
+  <body>
+    <redoc spec-url="{escaped_url}"></redoc>
+    <script src="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"></script>
   </body>
 </html>'''

@@ -35,6 +35,7 @@ BASE_DIR = Path(__file__).resolve().parent
 API_TITLE = "lenApp"
 API_VERSION = "0.1.0"
 DOCS_URL = "/docs/"
+REDOC_URL = "/redoc/"  # Set to None to disable ReDoc.
 OPENAPI_URL = "/openapi.json"
 SAFE_GUARD_DOCS_URL = False  # Set True to require an admin login for docs and OpenAPI.
 DOCS_SESSION_LIFETIME_SECONDS = 3600
@@ -327,9 +328,9 @@ python lenora.py migration
 python lenora.py run
 ```
 
-Migration checks for schema changes and skips the database upgrade when there is no new revision to apply. Set `SAFE_GUARD_DOCS_URL = True` in `settings.py` and run `python lenora.py admin` to enable database-backed login for `/docs/`.
+Migration checks for schema changes and skips the database upgrade when there is no new revision to apply. Set `SAFE_GUARD_DOCS_URL = True` in `settings.py` and run `python lenora.py admin` to enable database-backed login for `/docs/` and `/redoc/`.
 
-The development server uses port 8009. Open `/docs/` for Swagger UI. Run `python lenora.py test` to generate endpoint checks, run the tests, and write a CSV report.
+The development server uses port 8009. Open `/docs/` for Swagger UI or `/redoc/` for ReDoc. Both render the configured OpenAPI document. Run `python lenora.py test` to generate endpoint checks, run the tests, and write a CSV report.
 ''',
     "tests/__init__.py": '''"""Project test package. Run its tests with ``python lenora.py test``."""
 ''',

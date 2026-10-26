@@ -7,6 +7,7 @@ databases, Redis, or provider credentials.
 
 import asyncio
 import base64
+from datetime import date, datetime, time as time_type, timedelta
 import hashlib
 import hmac
 import importlib
@@ -20,7 +21,8 @@ from urllib.parse import urlsplit
 
 import pytest
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import inspect as sa_inspect, select
+from sqlalchemy import CheckConstraint, insert, inspect as sa_inspect, select
+from sqlalchemy.exc import IntegrityError
 
 import lenapi
 from lenapi import (
@@ -57,15 +59,28 @@ from lenapi.model import (
     CASCADE,
     Count,
     DecimalField,
+    DateField,
+    DateTimeField,
+    DurationField,
+    EmailField,
+    FileField,
+    FileImageField,
     ForeignKeyField,
+    IPField,
     JSONField,
     ManyToManyField,
     Max,
     Min,
     PROTECT,
+    OneToOneField,
+    PhoneField,
+    PositiveBigIntegerField,
+    PositiveIntegerField,
     SET_NULL,
     StringField,
     Sum,
+    TimeField,
+    URLField,
     UUIDField,
 )
 from lenapi.models import reset_current_session, set_current_session
@@ -620,6 +635,47 @@ class ArticleRecord(Model):
     tags = ManyToManyField("TagRecord")
 
 
+class ProfileRecord(Model):
+    parent_id = OneToOneField("parentrecord.id", nullable=False)
+
+
+class PositiveFieldRecord(Model):
+    count = PositiveIntegerField(nullable=False)
+    total = PositiveBigIntegerField(default=0, nullable=False)
+
+
+class ValidatedFieldRecord(Model):
+    email = EmailField(error_messages={"email": "this is not an email"})
+    phone = PhoneField()
+    address = IPField()
+    website = URLField()
+    public_id = UUIDField()
+
+
+class UniqueMessageRecord(Model):
+    email = EmailField(unique=True, error_messages={"unique": "Already exists"})
+
+
+class TimestampDurationRecord(Model):
+    created_date = DateField()
+    created_time = TimeField()
+    created_at = DateTimeField()
+    trial_period = DurationField(weeks=1)
+
+
+class StringPrimaryKeyRecord(Model):
+    code = StringField(max_length=12, primary_key=True)
+
+
+class CustomKeyTagRecord(Model):
+    code = StringField(max_length=12, primary_key=True)
+
+
+class CustomKeyItemRecord(Model):
+    sku = StringField(max_length=12, primary_key=True)
+    tags = ManyToManyField("CustomKeyTagRecord")
+
+
 def test_model_fields_defaults_uuid_unique_indexes_and_all_crud_helpers(tmp_path):
     db = Database(f"sqlite:///{tmp_path / 'model-features.db'}")
     FeatureRecord.__table__.create(db.engine)
@@ -677,6 +733,95 @@ def test_foreign_key_delete_policies_and_many_to_many_relationships(tmp_path):
         ProtectedChild.create(parent_id=parent.id)
         with pytest.raises(HTTPException, match="protected records"):
             parent.delete()
+    finally:
+        reset_current_session(token)
+        session.close()
+        db.close()
+
+
+def test_new_fields_validate_values_and_default_temporal_fields(tmp_path):
+    assert ProfileRecord.__table__.c.parent_id.unique is True
+    assert "code" in StringPrimaryKeyRecord.__table__.primary_key.columns
+    assert "id" not in StringPrimaryKeyRecord.__table__.columns
+    check_names = {
+        constraint.name for constraint in PositiveFieldRecord.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert check_names == {
+        "ck_positivefieldrecord_count_non_negative",
+        "ck_positivefieldrecord_total_non_negative",
+    }
+
+    with pytest.raises(HTTPException) as invalid_email:
+        ValidatedFieldRecord(
+            email="not-an-email", phone="+123456789", address="127.0.0.1",
+            website="https://example.com", public_id=uuid.uuid4(),
+        ).save()
+    assert invalid_email.value.detail == "this is not an email"
+
+    for field, value in (
+        ("phone", "123456"),
+        ("address", "999.1.1.1"),
+        ("website", "ftp://example.com"),
+        ("public_id", "not-a-uuid"),
+    ):
+        values = {
+            "email": "ada@example.com", "phone": "+123456789", "address": "127.0.0.1",
+            "website": "https://example.com", "public_id": uuid.uuid4(),
+        }
+        values[field] = value
+        with pytest.raises(HTTPException):
+            ValidatedFieldRecord(**values).save()
+
+    db = Database(f"sqlite:///{tmp_path / 'new-model-fields.db'}")
+    tables = [
+        PositiveFieldRecord.__table__, TimestampDurationRecord.__table__,
+        UniqueMessageRecord.__table__,
+    ]
+    Model.metadata.create_all(db.engine, tables=tables)
+    session = db.session()
+    token = set_current_session(session)
+    try:
+        with pytest.raises(HTTPException, match="zero or greater"):
+            PositiveFieldRecord.create(count=-1)
+        with pytest.raises(IntegrityError):
+            with db.engine.begin() as connection:
+                connection.execute(insert(PositiveFieldRecord.__table__).values(count=-1, total=0))
+
+        record = TimestampDurationRecord.create()
+        assert isinstance(record.created_date, date)
+        assert isinstance(record.created_time, time_type)
+        assert isinstance(record.created_at, datetime)
+        assert record.trial_period == timedelta(days=7)
+
+        UniqueMessageRecord.create(email="ada@example.com")
+        with pytest.raises(HTTPException) as duplicate:
+            UniqueMessageRecord.create(email="ada@example.com")
+        assert duplicate.value.detail == "Already exists"
+    finally:
+        reset_current_session(token)
+        session.close()
+        db.close()
+
+
+def test_many_to_many_supports_custom_primary_keys(tmp_path):
+    association = CustomKeyItemRecord.tags.property.secondary
+    assert {str(foreign_key.target_fullname) for column in association.columns for foreign_key in column.foreign_keys} == {
+        "customkeyitemrecord.sku", "customkeytagrecord.code",
+    }
+    db = Database(f"sqlite:///{tmp_path / 'custom-primary-keys.db'}")
+    Model.metadata.create_all(
+        db.engine,
+        tables=[CustomKeyItemRecord.__table__, CustomKeyTagRecord.__table__, association],
+    )
+    session = db.session()
+    token = set_current_session(session)
+    try:
+        item = CustomKeyItemRecord.create(sku="item-1")
+        tag = CustomKeyTagRecord.create(code="tag-1")
+        item.tags.add(tag)
+        session.commit()
+        assert item.tags.all() == [tag]
     finally:
         reset_current_session(token)
         session.close()

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,7 +11,19 @@ authors = [
     {name = "Maekandex Communication Limitation"},
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Framework :: AsyncIO",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "pydantic>=2.7,<3",
     "sqlalchemy[asyncio]>=2.0,<3",
@@ -44,3 +56,9 @@ include = ["lenapi*"]
 testpaths = ["tests"]
 python_files = ["test.py", "test_*.py", "*_test.py"]
 addopts = "-ra"
+
+[project.urls]
+Homepage = "https://github.com/Mikandex/lenapi"
+Repository = "https://github.com/Mikandex/lenapi"
+Documentation = "https://github.com/Mikandex/lenapi_documentation"
+Issues = "https://github.com/Mikandex/lenapi/issues"
