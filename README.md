@@ -316,7 +316,7 @@ Use the installed `lenora` command to create the first project; `python lenora.p
 
 If `settings.py` is accidentally deleted, run `python lenora.py repair-settings` from the project directory. It recreates the generated defaults only when the file is missing and refuses to overwrite an existing settings file. The recreated file gets fresh `SECRET_KEY` and `API_KEY` values; review it before starting the app. The old `SECRET_KEY` cannot be recovered, so tokens signed with that key will no longer validate.
 
-Run `python lenora.py apikey` inside a project to set `AUTHENTICATION = "api_key"`, add the `APIKey` model to `app/models.py` when it is missing, and generate/apply its migration. The command is safe to repeat; it leaves an existing model in place and applies no migration when the database is already current. The generated table is suitable for app-managed key records and stores a hash, owning user, active state, creation time, and revocation time. The built-in `authentication("api_key")` helper currently checks the digest in `User.api_key`; `register_user(..., authentication="api_key")` writes that digest and returns the raw key once. The generated `APIKey` table is not automatically populated by `register_user()`.
+Run `python lenora.py apikey` inside a project to set `AUTHENTICATION = "api_key"`, add the `APIKey` model to `app/models.py` when it is missing, and run the migration workflow. The command is safe to repeat; it leaves an existing model in place and applies no migration when the database is already current. **The built-in API-key authenticator uses the framework `User` model.** It hashes the presented key and compares it with the digest in `User.api_key`; `register_user(..., authentication="api_key")` writes that digest and returns the raw key once. The generated `APIKey` table is a separate, optional app-managed key registry, linked to `User` by `user_id`; the default authenticator and `register_user()` do not automatically read or populate it. If your app wants that table to be the authentication lookup source, implement and configure that lookup explicitly. Never store raw keys in `key_hash`.
 
 `settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database selection, token settings, and shared security storage. `HOST = ""` uses `127.0.0.1`; set `HOST` directly to bind another address. `app = LENAPI()` loads project settings automatically. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. `DATABASE_TYPE` chooses one backend (`sqlite`, `mysql`, `postgresql`, or `mongodb`), and `DATABASE_URL` configures it. `ACTIVATE_ASYNC` enables asynchronous access using the same database URL. The default database is SQLite.
 
@@ -624,7 +624,7 @@ AUTHENTICATION = "api_key"
 python lenora.py apikey
 ```
 
-The CLI sets that setting, adds `APIKey` to `app/models.py` if it is absent, and runs the migration workflow. The generated model has `user_id`, `key_hash`, `is_active`, `created_at`, and `revoked_at`; never place a raw key in `key_hash`. The default authenticator checks the hash on the framework `User.api_key` field. The CLI-created `APIKey` table is available for app-managed key records, but `register_user()` does not populate it automatically.
+The CLI sets that setting, adds `APIKey` to `app/models.py` if it is absent, and runs the migration workflow. The generated model has `user_id`, `key_hash`, `is_active`, `created_at`, and `revoked_at`. The default authenticator uses the framework `User` model and checks the hash in `User.api_key`. The CLI-created `APIKey` table is a separate management table linked to a `User`; it is not the default lookup table, and `register_user()` does not add rows to it automatically.
 
 For quick development, use the framework `User` model and its `api_key` column with no custom arguments. To use your own model, provide both `user_model` and `api_key_field`; there is no implicit key-column fallback for this custom-model path. LenAPI validates the field during setup and raises a clear error if it is missing:
 
@@ -719,37 +719,167 @@ app.include_router(private)
 
 Call the protected endpoint with Basic credentials; for example, `requests.get(url, auth=("ada", "password"))`. If `BASIC_AUTH_FIELD = "email"`, send the email in the username position: `auth=("ada@example.com", "password")`. Use HTTPS because Basic credentials are encoded, not encrypted, by the header scheme itself.
 
-### Additional authentication dependencies
+### Server-side session authentication
 
-Session cookies, HMAC, OIDC, and opaque bearer tokens can also be attached to selected routes. For example, an API can use an API key on most routes and require a browser session or a signed webhook request on specific endpoints:
+`session_auth()` reads the configured cookie, then loads the associated identity from the security store. Create a random session ID only after validating the user's credentials. Store session state server-side and send just the ID in an HttpOnly cookie:
+
+```python
+import json
+import secrets
+from lenapi import Depends, JSONResponse, LENAPI
+from lenapi import Request
+from lenapi.security import session_auth
+
+app = LENAPI()  # SECURITY_STORAGE defaults to "database".
+session = session_auth(store=app.security_store, cookie_name="session_id")
+
+@app.post("/session/login")
+async def login():
+    # Replace with real credential verification before issuing a session.
+    identity = {"user_id": "123"}
+    session_id = secrets.token_urlsafe(32)
+    await app.security_store.set(
+        f"session:{session_id}", json.dumps(identity), ttl=3600
+    )
+    response = JSONResponse({"authenticated": True})
+    response.set_cookie(
+        "session_id", session_id, max_age=3600, path="/",
+        httponly=True, secure=True, samesite="lax",
+    )
+    return response
+
+@app.get("/session/me")
+def session_me(identity=Depends(session)):
+    print(identity)
+    return identity
+
+@app.post("/session/logout")
+async def logout(request: Request, identity=Depends(session)):
+    session_id = request.cookies.get("session_id")
+    await app.security_store.delete(f"session:{session_id}")
+
+    response = JSONResponse({"message": "Logged out"})
+    response.delete_cookie("session_id")
+    return response
+```
+
+Use `secure=True` in production behind HTTPS; use `secure=False` only for local plain-HTTP development. The logout route requires a valid session, deletes its server-side record, then expires the browser cookie. Cookie-authenticated state-changing routes also need CSRF protection.
+
+### Opaque bearer authentication
+
+Opaque bearer tokens are random values looked up on every request. Unlike JWTs, they contain no trusted claims themselves; deleting the stored entry revokes one immediately.
+
+```python
+import json
+import secrets
+from lenapi import Depends, JSONResponse, LENAPI, Request
+from lenapi.security import opaque_bearer_auth
+
+app = LENAPI()
+bearer = opaque_bearer_auth(store=app.security_store)
+
+async def issue_token(identity: dict) -> str:
+    token = secrets.token_urlsafe(32)
+    await app.security_store.set(
+        f"opaque_bearer:{token}", json.dumps(identity), ttl=3600
+    )
+    return token
+
+@app.post("/opaque/token")
+async def token(request: Request):
+    # Verify the user's credentials before issuing a token in a real app.
+    value = await issue_token({"user_id": 1, "name": "Tolu"})
+    return JSONResponse({"token": value})
+
+@app.get("/opaque/profile", auth=bearer)
+def profile(request: Request, identity=Depends(bearer)):
+    # Do not log the raw bearer token in production.
+    return identity
+
+async def revoke_token(token: str) -> bool:
+    await app.security_store.delete(f"opaque_bearer:{token}")
+    return True
+
+@app.post("/opaque/revoke", auth=bearer)
+async def revoke(request: Request, identity=Depends(bearer)):
+    token = request.headers["authorization"].removeprefix("Bearer").strip()
+    await revoke_token(token)
+    return {"message": "Token revoked"}
+```
+
+The token endpoint above uses a sample identity to demonstrate the storage flow; replace it with credential verification. The `.strip()` after removing `Bearer` is needed so revocation looks up the same token value that was stored.
+
+### HMAC request authentication
+
+HMAC is useful for service-to-service requests and webhook-style clients that can hold a shared secret. It signs the timestamp, method, path and query, exact body bytes, and a unique nonce. The secret must contain at least 32 bytes; the nonce store prevents replay across workers.
+
+```python
+import os
+from lenapi import Depends
+from lenapi.security import hmac_auth
+
+HMAC_SECRET = os.environ["LENAPI_HMAC_SECRET"]
+signed_request = hmac_auth(
+    HMAC_SECRET,
+    header_name="flutter_api_auth",
+)
+
+@app.post("/webhooks/signed", auth=signed_request)
+async def signed_webhook(identity=Depends(signed_request)):
+    return {"accepted": True}
+```
+
+The client can use `hmac_request_signature(secret, method, path, timestamp, body, nonce=nonce)` to calculate the signature. The default signature header is `X-LenAPI-Signature`; set `header_name="flutter_api_auth"` to read the signature from a partner-specific header. The timestamp and nonce headers remain `X-LenAPI-Timestamp` and `X-LenAPI-Nonce`. The signed path includes the query string, and `body` must be the exact bytes sent. `tolerance_seconds` defaults to 300 and `nonce_store` is optional; pass `app.security_store` as the nonce store for replay protection shared across workers.
+
+```python
+import secrets
+import time
+from lenapi.security import hmac_request_signature
+
+body = b'{"event":"payment.completed"}'
+timestamp = str(int(time.time()))
+nonce = secrets.token_urlsafe(16)
+signature = hmac_request_signature(
+    HMAC_SECRET, "POST", "/webhooks/signed", timestamp, body, nonce=nonce
+)
+headers = {
+    "Content-Type": "application/json",
+    "X-LenAPI-Timestamp": timestamp,
+    "X-LenAPI-Nonce": nonce,
+    "flutter_api_auth": signature,
+}
+# Send these headers and `body` unchanged to the LenAPI endpoint over HTTPS.
+```
+
+### OIDC bearer-token validation
+
+Use `oidc_auth()` when a client already has an access token from an identity provider. Its callback must validate the token with a maintained OIDC/JWT library; do not merely decode its claims. Verify the signature using trusted provider keys and validate issuer, audience, and expiry (plus nonce where applicable):
 
 ```python
 from lenapi import Depends
-from lenapi.security import hmac_auth, oidc_auth, opaque_bearer_auth, session_auth
+from lenapi.security import oidc_auth
 
-session = session_auth(store=app.security_store, cookie_name="session_id")
-stored_token = opaque_bearer_auth(store=app.security_store)
-signed_request = hmac_auth(settings.HMAC_SECRET, nonce_store=app.security_store)
-provider_token = oidc_auth(oidc_token_lookup)
+def verify_provider_token(token: str):
+    # Replace with your OIDC library's verified token-validation call.
+    claims = verify_with_provider_keys(
+        token,
+        issuer="https://issuer.example",
+        audience="your-client-id",
+    )
+    if claims is None:
+        return None
+    return {"sub": claims["sub"], "email": claims.get("email")}
 
-@app.get("/browser/private")
-def browser_private(api_identity=Depends(auth), session_identity=Depends(session)):
-    return {"api_user": api_identity, "session_user": session_identity}
+provider_auth = oidc_auth(verify_provider_token)
 
-@app.get("/browser/session-only")
-def browser_session_only(user=Depends(session)):
-    return {"user": user}
-
-@app.post("/webhooks/provider")
-async def provider_webhook(identity=Depends(signed_request)):
-    return {"accepted": True}
-
-@app.get("/federated/private")
-def federated_private(identity=Depends(provider_token)):
-    return {"identity": identity}
+@app.get("/oidc/profile", auth=provider_auth)
+def oidc_profile(identity=Depends(provider_auth)):
+    return identity
 ```
 
-`SECURITY_STORAGE` selects the shared store used by IP flags, sessions, opaque bearer tokens, and HMAC nonce replay checks. The store exposes async `get(key)`, `set(key, value, ttl=...)`, `delete(key)`, and atomic `claim(key, ttl)` methods. For a custom login flow, create a random session ID, store the JSON-serialized identity as `await app.security_store.set(f"session:{session_id}", json.dumps(identity), ttl=3600)`, and set it in a cookie with `Response.set_cookie(..., httponly=True, secure=True, samesite="lax")`. Opaque bearer tokens can be stored similarly under `opaque_bearer:{token}`. `oidc_token_lookup(token)` must validate the provider's issuer, audience, signature, and expiry using its supported OIDC library.
+`verify_with_provider_keys` above represents your chosen OIDC library's verified validation function. This dependency validates incoming provider tokens; `SocialAuth` is the separate built-in authorization-code login and callback flow.
+
+`SECURITY_STORAGE` selects the shared store used by sessions, opaque bearer tokens, IP flags, and HMAC replay checks. Its async methods include `get(key)`, `set(key, value, ttl=...)`, `delete(key)`, and atomic `claim(key, ttl)`. The generated project defaults to database storage. Database storage needs the framework migration; Redis requires a running Redis server and the Redis extra. Memory storage is process-local and is not shared across workers.
 
 ## Social login
 
@@ -782,10 +912,6 @@ With `auto_register=True`, LenApi creates a framework `User` (or an `app.models.
 The scaffold includes blank settings for `GOOGLE_*`, `GITHUB_*`, and `LINKEDIN_*` client ID, client secret, redirect URI, and cookie security values. Keep client secrets in environment variables or a local ignored `.env` file.
 
 Use `SocialAuth` for the built-in Google, GitHub, and LinkedIn authorization-code flows; retain a custom flow when your provider or account-linking rules need different behavior.
-
-For HMAC, configure `HMAC_SECRET` with at least 32 bytes, then clients can generate the header signature with `hmac_request_signature(secret, method, path, timestamp, body, nonce=nonce)` and send it with `X-LenAPI-Timestamp`, `X-LenAPI-Nonce`, and `X-LenAPI-Signature`. Signatures older than the configured tolerance and repeated nonces are rejected. The replay cache is process-local; multi-worker deployments should replace it with a shared nonce store.
-
-HMAC mode signs the request timestamp, method, path plus query, body digest, and a unique nonce. Configure `HMAC_SECRET` with at least 32 bytes, then clients can generate the header signature with `hmac_request_signature(secret, method, path, timestamp, body, nonce=nonce)` and send it with `X-LenAPI-Timestamp` and `X-LenAPI-Nonce`. Signatures older than the configured tolerance and repeated nonces are rejected. The replay cache is process-local; multi-worker deployments should replace it with a shared nonce store.
 
 ## Authorization
 

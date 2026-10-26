@@ -48,7 +48,7 @@ def _auth_schemes(dependency, seen=None) -> dict[str, dict[str, str]]:
         return {
             "HMACTimestamp": {"type": "apiKey", "in": "header", "name": "X-LenAPI-Timestamp"},
             "HMACNonce": {"type": "apiKey", "in": "header", "name": "X-LenAPI-Nonce"},
-            "HMACSignature": {"type": "apiKey", "in": "header", "name": "X-LenAPI-Signature"},
+            "HMACSignature": {"type": "apiKey", "in": "header", "name": dependency.header_name},
         }
     if isinstance(dependency, WebhookAuth):
         schemes = {

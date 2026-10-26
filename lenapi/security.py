@@ -609,21 +609,35 @@ def hmac_request_signature(
 class HMACAuth:
     """Authenticate timestamped, body-signed requests from trusted clients."""
 
-    def __init__(self, secret: str | bytes, *, tolerance_seconds: int = 300, nonce_store=None) -> None:
+    def __init__(
+        self,
+        secret: str | bytes,
+        *,
+        tolerance_seconds: int = 300,
+        nonce_store=None,
+        header_name: str = "X-LenAPI-Signature",
+    ) -> None:
         self.secret = secret.encode("utf-8") if isinstance(secret, str) else secret
         if len(self.secret) < 32:
             raise ValueError("HMAC secret must be at least 32 bytes")
         if tolerance_seconds <= 0:
             raise ValueError("tolerance_seconds must be positive")
+        if (
+            not isinstance(header_name, str)
+            or not header_name.strip()
+            or any(character.isspace() for character in header_name)
+        ):
+            raise ValueError("header_name must be a non-empty header name without whitespace")
         self.tolerance_seconds = tolerance_seconds
         self.nonce_store = nonce_store
+        self.header_name = header_name.strip().lower()
         self._seen_nonces: dict[str, int] = {}
         self._nonce_lock = threading.Lock()
 
     async def __call__(self, request: Request) -> dict[str, str]:
         headers = request.headers
         timestamp = headers.get("x-lenapi-timestamp", "")
-        supplied = headers.get("x-lenapi-signature", "")
+        supplied = headers.get(self.header_name, "")
         nonce = headers.get("x-lenapi-nonce", "")
         if not nonce or len(nonce) > 128:
             raise HTTPException(401, "Invalid signed request", headers={"WWW-Authenticate": "HMAC"})
@@ -657,9 +671,20 @@ class HMACAuth:
         return {"auth_method": "hmac"}
 
 
-def hmac_auth(secret: str | bytes, *, tolerance_seconds: int = 300, nonce_store=None) -> HMACAuth:
+def hmac_auth(
+    secret: str | bytes,
+    *,
+    tolerance_seconds: int = 300,
+    nonce_store=None,
+    header_name: str = "X-LenAPI-Signature",
+) -> HMACAuth:
     """Create an optional per-route HMAC request authentication dependency."""
-    return HMACAuth(secret, tolerance_seconds=tolerance_seconds, nonce_store=nonce_store)
+    return HMACAuth(
+        secret,
+        tolerance_seconds=tolerance_seconds,
+        nonce_store=nonce_store,
+        header_name=header_name,
+    )
 
 
 def create_authenticator(
