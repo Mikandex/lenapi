@@ -800,6 +800,18 @@ def test_new_fields_validate_values_and_default_temporal_fields(tmp_path):
         "ck_positivefieldrecord_total_non_negative",
     }
 
+    # Alembic copies table metadata while generating migrations. Ensure that
+    # copy still has one of each generated CHECK constraint; an unguarded
+    # column-attachment listener duplicates them in generated revisions.
+    from alembic.operations.ops import CreateTableOp
+
+    migration_table = CreateTableOp.from_table(PositiveFieldRecord.__table__).to_table()
+    migration_check_names = [
+        constraint.name for constraint in migration_table.constraints
+        if isinstance(constraint, CheckConstraint)
+    ]
+    assert sorted(migration_check_names) == sorted(check_names)
+
     with pytest.raises(HTTPException) as invalid_email:
         ValidatedFieldRecord(
             email="not-an-email", phone="+123456789", address="127.0.0.1",

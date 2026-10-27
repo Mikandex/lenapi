@@ -1076,11 +1076,22 @@ class Model(DeclarativeBase):
 @event.listens_for(Column, "after_parent_attach")
 def _install_non_negative_constraint(column, table):
     """Add a DB CHECK constraint as soon as a Positive* column joins a table."""
-    if not column.info.get("lenapi_non_negative"):
+    if (
+        not column.info.get("lenapi_non_negative")
+        or column.info.get("lenapi_non_negative_constraint_added")
+    ):
         return
     name = f"ck_{table.name}_{column.name}_non_negative"
     if not any(constraint.name == name for constraint in table.constraints):
-        table.append_constraint(CheckConstraint(column >= 0, name=name))
+        table.append_constraint(CheckConstraint(
+            column >= 0,
+            name=name,
+            info={"lenapi_generated_non_negative": True},
+        ))
+        # Alembic reconstructs tables by attaching copied Columns before it
+        # reattaches the table's existing constraints. Preserve this marker in
+        # Column.info so reconstruction does not append a second copy.
+        column.info["lenapi_non_negative_constraint_added"] = True
 
 
 @event.listens_for(Mapper, "after_mapper_constructed")
