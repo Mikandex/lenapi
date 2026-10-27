@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import textwrap
+import os
 
 
 def test_user_subclass_extends_existing_table_and_migration_detects_columns(tmp_path):
@@ -44,9 +45,15 @@ def test_user_subclass_extends_existing_table_and_migration_detects_columns(tmp_
         database.close()
         """
     )
+    environment = os.environ.copy()
+    # This test intentionally exercises the framework's unnamespaced default;
+    # project-context tests elsewhere in the suite may set namespaced env vars.
+    environment.pop("LENAPI_PROJECT_NAME", None)
+    environment.pop("LENAPI_PROJECT_NAMESPACE", None)
     subprocess.run(
         [sys.executable, "-c", script, str(database_path)],
         check=True,
         capture_output=True,
         text=True,
+        env=environment,
     )

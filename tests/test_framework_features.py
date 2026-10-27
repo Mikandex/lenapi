@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 import pytest
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import CheckConstraint, insert, inspect as sa_inspect, select
+from sqlalchemy import CheckConstraint, func, insert, inspect as sa_inspect, select
 from sqlalchemy.exc import IntegrityError
 
 import lenapi
@@ -52,6 +52,7 @@ from lenapi import (
     make_api_key,
     make_password,
     check_password,
+    transaction,
 )
 from lenapi.authorization import require_owner, require_permission, require_role
 from lenapi.model import (
@@ -710,6 +711,53 @@ def test_model_fields_defaults_uuid_unique_indexes_and_all_crud_helpers(tmp_path
         reset_current_session(token)
         session.close()
         db.close()
+
+
+def test_transaction_atomic_commits_and_rolls_back_sync_model_creates(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'atomic-sync.db'}")
+    FeatureRecord.__table__.create(db.engine)
+    try:
+        with transaction.atomic(db):
+            FeatureRecord.create(name="Commit A", group="atomic")
+            FeatureRecord.create(name="Commit B", group="atomic")
+
+        with pytest.raises(RuntimeError, match="abort transaction"):
+            with transaction.atomic(db):
+                FeatureRecord.create(name="Rollback", group="atomic")
+                raise RuntimeError("abort transaction")
+
+        with db.session() as session:
+            assert session.scalar(select(func.count()).select_from(FeatureRecord)) == 2
+            assert session.scalar(select(FeatureRecord).where(FeatureRecord.name == "Rollback")) is None
+    finally:
+        db.close()
+
+
+def test_transaction_atomic_commits_and_rolls_back_async_model_creates(tmp_path):
+    async def run():
+        db = AsyncDatabase(f"sqlite+aiosqlite:///{tmp_path / 'atomic-async.db'}")
+        async with db.engine.begin() as connection:
+            await connection.run_sync(FeatureRecord.__table__.create)
+        try:
+            async with transaction.atomic(db):
+                await FeatureRecord.acreate(name="Async A", group="atomic")
+                await FeatureRecord.acreate(name="Async B", group="atomic")
+
+            with pytest.raises(RuntimeError, match="abort transaction"):
+                async with transaction.atomic(db):
+                    await FeatureRecord.acreate(name="Async rollback", group="atomic")
+                    raise RuntimeError("abort transaction")
+
+            async with db.session() as session:
+                result = await session.scalar(select(func.count()).select_from(FeatureRecord))
+                assert result == 2
+                assert await session.scalar(
+                    select(FeatureRecord).where(FeatureRecord.name == "Async rollback")
+                ) is None
+        finally:
+            await db.close()
+
+    asyncio.run(run())
 
 
 def test_foreign_key_delete_policies_and_many_to_many_relationships(tmp_path):

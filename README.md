@@ -473,6 +473,8 @@ Run `python lenora.py apikey` inside a project to set `AUTHENTICATION = "api_key
 
 `settings.py` centralizes the API title/version, docs and OpenAPI URLs, host, port, database selection, token settings, and shared security storage. `HOST = ""` uses `127.0.0.1`; set `HOST` directly to bind another address. `app = LENAPI()` loads project settings automatically. Each generated project gets a unique high-entropy `SECRET_KEY`; `TOKEN` uses it to sign tokens and configures token lifetime and issuer. Keep the key private. Changing it invalidates tokens signed with the old key. `DATABASE_TYPE` chooses one backend (`sqlite`, `mysql`, `postgresql`, or `mongodb`), and `DATABASE_URL` configures it. `ACTIVATE_ASYNC` enables asynchronous access using the same database URL. The default database is SQLite.
 
+Generated projects set `DEBUG = True` for local development. Unexpected route or dependency errors then print a traceback to the terminal. LenAPI returns a generic `500 Internal Server Error` response to the client in both debug modes; request validation errors and explicit `HTTPException` responses keep their normal status codes. Set `DEBUG = False` in production to stop LenAPI from printing exception tracebacks. If `DEBUG` is absent, LenAPI defaults to `False`.
+
 ## Automated tests
 
 Pytest is installed with lenApi, so you can run the framework test suite from the repository root:
@@ -798,6 +800,73 @@ For the built-in docs login, set `SAFE_GUARD_DOCS_URL = True` in `settings.py`. 
 The docs gate only handles `/`, `/logout`, the configured Swagger and ReDoc paths, and the configured OpenAPI path. Regular application routes do not query the admin or session tables; they pass through a small path check. Opening protected docs or OpenAPI does validate the session against the configured database, which is the expected cost of revocable server-side sessions.
 
 To remove the gate, set `SAFE_GUARD_DOCS_URL = False` and restart the app. The admin tables may remain in the database; they are not queried while the feature is disabled.
+
+### Built-in model admin and resource monitor
+
+The optional admin console is separate from the Swagger/ReDoc login and is served at `/admin/`. It uses stateless HTTP Basic authentication for its API requests. Enable it in `settings.py`, then run a migration and create an administrator. The first CLI-created superadmin has full access and can create other admin accounts and grant per-model permissions. If the project already had docs-admin accounts before this feature, create an additional account with the CLI; it becomes superadmin if no superadmin exists yet.
+
+```python
+# settings.py
+ADMIN_ENABLED = True
+ADMIN_URL = "/admin/"
+ADMIN_SESSION_LIFETIME_SECONDS = 3600
+ADMIN_COOKIE_SECURE = None  # follows the ASGI HTTPS scheme
+
+# Monitoring is optional and requires the admin console to be enabled.
+ADMIN_MONITORING_ENABLED = True
+```
+
+```bash
+python lenora.py migration
+python lenora.py admin
+python lenora.py run
+```
+
+The first SQL migration includes the framework `AdminUser` fields and session storage along with the imported app models. MongoDB initializes the admin collections through `migration`. Mongo collections need a corresponding `MongoDocument` class so the admin can safely render typed edit forms.
+
+Create `app/admin.py` to explicitly allow-list models and choose which fields are visible. Once this file exists, only models registered there appear in the console. `fields` selects displayed/editable fields, `readonly` displays selected fields without allowing changes, and `exclude` hides fields. Credential-like fields such as `password`, `api_key`, and `key_digest` remain hidden even if listed; use application routes that hash or rotate credentials.
+
+```python
+# app/admin.py
+from lenapi.admin import admin
+from app.models import Student, Course, Invoice, Staff
+
+admin.register(
+    Student,
+    fields=("person_name", "course", "email", "profile_image"),
+    readonly=("email",),
+    exclude=("password", "private_notes"),
+)
+
+admin.register(
+    Course,
+    fields=("title", "description", "duration_weeks", "is_active"),
+)
+
+admin.register(
+    Invoice,
+    fields=("invoice_number", "student_id", "amount", "status", "issued_at"),
+    readonly=("invoice_number", "issued_at"),
+    exclude=("payment_token", "provider_response"),
+)
+
+admin.register(
+    Staff,
+    fields=("name", "work_email", "department"),
+    readonly=("work_email",),
+    exclude=("password", "salary", "hr_notes"),
+)
+```
+
+When `app/admin.py` is absent, the console keeps its backward-compatible model discovery. Registered models show only the selected columns; readonly fields appear in record forms without editable controls, and excluded fields are omitted from both the UI and the API response. Update requests are checked against the same field allow-list. The console supports list/read, update, and delete; record creation is handled by application endpoints. Superadmins grant `view`, `read`, `write`, and `delete` independently. `view` controls whether a model appears in the sidebar, `read` allows listing records, `write` permits updates, and `delete` controls deletion.
+
+Admin accounts and model records use the selected SQL database or MongoDB. Disable the console with `ADMIN_ENABLED = False`; set `ADMIN_MONITORING_ENABLED = False` to hide its monitor. Resource metrics are available only to a superadmin when both settings are enabled:
+
+```bash
+python -m pip install 'lenapi[monitoring]'
+```
+
+The Resource Monitor page shows CPU and RAM metric cards with rolling graphs, plus the LenAPI process PID and thread count. RAM shows process resident memory and total system-memory use. Metrics refresh every two seconds while the page is open; history remains in that browser page only. The endpoint is restricted to superadmins. This is an operational status view, not a host monitoring or alerting system. Monitoring requires psutil and does not start background sampling.
 
 The sample app exposes the model queries as HTTP routes: `POST /classrooms` creates a classroom, `GET /classrooms` lists them, and `POST /students` accepts an optional `classroom_id`. `POST /students/batch` creates multiple students, `PUT /students/batch` updates multiple students by ID, and `DELETE /students/batch` deletes multiple students by ID. Batch requests are all-or-nothing: unknown IDs, duplicate names, or a protected deletion reject the whole operation. `PUT /students/{student_id}` updates one student; it returns HTTP 404 if the ID does not exist. `GET /students/{student_id}/classroom` returns the related classroom. Other student routes list, search, and check existence. These routes appear in Swagger at `/docs/`.
 
@@ -1575,7 +1644,7 @@ async def billing_webhook(
 
 ## Databases
 
-`DATABASE_TYPE` chooses one backend and `DATABASE_URL` connects to it. The generated project defaults to SQLite. SQLite, MySQL, and PostgreSQL use SQLAlchemy models and Alembic revisions; MongoDB uses the separate `MongoDocument` API and does not have SQL schema revisions. `ACTIVATE_ASYNC = True` enables async access to the same database URL. Keep production credentials out of committed settings and URL-encode reserved characters in credentials.
+`DATABASE_TYPE` chooses one backend and `DATABASE_URL` connects to it. The generated project defaults to SQLite. SQLite, MySQL, and PostgreSQL use SQLAlchemy models and Alembic revisions; MongoDB uses the separate `MongoDocument` API and does not have SQL schema revisions. `app.database_type` reports the selected backend at runtime. `ACTIVATE_ASYNC = True` enables async access to the same database URL. Keep production credentials out of committed settings and URL-encode reserved characters in credentials.
 
 ```python
 # settings.py — choose one backend and its URL
@@ -1593,6 +1662,8 @@ DATABASE_URL = f"sqlite:///{BASE_DIR / 'lenapi.db'}"
 # MongoDB: install `python -m pip install 'lenapi[mongodb]'`
 # DATABASE_TYPE = "mongodb"
 # DATABASE_URL = "mongodb://user:password@localhost:27017/app_db"
+# If the URI has no database path, set this explicitly instead:
+# MONGODB_DATABASE = "app_db"
 
 ACTIVATE_ASYNC = False
 ```
@@ -1636,7 +1707,44 @@ await student.asave()
 await student.adelete()
 ```
 
-`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. To select MongoDB, set `DATABASE_TYPE = "mongodb"` and set `DATABASE_URL` to a Mongo URI whose path contains the database name, such as `mongodb://localhost:27017/my_database`. `ACTIVATE_ASYNC` controls whether LenApi also creates PyMongo's async client. `migration` and `migrate` ensure collections exist for imported `MongoDocument` models and framework security/admin state; document fields are schema-flexible and do not use Alembic revisions. `SECURITY_STORAGE = "database"` uses MongoDB for shared security state, while Redis and process memory remain optional choices. MongoDB uses the official synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
+`MongoDatabase.ping()` and `await MongoDatabase.aping()` check connectivity. To select MongoDB, set `DATABASE_TYPE = "mongodb"`. Put the database name in the URI path, such as `mongodb://localhost:27017/my_database`, or set `MONGODB_DATABASE = "my_database"` when the URI has no path. `ACTIVATE_ASYNC` controls whether LenApi also creates PyMongo's async client. `migration` and `migrate` ensure collections exist for imported `MongoDocument` models and framework security/admin state; document fields are schema-flexible and do not use Alembic revisions. `SECURITY_STORAGE = "database"` uses MongoDB for shared security state, while Redis and process memory remain optional choices. MongoDB uses the official synchronous and `AsyncMongoClient` APIs; see the [PyMongo driver guide](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/).
+
+#### Switching an existing project from SQL to MongoDB
+
+Changing `DATABASE_TYPE` and `DATABASE_URL` selects MongoDB for the app; it does not convert existing SQLAlchemy models, tables, or rows. Define the Mongo-backed version as a `MongoDocument`, bind it after creating the app, and update routes to use that document class. If a SQL `model.Model` query runs while MongoDB is selected, LenAPI raises a clear backend-mismatch error explaining that a Mongo document is required. Check the active backend with `app.database_type`.
+
+```python
+# settings.py
+DATABASE_TYPE = "mongodb"
+DATABASE_URL = "mongodb://127.0.0.1:27017/my_app"
+
+# app/models.py
+from lenapi import MongoDocument
+
+class MongoStudent(MongoDocument):
+    collection_name = "students"
+    username: str
+    course: str
+
+# main.py
+from lenapi import LENAPI
+from pydantic import BaseModel
+from app.models import MongoStudent
+
+class StudentCreate(BaseModel):
+    username: str
+    course: str
+
+app = LENAPI()
+MongoStudent.bind(app.mongodb)
+print(app.database_type)  # mongodb
+
+@app.post("/students")
+def create_student(data: StudentCreate):
+    return MongoStudent.create(**data.model_dump())
+```
+
+If you need to carry existing records over, treat that as an explicit data migration: back up both stores, copy in controlled batches, verify counts and important fields, and only then switch production traffic. LenAPI's `migration`/`migrate` commands initialize MongoDB collections and framework state; they do not copy SQL data. MongoDB document IDs are strings, so update route and response-schema ID types that previously expected integer SQL IDs.
 
 Put application models in `app/models.py` and import that module from `main.py`. The migration command loads `main:app`, so it discovers those model classes before creating a migration. The library's `Model` base supplies an integer `id`:
 

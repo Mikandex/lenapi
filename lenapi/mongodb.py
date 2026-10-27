@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
+from .project import project_object_name
 
 
 class MultipleDocumentsFound(LookupError):
@@ -33,7 +34,11 @@ class MongoDatabase:
         parsed_database = unquote(urlsplit(self.uri).path.lstrip("/").split("/", 1)[0])
         self.database_name = database_name or os.getenv("MONGODB_DATABASE") or parsed_database
         if not self.database_name:
-            raise ValueError("The MongoDB DATABASE_URL must include a database name in its URI path")
+            raise ValueError(
+                "MongoDB database name is missing. Set MONGODB_DATABASE in settings.py "
+                "or include a database name in the DATABASE_URL path, e.g. "
+                "mongodb://localhost:27017/my_database"
+            )
         MongoClient = AsyncMongoClient = None
         if client is None or (async_enabled and async_client is None):
             try:
@@ -144,6 +149,12 @@ class MongoDocument(BaseModel):
     id: str | None = Field(default=None, alias="_id")
     collection_name: ClassVar[str | None] = None
     _mongo_database: ClassVar[MongoDatabase | None] = None
+    _project_namespace: ClassVar[str] = ""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        from .project import project_namespace
+        cls._project_namespace = project_namespace()
 
     @classmethod
     def bind(cls, database: MongoDatabase):
@@ -153,7 +164,10 @@ class MongoDocument(BaseModel):
 
     @classmethod
     def _collection_name(cls) -> str:
-        return cls.collection_name or cls.__name__.lower()
+        return project_object_name(
+            cls.collection_name or cls.__name__.lower(),
+            namespace=cls._project_namespace,
+        )
 
     @classmethod
     def _database(cls) -> MongoDatabase:

@@ -1,12 +1,15 @@
 """Command line interface for lenApi projects."""
 
 import argparse
+import ast
 import csv
+import hashlib
 from importlib import import_module
 from importlib.util import find_spec
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import subprocess
 import sys
@@ -15,6 +18,7 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 from . import __version__
 from .logging import logger
+from .project import project_namespace, project_object_name
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -32,8 +36,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
+PROJECT_NAME = "__LENAPI_PROJECT_NAME__"
+PROJECT_NAMESPACE = "__LENAPI_PROJECT_NAMESPACE__"
 API_TITLE = "lenApp"
 API_VERSION = "0.1.0"
+DEBUG = True  # Development traceback logging; set False before production.
 DOCS_URL = "/docs/"
 REDOC_URL = "/redoc/"  # Set to None to disable ReDoc.
 OPENAPI_URL = "/openapi.json"
@@ -42,6 +49,11 @@ DOCS_SESSION_LIFETIME_SECONDS = 3600
 DOCS_COOKIE_SECURE = None  # None follows the ASGI HTTPS scheme; set True behind a TLS proxy.
 DOCS_LOGIN_MAX_ATTEMPTS = 5  # Failed docs sign-ins allowed per client IP in the time window.
 DOCS_LOGIN_WINDOW_SECONDS = 300
+ADMIN_ENABLED = False  # Set True to enable the private model admin at ADMIN_URL.
+ADMIN_URL = "/admin/"
+ADMIN_SESSION_LIFETIME_SECONDS = 3600
+ADMIN_COOKIE_SECURE = None
+ADMIN_MONITORING_ENABLED = False  # Requires ADMIN_ENABLED = True; install lenapi[monitoring].
 # Limit incoming request bodies to 10 MiB; set to None to disable.
 MAX_REQUEST_BODY_SIZE = 10 * 1024 * 1024
 # Maximum time allowed to receive an incoming body; set to None to disable.
@@ -60,6 +72,8 @@ PORT = 8009
 WEBSOCKET_ALLOWED_ORIGINS = []
 DATABASE_TYPE = "sqlite"  # "sqlite", "mysql", "postgresql", or "mongodb".
 DATABASE_URL = f"sqlite:///{BASE_DIR / 'lenapi.db'}"
+# Optional when DATABASE_URL already contains a MongoDB database path.
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "")
 ACTIVATE_ASYNC = True  # Async access uses the same database and URL as sync access.
 MEDIA_ROOT = BASE_DIR / "media"
 MEDIA_URL = "/"
@@ -95,12 +109,49 @@ TOKEN = {
     "ISSUER": API_TITLE,
 }
 ''',
+    "project_context.py": '''"""Validate project identity before importing LenAPI."""
+
+import os
+from pathlib import Path
+import re
+
+
+def configure_project_context(source_file, settings_module):
+    project_dir = Path(source_file).resolve().parent
+    project_name = settings_module.PROJECT_NAME
+    if not isinstance(project_name, str) or not project_name.isidentifier():
+        raise RuntimeError("settings.PROJECT_NAME must be a valid Python identifier")
+    if project_name.lower() == "lenora":
+        raise RuntimeError("'lenora' is reserved for the LenAPI framework")
+    if project_name != project_dir.name:
+        raise RuntimeError(
+            f"PROJECT_NAME {project_name!r} must match project directory "
+            f"{project_dir.name!r}"
+        )
+    namespace = settings_module.PROJECT_NAMESPACE
+    if not isinstance(namespace, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,29}", namespace.lower()):
+        raise RuntimeError("PROJECT_NAMESPACE must be a valid database namespace of at most 30 characters")
+    os.environ["LENAPI_PROJECT_NAME"] = project_name
+    os.environ["LENAPI_PROJECT_NAMESPACE"] = namespace.lower()
+''',
     "main.py": '''"""Application routes."""
 
-from lenapi import LENAPI
-from app import models  # Import models so migrations can discover them.
+if __package__:
+    from . import settings
+    from .project_context import configure_project_context
+else:
+    import settings
+    from project_context import configure_project_context
 
-app = LENAPI()
+configure_project_context(__file__, settings)
+
+from lenapi import LENAPI
+if __package__:
+    from .app import models  # Import models so migrations can discover them.
+else:
+    from app import models
+
+app = LENAPI(settings=settings)
 
 
 @app.get("/")
@@ -135,12 +186,33 @@ migration command detects those added columns.
 # Default account schemas are supplied by the framework.
 from lenapi.authentication import UserPublic, UserRegistration
 ''',
+    "app/admin.py": '''"""Allow-list project models exposed in the LenAPI admin console.
+
+Register only models that administrators should be able to view or manage.
+When this file has no registrations, the console exposes no application models.
+"""
+
+from lenapi.admin import admin
+
+# Example:
+# from app.models import Student
+#
+# admin.register(
+#     Student,
+#     fields=("person_name", "course"),
+#     readonly=("course",),
+#     exclude=("password", "private_notes"),
+# )
+''',
     "lenora.py": '''"""Project-local command launcher."""
 
 import sys
 from pathlib import Path
+from project_context import configure_project_context
+import settings
 
 project_dir = Path(__file__).resolve().parent
+configure_project_context(__file__, settings)
 sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != project_dir]
 sys.path.insert(0, str(project_dir.parent))
 from lenapi.cli import main
@@ -197,13 +269,17 @@ from alembic import context
 from sqlalchemy import create_engine, inspect
 
 from lenapi import Model
+from lenapi.project import project_namespace, project_object_name
 
 config = context.config
 
 
 def include_migration_object(obj, name, type_, reflected, compare_to):
-    if type_ == "table" and name == "lenapi_background_jobs":
+    if type_ == "table" and name == project_object_name("lenapi_background_jobs"):
         return config.attributes.get("lenapi_include_background_jobs", False)
+    namespace = project_namespace()
+    if type_ == "table" and reflected and namespace and not name.startswith(f"{namespace}_"):
+        return False
     # A newer LenApi naming convention can assign a name to a unique
     # constraint that an older database already has unnamed. Treat matching
     # column sets as the same constraint instead of generating a duplicate.
@@ -227,10 +303,12 @@ def include_migration_object(obj, name, type_, reflected, compare_to):
 def load_app():
     app_path = config.attributes.get("app_import_string", "main:app")
     module_name, _, attribute_path = app_path.partition(":")
+    package_name = module_name.rpartition(".")[0]
+    models_module = f"{package_name}.app.models" if package_name else "app.models"
     try:
-        import_module("app.models")
+        import_module(models_module)
     except ModuleNotFoundError as exc:
-        if exc.name not in {"app", "app.models"}:
+        if exc.name not in {"app", "app.models", models_module, f"{package_name}.app"}:
             raise
     app = import_module(module_name)
     for name in attribute_path.split(".") if attribute_path else []:
@@ -243,6 +321,7 @@ def run_migrations_offline():
     context.configure(
         url=app.database.engine.url.render_as_string(hide_password=False),
         target_metadata=Model.metadata,
+        version_table=project_object_name("alembic_version"),
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
@@ -260,6 +339,7 @@ def run_migrations_online():
         context.configure(
             connection=connection,
             target_metadata=Model.metadata,
+            version_table=project_object_name("alembic_version"),
             compare_type=True,
             include_object=include_migration_object,
             render_as_batch=connection.dialect.name == "sqlite",
@@ -273,7 +353,7 @@ def run_migrations_online():
         return
 
     with engine.connect() as connection:
-        existing_tables = set(inspect(connection).get_table_names()) - {"alembic_version"}
+        existing_tables = set(inspect(connection).get_table_names()) - {project_object_name("alembic_version")}
         if connection.in_transaction():
             connection.commit()
         if (config.attributes.get("lenapi_initial_revision", False) and existing_tables
@@ -316,21 +396,7 @@ def downgrade() -> None:
 ''',
     "migrations/versions/__init__.py": "",
     "migrations/versions/.gitkeep": "",
-    "README.md": '''# lenApp
-
-Project settings are in `settings.py`; project models and schemas belong in
-`app/models.py` and `app/schemas.py`, and routes belong in `main.py`. The
-framework supplies the default `User` model and authentication setup. The
-first migration includes the framework `User` and `AdminUser` tables.
-
-```bash
-python lenora.py migration
-python lenora.py run
-```
-
-Migration checks for schema changes and skips the database upgrade when there is no new revision to apply. Set `SAFE_GUARD_DOCS_URL = True` in `settings.py` and run `python lenora.py admin` to enable database-backed login for `/docs/` and `/redoc/`.
-
-The development server uses port 8009. Open `/docs/` for Swagger UI or `/redoc/` for ReDoc. Both render the configured OpenAPI document. Run `python lenora.py test` to generate endpoint checks, run the tests, and write a CSV report.
+    "README.md": '''[LenAPI documentation](https://lenapi.site)
 ''',
     "tests/__init__.py": '''"""Project test package. Run its tests with ``python lenora.py test``."""
 ''',
@@ -472,6 +538,8 @@ def _main() -> None:
     if args.command == "startproject":
         if not args.name.isidentifier():
             parser.error("project name must be a valid Python package name")
+        if args.name.lower() == "lenora":
+            parser.error("'lenora' is reserved for the LenAPI framework; choose another project name")
         project_dir = Path.cwd() / args.name
         if project_dir.exists():
             parser.error(f"{project_dir} already exists")
@@ -479,6 +547,16 @@ def _main() -> None:
             for relative_path, contents in PROJECT_FILES.items():
                 destination = project_dir / relative_path
                 destination.parent.mkdir(parents=True, exist_ok=True)
+                if relative_path == "settings.py":
+                    parent_name = re.sub(r"[^a-z0-9_]+", "_", Path.cwd().name.lower()).strip("_")
+                    if not parent_name or not parent_name[0].isalpha():
+                        parent_name = f"project_{parent_name}"
+                    contents = contents.replace("__LENAPI_PROJECT_NAME__", args.name)
+                    namespace = f"{parent_name}_{args.name.lower()}"
+                    if len(namespace) > 30:
+                        digest = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:8]
+                        namespace = f"{namespace[:21].rstrip('_')}_{digest}"
+                    contents = contents.replace("__LENAPI_PROJECT_NAMESPACE__", namespace)
                 if relative_path == "settings.py":
                     contents = contents.replace(
                         "__LENAPI_GENERATED_SECRET_KEY__", secrets.token_urlsafe(48)
@@ -791,7 +869,22 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     for attribute in attribute_path.split(".") if attribute_path else []:
         app = getattr(app, attribute)
 
+    namespace = project_namespace()
+    version_table = project_object_name("alembic_version")
+
+    def confirm_project_orphans(names, kind):
+        names = sorted(names)
+        if not names:
+            return
+        print(f"Orphaned {kind} in project namespace '{namespace}':")
+        for name in names:
+            print(f"  - {name}")
+        answer = input("Drop these project-owned objects before continuing? [y/N]: ").strip().lower()
+        if answer not in {"y", "yes"}:
+            parser.error("cancelled; no orphaned objects or migration history were changed")
+
     if args.command == "admin":
+        import asyncio
         from getpass import getpass
 
         username = input("Admin username: ").strip()
@@ -803,7 +896,10 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         if app.docs_guard is None:
             parser.error("admin accounts require a configured SQL or MongoDB database")
         try:
-            app.docs_guard.create_admin(username, email, password)
+            is_first_admin = not asyncio.run(app.docs_guard.has_superuser())
+            app.docs_guard.create_admin(
+                username, email, password, is_superuser=is_first_admin
+            )
         except (ValueError, RuntimeError) as exc:
             parser.error(str(exc))
         print("Administrator account created successfully.")
@@ -819,7 +915,14 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             _run_registered_background_worker(module_name, app)
             return
         if args.command == "delete_migrations":
-            answer = input("Delete all MongoDB collections and local migration revisions? [y/N]: ").strip().lower()
+            collection_names = set(app.mongodb.database.list_collection_names())
+            owned_collections = {
+                name for name in collection_names if namespace and name.startswith(f"{namespace}_")
+            }
+            print("Project collections selected for deletion:")
+            for name in sorted(owned_collections):
+                print(f"  - {name}")
+            answer = input("Delete these project collections and local migration revisions? [y/N]: ").strip().lower()
             if answer not in {"y", "yes"}:
                 print("Cancelled; no collections or migration files were deleted.")
                 import asyncio
@@ -828,14 +931,13 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             import asyncio
             try:
                 database = app.mongodb.database
-                collection_names = database.list_collection_names()
-                for collection_name in collection_names:
+                for collection_name in owned_collections:
                     database.drop_collection(collection_name)
                 revisions_dir = Path.cwd() / "migrations" / "versions"
                 for path in revisions_dir.glob("*.py") if revisions_dir.exists() else []:
                     if path.name != "__init__.py":
                         path.unlink()
-                logger.info("Deleted %d MongoDB collections and local migration revisions.", len(collection_names))
+                logger.info("Deleted %d project MongoDB collections and local migration revisions.", len(owned_collections))
             finally:
                 asyncio.run(app.mongodb.aclose())
             return
@@ -862,17 +964,25 @@ def test_http_endpoint_is_registered_and_documented(method, path):
                 for document_model in document_models(MongoDocument)
             }
             collection_names_to_create.update({
-                "admin_user",
-                "lenapi_admin_sessions",
-                "lenapi_security_store",
+                project_object_name("admin_user"),
+                project_object_name("lenapi_admin_sessions"),
+                project_object_name("lenapi_security_store"),
             })
+            orphaned = {
+                name for name in existing_collections
+                if namespace and name.startswith(f"{namespace}_")
+                and name not in collection_names_to_create
+            }
+            confirm_project_orphans(orphaned, "MongoDB collections")
+            for name in orphaned:
+                app.mongodb.database.drop_collection(name)
             for collection_name in sorted(collection_names_to_create):
                 if collection_name not in existing_collections:
                     app.mongodb.database.create_collection(collection_name)
                     existing_collections.add(collection_name)
                     created_collections.append(collection_name)
-            app.mongodb.collection("admin_user").create_index("username", unique=True)
-            app.mongodb.collection("admin_user").create_index("email", unique=True)
+            app.mongodb.collection(project_object_name("admin_user")).create_index("username", unique=True)
+            app.mongodb.collection(project_object_name("admin_user")).create_index("email", unique=True)
         finally:
             asyncio.run(app.mongodb.aclose())
         if created_collections:
@@ -889,22 +999,117 @@ def test_http_endpoint_is_registered_and_documented(method, path):
 
     engine = app.database.engine
     revisions = Path.cwd() / "migrations" / "versions"
+    if namespace and args.command != "delete_migrations":
+        # Never read or adopt the legacy global alembic_version table: it may
+        # belong to another project using the same database. Also refuse to
+        # replay a pre-namespace local chain into the shared database.
+        legacy_create_tables = []
+        for path in sorted(revisions.glob("*.py")) if revisions.exists() else []:
+            if path.name == "__init__.py":
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            except (OSError, SyntaxError):
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "op"
+                    and func.attr == "create_table"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
+                    continue
+                table_name = node.args[0].value
+                if not table_name.startswith(f"{namespace}_"):
+                    legacy_create_tables.append((path.name, table_name))
+        if legacy_create_tables:
+            affected = ", ".join(
+                f"{filename}:{table}" for filename, table in legacy_create_tables[:5]
+            )
+            parser.error(
+                "local migration files contain pre-namespace table names "
+                f"({affected}); they cannot be replayed safely in a shared database. "
+                "Review the legacy schema, then use `python lenora.py delete_migrations` "
+                "to clear this project's migration history and generate a namespaced baseline. "
+                "Tables without this project's namespace and the shared alembic_version "
+                "table will remain untouched."
+            )
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        known_project_tables = set(Model.metadata.tables)
+        owned_tables = {
+            name for name in inspector.get_table_names()
+            if namespace and name.startswith(f"{namespace}_") and name != version_table
+        }
+        orphaned_tables = owned_tables - known_project_tables
+        owned_views = {
+            name for name in inspector.get_view_names()
+            if namespace and name.startswith(f"{namespace}_")
+        }
+    if args.command in {"migration", "migrate", "repair-migrations"}:
+        confirm_project_orphans(orphaned_tables | owned_views, "database tables/views")
+        if orphaned_tables or owned_views:
+            dialect = engine.dialect.name
+            quote = engine.dialect.identifier_preparer.quote
+            with engine.connect() as connection:
+                if dialect == "mysql":
+                    connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=0")
+                    connection.commit()
+                elif dialect == "sqlite":
+                    connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                    connection.commit()
+                transaction = connection.begin()
+                try:
+                    for name in sorted(owned_views):
+                        connection.exec_driver_sql(f"DROP VIEW {quote(name)}")
+                    for name in sorted(orphaned_tables):
+                        cascade = " CASCADE" if dialect == "postgresql" else ""
+                        connection.exec_driver_sql(f"DROP TABLE {quote(name)}{cascade}")
+                    transaction.commit()
+                except Exception:
+                    transaction.rollback()
+                    raise
+                finally:
+                    if dialect == "mysql":
+                        connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=1")
+                        connection.commit()
+                    elif dialect == "sqlite":
+                        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                        connection.commit()
     if args.command == "delete_migrations":
-        answer = input("Delete all tables and local migration revisions from this database? [y/N]: ").strip().lower()
+        print("Project tables/views selected for deletion:")
+        for name in sorted(owned_tables | owned_views):
+            print(f"  - {name}")
+        if version_table in inspect(engine).get_table_names():
+            print(f"  - {version_table}")
+        answer = input("Delete these project tables and local migration revisions? [y/N]: ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled; no tables or migration files were deleted.")
             return
         with engine.connect() as connection:
             inspector = inspect(connection)
-            table_names = set(inspector.get_table_names())
-            view_names = set(inspector.get_view_names())
+            table_names = {
+                name for name in inspector.get_table_names()
+                if namespace and name.startswith(f"{namespace}_")
+            }
+            if version_table in inspector.get_table_names():
+                table_names.add(version_table)
+            view_names = {
+                name for name in inspector.get_view_names()
+                if namespace and name.startswith(f"{namespace}_")
+            }
             dialect = connection.dialect.name
             quote = connection.dialect.identifier_preparer.quote
             if dialect == "mysql":
                 connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=0")
             elif dialect == "sqlite":
                 connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
-                table_names = {name for name in table_names if not name.startswith("sqlite_")}
             try:
                 for name in sorted(view_names):
                     connection.exec_driver_sql(f"DROP VIEW {quote(name)}")
@@ -916,12 +1121,6 @@ def test_http_endpoint_is_registered_and_documented(method, path):
                 if dialect == "mysql":
                     connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=1")
         engine.dispose()
-        if dialect == "sqlite":
-            database_path = engine.url.database
-            if database_path and database_path != ":memory:":
-                db_path = Path(database_path)
-                for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
-                    path.unlink(missing_ok=True)
         for path in revisions.glob("*.py") if revisions.exists() else []:
             if path.name != "__init__.py":
                 path.unlink()
@@ -934,10 +1133,11 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     if args.command == "background-worker":
         config.attributes["lenapi_include_background_jobs"] = True
     else:
+        background_table_name = project_object_name("lenapi_background_jobs")
         with engine.connect() as connection:
-            background_table_exists = "lenapi_background_jobs" in inspect(connection).get_table_names()
+            background_table_exists = background_table_name in inspect(connection).get_table_names()
         background_migration_exists = any(
-            "lenapi_background_jobs" in path.read_text(encoding="utf-8")
+            background_table_name in path.read_text(encoding="utf-8")
             for path in revisions.glob("*.py")
             if path.name != "__init__.py"
         ) if revisions.exists() else False
@@ -946,8 +1146,10 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         )
 
     def include_migration_object(obj, name, type_, reflected, compare_to):
-        if type_ == "table" and name == "lenapi_background_jobs":
+        if type_ == "table" and name == project_object_name("lenapi_background_jobs"):
             return config.attributes.get("lenapi_include_background_jobs", False)
+        if type_ == "table" and reflected and namespace and not name.startswith(f"{namespace}_"):
+            return False
         if type_ == "unique_constraint" and not reflected:
             table = getattr(obj, "table", None)
             columns = tuple(column.name for column in getattr(obj, "columns", ()))
@@ -964,8 +1166,6 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         return True
 
     if args.command == "showmigrations":
-        import ast
-
         local_revisions = []
         for path in sorted(revisions.glob("*.py")):
             if path.name == "__init__.py":
@@ -991,7 +1191,9 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             except (SyntaxError, ValueError) as exc:
                 logger.warning("Could not read migration metadata from %s: %s", path.name, exc)
         with engine.connect() as connection:
-            current_heads = set(MigrationContext.configure(connection).get_current_heads())
+            current_heads = set(MigrationContext.configure(
+                connection, opts={"version_table": version_table}
+            ).get_current_heads())
         known_ids = {revision_id for revision_id, _, _, _ in local_revisions}
         parent_map = {revision_id: parents for revision_id, parents, _, _ in local_revisions}
         applied = set()
@@ -1035,7 +1237,8 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             differences = compare_metadata(
                 MigrationContext.configure(
                     connection,
-                    opts={"compare_type": True, "include_object": include_migration_object},
+                    opts={"compare_type": True, "include_object": include_migration_object,
+                          "version_table": version_table},
                 ),
                 Model.metadata,
             )
@@ -1096,15 +1299,19 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     if args.command == "clear_migrations":
         with engine.connect() as connection:
             table_names = set(inspect(connection).get_table_names())
-        application_tables = table_names - {"alembic_version"}
+        application_tables = {
+            name for name in table_names
+            if namespace and name.startswith(f"{namespace}_") and name != version_table
+        }
         if application_tables:
             parser.error(
                 "refusing to clear migrations because the database contains application tables; "
                 "use `python lenora.py repair-migrations` for a missing revision when its schema matches models"
             )
-        if "alembic_version" in table_names:
+        if version_table in table_names:
             with engine.begin() as connection:
-                connection.execute(text("DROP TABLE alembic_version"))
+                quoted = connection.dialect.identifier_preparer.quote(version_table)
+                connection.exec_driver_sql(f"DROP TABLE {quoted}")
         if revisions.exists():
             for path in revisions.glob("*.py"):
                 if path.name != "__init__.py":
@@ -1120,33 +1327,36 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         revisions_before_autogenerate = {path.resolve() for path in existing_revisions}
         config.attributes["lenapi_initial_revision"] = not existing_revisions
 
-        # On a fresh non-SQLite database, apply the checked-in migration chain
-        # before asking Alembic to autogenerate the next revision. Otherwise
-        # Alembic rejects revision generation because the database is behind
-        # the current repository head.
-        if existing_revisions and engine.dialect.name != "sqlite":
+        script = ScriptDirectory.from_config(config)
+
+        if existing_revisions:
             with engine.connect() as connection:
-                table_names = set(inspect(connection).get_table_names())
-            if not table_names:
-                script = ScriptDirectory.from_config(config)
+                database_tables = set(inspect(connection).get_table_names())
+                project_tables = {
+                    name for name in database_tables
+                    if namespace and name.startswith(f"{namespace}_") and name != version_table
+                }
+                has_project_version = version_table in database_tables
+            if not project_tables and not has_project_version and engine.dialect.name != "sqlite":
                 command.upgrade(config, script.get_current_head())
 
-        # Adopt databases created from this project's prior migration history.
-        # Verify against the already-recorded migration schema before stamping;
-        # never mark an unrelated or mismatched schema as migrated.
+        # Adopt a matching pre-versioned SQLite schema without recreating data.
         if existing_revisions and engine.dialect.name == "sqlite":
             with engine.connect() as connection:
                 table_names = set(inspect(connection).get_table_names())
-                has_version = "alembic_version" in table_names
+                has_version = version_table in table_names
                 if has_version:
+                    quoted_version = connection.dialect.identifier_preparer.quote(version_table)
                     has_version = connection.exec_driver_sql(
-                        "SELECT version_num FROM alembic_version LIMIT 1"
+                        f"SELECT version_num FROM {quoted_version} LIMIT 1"
                     ).first() is not None
-            user_tables = table_names - {"alembic_version"}
+                project_tables = {
+                    name for name in table_names
+                    if namespace and name.startswith(f"{namespace}_") and name != version_table
+                }
             if not has_version:
-                script = ScriptDirectory.from_config(config)
                 existing_head = script.get_current_head()
-                if not user_tables:
+                if not project_tables:
                     command.upgrade(config, existing_head)
                 else:
                     temporary_engine = create_engine("sqlite://")
@@ -1157,24 +1367,25 @@ def test_http_endpoint_is_registered_and_documented(method, path):
                             config.attributes.pop("connection", None)
                             expected_schema = MetaData()
                             expected_schema.reflect(bind=temporary_connection)
-                        version_table = expected_schema.tables.get("alembic_version")
-                        if version_table is not None:
-                            expected_schema.remove(version_table)
+                        reflected_version = expected_schema.tables.get(version_table)
+                        if reflected_version is not None:
+                            expected_schema.remove(reflected_version)
                         with engine.connect() as connection:
                             differences = compare_metadata(
                                 MigrationContext.configure(
                                     connection,
-                                    opts={"compare_type": True, "include_object": include_migration_object},
+                                    opts={"compare_type": True, "include_object": include_migration_object,
+                                          "version_table": version_table},
                                 ),
                                 expected_schema,
                             )
                         if differences:
                             parser.error(
-                                "existing database does not match its recorded migration history; "
-                                "review the schema before migrating"
+                                "existing project schema does not match its recorded migration history; "
+                                "review it before migrating"
                             )
                         command.stamp(config, existing_head)
-                        logger.info("Existing database matches its migration history; preserving its data.")
+                        logger.info("Existing project schema matches its migration history; preserving data.")
                     finally:
                         config.attributes.pop("connection", None)
                         temporary_engine.dispose()
@@ -1213,10 +1424,10 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         with engine.begin() as connection:
             inspector = inspect(connection)
             existing = set(inspector.get_table_names())
-            if "alembic_version" not in existing and connection.dialect.name == "sqlite":
+            if version_table not in existing and connection.dialect.name == "sqlite":
                 quote = connection.dialect.identifier_preparer.quote
                 for table_name, table in Model.metadata.tables.items():
-                    old_name = f"{table_name}s"
+                    old_name = project_object_name(f"{table_name}s")
                     if table_name not in existing and old_name in existing:
                         old_columns = {column["name"] for column in inspector.get_columns(old_name)}
                         if old_columns == set(table.columns.keys()):
@@ -1227,12 +1438,16 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     mark_existing_schema = False
     with engine.connect() as connection:
         table_names = set(inspect(connection).get_table_names())
-        existing_tables = table_names - {"alembic_version"}
-        if existing_tables and "alembic_version" not in table_names:
+        existing_tables = {
+            name for name in table_names
+            if namespace and name.startswith(f"{namespace}_") and name != version_table
+        }
+        if existing_tables and version_table not in table_names:
             differences = compare_metadata(
                 MigrationContext.configure(
                     connection,
-                    opts={"compare_type": True, "include_object": include_migration_object},
+                    opts={"compare_type": True, "include_object": include_migration_object,
+                          "version_table": version_table},
                 ),
                 Model.metadata,
             )
@@ -1245,7 +1460,9 @@ def test_http_endpoint_is_registered_and_documented(method, path):
 
     script = ScriptDirectory.from_config(config)
     with engine.connect() as connection:
-        current_heads = set(MigrationContext.configure(connection).get_current_heads())
+        current_heads = set(MigrationContext.configure(
+            connection, opts={"version_table": version_table}
+        ).get_current_heads())
     expected_heads = set(script.get_heads())
     if current_heads == expected_heads:
         logger.info("Database is already up to date; no migrations applied.")

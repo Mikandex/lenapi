@@ -30,9 +30,12 @@ from .parameters import Body, File
 from .database import AsyncDatabase, Database
 from .mongodb import MongoDatabase
 from .models import (
+    DatabaseBackendMismatch,
     reset_current_async_session,
+    reset_current_database_backend,
     reset_current_session,
     set_current_async_session,
+    set_current_database_backend,
     set_current_session,
 )
 from .security_store import SecurityStoreUnavailable, create_security_store
@@ -252,7 +255,9 @@ class Application(Router):
     def __init__(self, *, session_factory: Callable[[], Any] | None = None, database: Any = None,
                  async_database: AsyncDatabase | None = None,
                  mongodb: MongoDatabase | None = None,
+                 database_type: str | None = None,
                  title: str = "lenApi", version: str = "0.1.0",
+                 debug: bool = False,
                  docs_url: str | None = "/docs/", redoc_url: str | None = "/redoc/",
                  openapi_url: str | None = "/openapi.json",
                  max_request_body_size: int | None = 10 * 1024 * 1024,
@@ -268,9 +273,15 @@ class Application(Router):
                  docs_session_lifetime_seconds: int = 3600,
                  docs_cookie_secure: bool | None = None,
                  docs_login_max_attempts: int = 5,
-                 docs_login_window_seconds: int = 300) -> None:
+                 docs_login_window_seconds: int = 300,
+                 admin_enabled: bool = False, admin_url: str = "/admin/",
+                 admin_session_lifetime_seconds: int = 3600,
+                 admin_cookie_secure: bool | None = None,
+                 admin_monitoring_enabled: bool = False) -> None:
         if session_factory is not None and database is not None:
             raise ValueError("Pass either session_factory or database, not both")
+        if not isinstance(debug, bool):
+            raise ValueError("debug must be a boolean")
         if max_request_body_size is not None and (
             isinstance(max_request_body_size, bool) or not isinstance(max_request_body_size, int)
             or max_request_body_size < 0
@@ -285,6 +296,15 @@ class Application(Router):
                             ("docs_login_window_seconds", docs_login_window_seconds)):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        for name, value in (("admin_session_lifetime_seconds", admin_session_lifetime_seconds),):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(admin_enabled, bool) or not isinstance(admin_monitoring_enabled, bool):
+            raise ValueError("ADMIN_ENABLED and ADMIN_MONITORING_ENABLED must be booleans")
+        if not isinstance(admin_url, str) or not admin_url.startswith("/") or "?" in admin_url or "#" in admin_url:
+            raise ValueError("ADMIN_URL must be an absolute path beginning with '/'")
+        if admin_monitoring_enabled and not admin_enabled:
+            raise ValueError("ADMIN_MONITORING_ENABLED requires ADMIN_ENABLED = True")
         super().__init__(tag_name=tag_name, auth=auth, throttle=throttle)
         self.database = None if database is False else database if database is not None else (
             None if session_factory is not None or async_database is not None else Database()
@@ -293,8 +313,15 @@ class Application(Router):
         self.async_database = async_database
         self.async_session_factory = async_database.session_factory if async_database is not None else None
         self.mongodb = mongodb
+        # Make the selected backend visible to model helpers during requests,
+        # so a SQL-model call in MongoDB mode can explain the mismatch clearly.
+        inferred_backend = "mongodb" if mongodb is not None else (
+            "sql" if self.database is not None or self.session_factory is not None else None
+        )
+        self.database_type = database_type or inferred_backend
         self.title = title
         self.version = version
+        self.debug = debug
         self.docs_url = docs_url
         self.redoc_url = redoc_url
         self.openapi_url = openapi_url
@@ -324,6 +351,17 @@ class Application(Router):
         )
         if self.safe_guard_docs_url and self.docs_guard is None:
             raise ValueError("SAFE_GUARD_DOCS_URL requires a configured SQL or MongoDB database")
+        if admin_enabled and (self.docs_guard is None or (self.database is None and self.mongodb is None)):
+            raise ValueError("ADMIN_ENABLED requires a configured SQL or MongoDB database")
+        self.admin_enabled = admin_enabled
+        self.admin_url = admin_url
+        self.admin_session_lifetime_seconds = admin_session_lifetime_seconds
+        self.admin_monitoring_enabled = admin_monitoring_enabled
+        from .admin import AdminConsole
+        self.admin_console = AdminConsole(
+            self, path=admin_url, monitor=admin_monitoring_enabled,
+            cookie_secure=admin_cookie_secure,
+        )
         self.media_root = Path(media_root).expanduser().resolve() if media_root is not None else None
         self.media_url = self._normalize_media_url(media_url) if self.media_root is not None and media_url else None
         self.private_media_root = (
@@ -337,6 +375,7 @@ class Application(Router):
         self._throttle_lock = threading.Lock()
         self.user_middleware: list[tuple[type, dict[str, Any]]] = []
         self._middleware_stack = None
+        self._mounted_apps: dict[str, Application] = {}
         self.security_storage = (security_storage or ip_flag_backend or "memory").lower()
         self.security_store = create_security_store(
             self.security_storage,
@@ -369,9 +408,55 @@ class Application(Router):
             self._middleware_stack = app
         await self._middleware_stack(scope, receive, send)
 
+    def mount(self, path: str, app: "Application") -> None:
+        """Mount an independent LenAPI app at its matching project path."""
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError("mount path must be an absolute path such as '/games'")
+        normalized = "/" + path.strip("/")
+        if normalized == "/" or "?" in normalized or "#" in normalized:
+            raise ValueError("mount path must be a named absolute path such as '/games'")
+        if not isinstance(app, Application):
+            raise TypeError("mount expects another LENAPI application")
+        project_name = getattr(app, "project_name", None)
+        if not project_name:
+            raise ValueError("mounted application must define PROJECT_NAME in its settings")
+        if normalized.rsplit("/", 1)[-1] != project_name:
+            raise ValueError(
+                f"mount path {normalized!r} must end with the mounted project's "
+                f"PROJECT_NAME {project_name!r}"
+            )
+        if normalized in self._mounted_apps:
+            raise ValueError(f"an application is already mounted at {normalized!r}")
+        if app is self:
+            raise ValueError("an application cannot mount itself")
+        self._mounted_apps[normalized] = app
+
+    async def _dispatch_mounted_app(self, scope, receive, send) -> bool:
+        if scope.get("type") not in {"http", "websocket"}:
+            return False
+        path = scope.get("path", "/")
+        for prefix, mounted_app in sorted(
+            self._mounted_apps.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if path != prefix and not path.startswith(prefix + "/"):
+                continue
+            child_scope = dict(scope)
+            child_scope["root_path"] = scope.get("root_path", "").rstrip("/") + prefix
+            child_scope["path"] = path[len(prefix):] or "/"
+            raw_path = scope.get("raw_path")
+            if isinstance(raw_path, bytes):
+                raw_prefix = prefix.encode("utf-8")
+                if raw_path.startswith(raw_prefix):
+                    child_scope["raw_path"] = raw_path[len(raw_prefix):] or b"/"
+            await mounted_app(child_scope, receive, send)
+            return True
+        return False
+
     async def _dispatch(self, scope, receive, send) -> None:
         if scope["type"] == "lifespan":
             await self._handle_lifespan(receive, send)
+            return
+        if await self._dispatch_mounted_app(scope, receive, send):
             return
         if scope["type"] == "websocket":
             await self._handle_websocket(scope, receive, send)
@@ -379,7 +464,20 @@ class Application(Router):
         if scope["type"] != "http":
             return
         path, method = scope.get("path", "/"), scope.get("method", "GET").upper()
+        root_path = scope.get("root_path", "").rstrip("/")
+        external_openapi_url = f"{root_path}{self.openapi_url}" if root_path and self.openapi_url else self.openapi_url
         route_scope = scope
+        try:
+            admin_response = await self.admin_console.dispatch(scope, receive)
+        except Exception:
+            if self.debug:
+                logger.exception("Admin console request failed for %s", path)
+            else:
+                logger.error("Admin console request failed for %s", path)
+            admin_response = JSONResponse({"detail": "Admin service is temporarily unavailable"}, status_code=503)
+        if admin_response is not None:
+            await admin_response(route_scope, receive, send)
+            return
         docs_login_path = (path == "/" and method in {"GET", "POST"}) or (
             path == "/logout" and method == "POST"
         )
@@ -389,11 +487,12 @@ class Application(Router):
                 await guarded_response(scope, receive, send)
                 return
         if self.docs_url is not None and self.openapi_url is not None and path in {self.docs_url, self.docs_url.rstrip("/")} and method == "GET":
-            page = swagger_html(self.openapi_url)
+            page = swagger_html(external_openapi_url)
             if self.safe_guard_docs_url:
-                signout = '''<form method="post" action="/logout" style="position:fixed;right:18px;top:14px;z-index:9999">
+                signout_path = f"{root_path}/logout" or "/logout"
+                signout = f'''<form method="post" action="{signout_path}" style="position:fixed;right:18px;top:14px;z-index:9999">
 <input type="hidden" name="csrf_token"><button style="border:1px solid #64748b;background:#fff;border-radius:7px;padding:8px 12px;cursor:pointer">Sign out</button>
-</form><script>(function(){const c=document.cookie.split('; ').find(x=>x.startsWith('lenapi_docs_csrf='));if(c)document.querySelector('form[action="/logout"] input').value=decodeURIComponent(c.split('=').slice(1).join('='));})();</script>'''
+</form><script>(function(){{const c=document.cookie.split('; ').find(x=>x.startsWith('lenapi_docs_csrf='));if(c)document.querySelector('form[action="{signout_path}"] input').value=decodeURIComponent(c.split('=').slice(1).join('='));}})();</script>'''
                 page = page.replace("</body>", signout + "</body>")
             response = Response(page, media_type="text/html; charset=utf-8")
             await response(route_scope, receive, send)
@@ -401,17 +500,21 @@ class Application(Router):
         if self.redoc_url is not None and self.openapi_url is not None and path in {
             self.redoc_url, self.redoc_url.rstrip("/")
         } and method == "GET":
-            page = redoc_html(self.openapi_url)
+            page = redoc_html(external_openapi_url)
             if self.safe_guard_docs_url:
-                signout = '''<form method="post" action="/logout" style="position:fixed;right:18px;top:14px;z-index:9999">
+                signout_path = f"{root_path}/logout" or "/logout"
+                signout = f'''<form method="post" action="{signout_path}" style="position:fixed;right:18px;top:14px;z-index:9999">
 <input type="hidden" name="csrf_token"><button style="border:1px solid #64748b;background:#fff;border-radius:7px;padding:8px 12px;cursor:pointer">Sign out</button>
-</form><script>(function(){const c=document.cookie.split('; ').find(x=>x.startsWith('lenapi_docs_csrf='));if(c)document.querySelector('form[action="/logout"] input').value=decodeURIComponent(c.split('=').slice(1).join('='));})();</script>'''
+</form><script>(function(){{const c=document.cookie.split('; ').find(x=>x.startsWith('lenapi_docs_csrf='));if(c)document.querySelector('form[action="{signout_path}"] input').value=decodeURIComponent(c.split('=').slice(1).join('='));}})();</script>'''
                 page = page.replace("</body>", signout + "</body>")
             response = Response(page, media_type="text/html; charset=utf-8")
             await response(route_scope, receive, send)
             return
         if self.openapi_url is not None and path == self.openapi_url and method == "GET":
-            response = JSONResponse(build_openapi(self, title=self.title, version=self.version))
+            schema = build_openapi(self, title=self.title, version=self.version)
+            if root_path:
+                schema["servers"] = [{"url": root_path}]
+            response = JSONResponse(schema)
             await response(route_scope, receive, send)
             return
         if self.media_url is not None and method == "GET":
@@ -496,6 +599,7 @@ class Application(Router):
             async_session = None
             session_token = None
             async_session_token = None
+            database_backend_token = set_current_database_backend(self.database_type)
             request_token = set_current_request(request)
             try:
                 if self.session_factory is not None:
@@ -561,10 +665,17 @@ class Application(Router):
                 response = JSONResponse(
                     {"detail": f"Security storage is unavailable. {hint}"}, status_code=503
                 )
-            except (TypeError, ValueError, KeyError):
-                response = JSONResponse({"error": "Invalid request"}, status_code=422)
+            except DatabaseBackendMismatch as exc:
+                response = JSONResponse({"detail": str(exc)}, status_code=500)
+            except Exception:
+                if self.debug:
+                    logger.exception("Unhandled application error for %s %s", method, path)
+                else:
+                    logger.error("Unhandled application error for %s %s", method, path)
+                response = JSONResponse({"detail": "Internal Server Error"}, status_code=500)
             finally:
                 reset_current_request(request_token)
+                reset_current_database_backend(database_backend_token)
                 if session_token is not None:
                     reset_current_session(session_token)
                 if async_session_token is not None:
@@ -586,6 +697,10 @@ class Application(Router):
         from .request import Request
 
         path, method = scope.get("path", "/"), scope.get("method", "GET").upper()
+        root_path = scope.get("root_path", "").rstrip("/")
+        base_path = f"{root_path}/" if root_path else "/"
+        docs_path = f"{root_path}{self.docs_url}" if root_path and self.docs_url else (self.docs_url or "/")
+        cookie_path = root_path or "/"
         request = Request(scope, receive, max_body_size=4096, body_timeout=self.request_body_timeout)
         secure = (
             self.docs_cookie_secure
@@ -601,7 +716,7 @@ class Application(Router):
                 identity = None
             if identity is not None:
                 return None
-            return Response(b"", status_code=303, headers={"location": "/"})
+            return Response(b"", status_code=303, headers={"location": base_path})
 
         if path == "/" and method == "GET":
             try:
@@ -611,7 +726,7 @@ class Application(Router):
             except RuntimeError:
                 identity = None
             if identity is not None:
-                return Response(b"", status_code=303, headers={"location": self.docs_url or "/"})
+                return Response(b"", status_code=303, headers={"location": docs_path})
             csrf_token = secrets.token_urlsafe(32)
             try:
                 has_admin = await self._has_docs_admin()
@@ -624,9 +739,11 @@ class Application(Router):
                 if not has_admin
                 else None,
             )
+            if root_path:
+                page = page.replace('action="/"', f'action="{base_path}"')
             response = Response(page, media_type="text/html; charset=utf-8")
             response.set_cookie(
-                "lenapi_docs_csrf", csrf_token, path="/", secure=secure,
+                "lenapi_docs_csrf", csrf_token, path=cookie_path, secure=secure,
                 httponly=False, samesite="strict",
             )
             return response
@@ -667,9 +784,11 @@ class Application(Router):
             if identity is None:
                 csrf_token = secrets.token_urlsafe(32)
                 page = render_login_page(self.title, csrf_token, "The username or password is incorrect.")
+                if root_path:
+                    page = page.replace('action="/"', f'action="{base_path}"')
                 response = Response(page, status_code=401, media_type="text/html; charset=utf-8")
                 response.set_cookie(
-                    "lenapi_docs_csrf", csrf_token, path="/", secure=secure,
+                    "lenapi_docs_csrf", csrf_token, path=cookie_path, secure=secure,
                     httponly=False, samesite="strict",
                 )
                 return response
@@ -681,11 +800,11 @@ class Application(Router):
                     status_code=503,
                 )
             session_id = await self.docs_guard.create_session(identity["id"])
-            response = Response(b"", status_code=303, headers={"location": self.docs_url or "/"})
+            response = Response(b"", status_code=303, headers={"location": docs_path})
             response.set_cookie(
                 "lenapi_docs_session", session_id,
                 max_age=self.docs_session_lifetime_seconds,
-                path="/", secure=secure, httponly=True, samesite="lax",
+                path=cookie_path, secure=secure, httponly=True, samesite="lax",
             )
             return response
 
@@ -701,9 +820,9 @@ class Application(Router):
             ):
                 return JSONResponse({"detail": "Invalid logout request"}, status_code=403)
             await self.docs_guard.delete_session(request.cookies.get("lenapi_docs_session"))
-            response = Response(b"", status_code=303, headers={"location": "/"})
-            response.delete_cookie("lenapi_docs_session", path="/")
-            response.delete_cookie("lenapi_docs_csrf", path="/")
+            response = Response(b"", status_code=303, headers={"location": base_path})
+            response.delete_cookie("lenapi_docs_session", path=cookie_path)
+            response.delete_cookie("lenapi_docs_csrf", path=cookie_path)
             return response
         return None
 
@@ -784,7 +903,10 @@ class Application(Router):
             except WebSocketDisconnect:
                 pass
             except Exception:
-                logger.exception("WebSocket handler failed for %s", path)
+                if self.debug:
+                    logger.exception("WebSocket handler failed for %s", path)
+                else:
+                    logger.error("WebSocket handler failed for %s", path)
                 if not websocket.closed:
                     await websocket.close(code=1011, reason="Internal server error")
             else:
@@ -858,15 +980,25 @@ class Application(Router):
             if message["type"] == "lifespan.startup":
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
-                if self.security_storage == "redis":
-                    await self.security_store.close()
-                await self.cache.close()
-                if self.database is not None:
-                    self.database.close()
-                if self.async_database is not None:
-                    await self.async_database.close()
-                if self.mongodb is not None:
-                    await self.mongodb.aclose()
+                visited = set()
+
+                async def close_tree(application):
+                    if id(application) in visited:
+                        return
+                    visited.add(id(application))
+                    if application.security_storage == "redis":
+                        await application.security_store.close()
+                    await application.cache.close()
+                    if application.database is not None:
+                        application.database.close()
+                    if application.async_database is not None:
+                        await application.async_database.close()
+                    if application.mongodb is not None:
+                        await application.mongodb.aclose()
+                    for child in application._mounted_apps.values():
+                        await close_tree(child)
+
+                await close_tree(self)
                 await send({"type": "lifespan.shutdown.complete"})
 
     async def _claim_ip_flag(self, route: str, client_ip: str, cool_time: int) -> int:
@@ -1086,9 +1218,9 @@ class Application(Router):
             if raw is inspect.Parameter.empty:
                 if parameter.default is not inspect.Parameter.empty:
                     continue
-                raise ValueError(f"Missing required parameter: {name}")
+                raise HTTPException(422, f"Missing required parameter: {name}")
             if isinstance(raw, list):
-                raise ValueError(f"Parameter '{name}' may only be supplied once")
+                raise HTTPException(422, f"Parameter '{name}' may only be supplied once")
             values[name] = raw if annotation is inspect.Parameter.empty else TypeAdapter(annotation).validate_python(raw)
         return values
 
@@ -1096,10 +1228,12 @@ class Application(Router):
 class LENAPI(Application):
     """Application configured from the current project's optional settings.py."""
 
-    def __init__(self, *, session_factory: Callable[[], Any] | None = None, database: Any = None,
+    def __init__(self, *, settings: Any = None,
+                 session_factory: Callable[[], Any] | None = None, database: Any = None,
                  async_database: AsyncDatabase | None = None,
                  mongodb: MongoDatabase | None = None,
                  title: str | None = None, version: str | None = None,
+                 debug: bool | None = None,
                  docs_url: Any = UNSET, redoc_url: Any = UNSET,
                  openapi_url: Any = UNSET,
                  max_request_body_size: Any = UNSET,
@@ -1115,19 +1249,27 @@ class LENAPI(Application):
                  docs_cookie_secure: Any = UNSET,
                  docs_login_max_attempts: int | None = None,
                  docs_login_window_seconds: int | None = None,
-                 private_media_root: Any = UNSET) -> None:
+                 private_media_root: Any = UNSET,
+                 admin_enabled: bool | None = None, admin_url: str | None = None,
+                 admin_session_lifetime_seconds: int | None = None,
+                 admin_cookie_secure: Any = UNSET,
+                 admin_monitoring_enabled: bool | None = None) -> None:
         # Project settings are optional, so importing lenapi outside a project
         # continues to work with the framework defaults.
-        try:
-            project_settings = import_module("settings")
-        except ModuleNotFoundError as exc:
-            if exc.name != "settings":
-                raise
-            project_settings = None
+        if settings is not None:
+            project_settings = settings
+        else:
+            try:
+                project_settings = import_module("settings")
+            except ModuleNotFoundError as exc:
+                if exc.name != "settings":
+                    raise
+                project_settings = None
 
         configured_database = database
         configured_async_database = async_database
         configured_mongodb = mongodb
+        database_type = None
         if project_settings is not None:
             database_type = str(getattr(project_settings, "DATABASE_TYPE", "sqlite")).lower()
             database_url = getattr(project_settings, "DATABASE_URL", None)
@@ -1141,7 +1283,11 @@ class LENAPI(Application):
                 if not database_url:
                     raise ValueError("Set DATABASE_URL in settings.py")
                 if database_type == "mongodb":
-                    configured_mongodb = MongoDatabase(database_url, async_enabled=activate_async)
+                    configured_mongodb = MongoDatabase(
+                        database_url,
+                        database_name=getattr(project_settings, "MONGODB_DATABASE", None),
+                        async_enabled=activate_async,
+                    )
                 else:
                     sync_url = make_url(database_url)
                     expected = "postgresql" if database_type in {"postgres", "postgresql"} else database_type
@@ -1188,14 +1334,20 @@ class LENAPI(Application):
         # implicit SQLite engine through Application's standalone default.
         if configured_mongodb is not None and configured_database is None and session_factory is None:
             configured_database = False
+            database_type = "mongodb"
+        elif configured_database is not None and database_type is None:
+            database_type = "sql"
 
         super().__init__(
             session_factory=session_factory,
             database=configured_database,
             async_database=configured_async_database,
             mongodb=configured_mongodb,
+            database_type=("postgresql" if database_type == "postgres" else database_type),
             title=title or getattr(project_settings, "API_TITLE", "lenApi"),
             version=version or getattr(project_settings, "API_VERSION", "0.1.0"),
+            debug=(debug if debug is not None else
+                   getattr(project_settings, "DEBUG", False)),
             docs_url=_setting_override(docs_url, project_settings, "DOCS_URL", "/docs/"),
             redoc_url=_setting_override(redoc_url, project_settings, "REDOC_URL", "/redoc/"),
             openapi_url=_setting_override(openapi_url, project_settings, "OPENAPI_URL", "/openapi.json"),
@@ -1236,7 +1388,19 @@ class LENAPI(Application):
                                      getattr(project_settings, "DOCS_LOGIN_MAX_ATTEMPTS", 5)),
             docs_login_window_seconds=(docs_login_window_seconds if docs_login_window_seconds is not None else
                                        getattr(project_settings, "DOCS_LOGIN_WINDOW_SECONDS", 300)),
+            admin_enabled=(admin_enabled if admin_enabled is not None else
+                           getattr(project_settings, "ADMIN_ENABLED", False)),
+            admin_url=admin_url or getattr(project_settings, "ADMIN_URL", "/admin/"),
+            admin_session_lifetime_seconds=(admin_session_lifetime_seconds if admin_session_lifetime_seconds is not None else
+                                            getattr(project_settings, "ADMIN_SESSION_LIFETIME_SECONDS", 3600)),
+            admin_cookie_secure=_setting_override(
+                admin_cookie_secure, project_settings, "ADMIN_COOKIE_SECURE", None
+            ),
+            admin_monitoring_enabled=(admin_monitoring_enabled if admin_monitoring_enabled is not None else
+                                      getattr(project_settings, "ADMIN_MONITORING_ENABLED", False)),
         )
+        self.project_name = getattr(project_settings, "PROJECT_NAME", None)
+        self.project_namespace = getattr(project_settings, "PROJECT_NAMESPACE", None)
         if project_settings is not None:
             from .authentication import install_default_authentication
 

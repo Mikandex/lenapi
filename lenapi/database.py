@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -18,12 +19,20 @@ class Database:
 
     def __init__(self, url: str = "sqlite:///lenapi.db", *, engine_options: Mapping[str, Any] | None = None) -> None:
         options = {"pool_pre_ping": True, **(engine_options or {})}
+        if make_url(url).get_backend_name() == "sqlite":
+            connect_args = dict(options.get("connect_args", {}))
+            connect_args.setdefault("timeout", 30)
+            options["connect_args"] = connect_args
+            busy_timeout_ms = max(0, int(float(connect_args["timeout"]) * 1000))
+        else:
+            busy_timeout_ms = None
         self.engine: Engine = create_engine(url, **options)
         if self.engine.dialect.name == "sqlite":
             @event.listens_for(self.engine, "connect")
             def enable_sqlite_foreign_keys(connection, _record):
                 cursor = connection.cursor()
                 cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
                 cursor.close()
         self.session_factory = sessionmaker(bind=self.engine, class_=Session)
         if self.engine.dialect.name == "sqlite":
@@ -63,7 +72,20 @@ class AsyncDatabase:
 
     def __init__(self, url: str, *, engine_options: Mapping[str, Any] | None = None) -> None:
         options = {"pool_pre_ping": True, **(engine_options or {})}
+        if make_url(url).get_backend_name() == "sqlite":
+            connect_args = dict(options.get("connect_args", {}))
+            connect_args.setdefault("timeout", 30)
+            options["connect_args"] = connect_args
         self.engine: AsyncEngine = create_async_engine(url, **options)
+        if self.engine.dialect.name == "sqlite":
+            busy_timeout_ms = max(0, int(float(connect_args["timeout"]) * 1000))
+
+            @event.listens_for(self.engine.sync_engine, "connect")
+            def enable_async_sqlite_pragmas(connection, _record):
+                cursor = connection.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+                cursor.close()
         self.session_factory = async_sessionmaker(
             bind=self.engine, class_=AsyncSession, expire_on_commit=False
         )

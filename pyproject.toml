@@ -44,6 +44,7 @@ test = ["pytest>=9.0.3,<10", "aiosqlite>=0.20"]
 async-postgres = ["asyncpg>=0.29"]
 async-mysql = ["asyncmy>=0.2"]
 mongodb = ["pymongo>=4.13,<5"]
+monitoring = ["psutil>=5.9,<8"]
 
 [project.scripts]
 lenora = "lenapi.cli:main"

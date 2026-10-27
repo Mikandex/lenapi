@@ -4,10 +4,11 @@ import hashlib
 import asyncio
 import time
 
-from sqlalchemy import Integer, case, cast, delete, insert, select, update
+from sqlalchemy import Integer, String, case, cast, delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .models import SECURITY_STORE_TABLE
+from .project import project_object_name
 
 
 class SecurityStoreUnavailable(RuntimeError):
@@ -112,7 +113,15 @@ class DatabaseSecurityStore:
         expires = now + window_seconds
         expired = SECURITY_STORE_TABLE.c.expires_at <= now
         updates = {
-            "value": case((expired, "1"), else_=cast(SECURITY_STORE_TABLE.c.value, Integer) + 1),
+            # Keep CASE branches integer-typed for PostgreSQL, then cast the
+            # result back to text for the shared store's value column.
+            "value": cast(
+                case(
+                    (expired, 1),
+                    else_=cast(SECURITY_STORE_TABLE.c.value, Integer) + 1,
+                ),
+                String(64),
+            ),
             "expires_at": case((expired, expires), else_=SECURITY_STORE_TABLE.c.expires_at),
         }
         dialect = self.engine.dialect.name
@@ -242,7 +251,7 @@ class MongoSecurityStore:
 
     def __init__(self, mongodb) -> None:
         self.mongodb = mongodb
-        self.collection = mongodb.collection("lenapi_security_store")
+        self.collection = mongodb.collection(project_object_name("lenapi_security_store"))
 
     @staticmethod
     def _key(key: str) -> str:

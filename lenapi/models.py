@@ -9,16 +9,21 @@ import re
 import uuid
 from urllib.parse import urlsplit
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, Float, ForeignKey, Integer, Interval, JSON, MetaData, Numeric, String, Table, Text, Time, Uuid, UniqueConstraint, and_, delete, func, inspect, or_, select
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, Float, ForeignKey, Integer, Interval, JSON, MetaData, Numeric, String, Table, Text, Time, Uuid, UniqueConstraint, and_, delete, false, func, inspect, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, declared_attr, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, Mapper, declared_attr, mapped_column, object_session, relationship
 from sqlalchemy import event
 
 from .response import HTTPException
+from .project import project_object_name
 
 
 _current_session: ContextVar[Any | None] = ContextVar("lenapi_current_session", default=None)
 _current_async_session: ContextVar[Any | None] = ContextVar("lenapi_current_async_session", default=None)
+_current_atomic_session: ContextVar[Any | None] = ContextVar("lenapi_current_atomic_session", default=None)
+_current_database_backend: ContextVar[str | None] = ContextVar(
+    "lenapi_current_database_backend", default=None
+)
 
 
 class Aggregate:
@@ -55,6 +60,10 @@ SET_NULL = "SET_NULL"
 PROTECT = "PROTECT"
 
 
+class DatabaseBackendMismatch(RuntimeError):
+    """Raised when SQL model operations are attempted with MongoDB selected."""
+
+
 class _CascadePolicy:
     delete = CASCADE
 
@@ -80,9 +89,35 @@ def reset_current_async_session(token) -> None:
     _current_async_session.reset(token)
 
 
+def set_current_atomic_session(session):
+    return _current_atomic_session.set(session)
+
+
+def reset_current_atomic_session(token) -> None:
+    _current_atomic_session.reset(token)
+
+
+def set_current_database_backend(backend: str | None):
+    return _current_database_backend.set(backend)
+
+
+def reset_current_database_backend(token) -> None:
+    _current_database_backend.reset(token)
+
+
 def _session():
     session = _current_session.get()
     if session is None:
+        if _current_database_backend.get() == "mongodb":
+            raise DatabaseBackendMismatch(
+                "This app is configured with DATABASE_TYPE='mongodb', but this operation "
+                "uses a SQL model (model.Model). MongoDB does not provide a SQL session. "
+                "Define the record as a MongoDocument, bind that document class with "
+                "YourDocument.bind(app.mongodb), and use its document API (for example, "
+                "YourDocument.create()). Changing "
+                "DATABASE_TYPE does not convert existing SQL tables or data; migrate that "
+                "data explicitly if you are switching backends."
+            )
         raise RuntimeError("Model queries require an active lenApi request with a configured database")
     return session
 
@@ -90,6 +125,13 @@ def _session():
 def _async_session(session=None):
     session = session or _current_async_session.get()
     if session is None:
+        if _current_database_backend.get() == "mongodb":
+            raise DatabaseBackendMismatch(
+                "This app is configured with DATABASE_TYPE='mongodb', but this operation "
+                "uses a SQL model (model.Model). Use a bound MongoDocument and its async "
+                "document methods instead; changing DATABASE_TYPE does not convert existing "
+                "SQL tables or data."
+            )
         raise RuntimeError(
             "Async model queries require an active lenApi request with an AsyncDatabase, "
             "or an explicit AsyncSession argument"
@@ -711,9 +753,56 @@ class Model(DeclarativeBase):
         "pk": "pk_%(table_name)s",
     })
 
+    @classmethod
+    def __table_cls__(cls, name, metadata, *args, **kwargs):
+        """Namespace model tables and string foreign-key targets."""
+        for item in args:
+            if isinstance(item, Column):
+                for foreign_key in item.foreign_keys:
+                    target = getattr(foreign_key, "_given_tokens", None)
+                    table_name = getattr(target, "table_name", None)
+                    if table_name:
+                        foreign_key._given_tokens = target._replace(
+                            table_name=project_object_name(table_name)
+                        )
+            elif getattr(item, "name", None):
+                item.name = project_object_name(item.name)
+        return Table(project_object_name(name), metadata, *args, **kwargs)
+
     get = _ModelManagerDescriptor()
     aget = _AsyncModelManagerDescriptor()
     adelete = _AsyncDeleteDescriptor()
+
+    def __getattr__(self, name):
+        """Resolve a related model via its conventional ``<name>_id`` field.
+
+        For example, ``tag_id = ForeignKeyField("tag.id")`` also allows
+        ``instance.tag.name`` while preserving ``instance.tag_id`` as the raw
+        foreign-key value.
+        """
+        table = object.__getattribute__(self, "__table__")
+        foreign_key_column = table.columns.get(f"{name}_id")
+        if foreign_key_column is not None and foreign_key_column.foreign_keys:
+            foreign_key = next(iter(foreign_key_column.foreign_keys))
+            target_column = foreign_key.column
+            target_model = next((mapper.class_ for mapper in Model.registry.mappers
+                                 if mapper.local_table is target_column.table), None)
+            if target_model is None:
+                raise AttributeError(
+                    f"No model is registered for relationship '{name}'"
+                )
+            value = object.__getattribute__(self, foreign_key_column.key)
+            if value is None:
+                return None
+            session = object_session(self) or _current_session.get()
+            if session is None:
+                raise AttributeError(
+                    f"Relationship '{name}' requires an active database session"
+                )
+            return session.scalar(
+                select(target_model).where(target_column == value)
+            )
+        return object.__getattribute__(self, name)
 
     @declared_attr
     def id(cls):
@@ -837,7 +926,7 @@ class Model(DeclarativeBase):
         return _TableQuery(cls, limit=limit, offset=offset)
 
     def save(self):
-        """Insert or update this model instance, commit, and refresh it."""
+        """Insert or update this model instance and refresh it."""
         _validate_instance(self)
         session = _session()
         mapper = inspect(type(self))
@@ -864,10 +953,14 @@ class Model(DeclarativeBase):
                 )
         session.add(self)
         try:
-            session.commit()
+            if _current_atomic_session.get() is session:
+                session.flush()
+            else:
+                session.commit()
             session.refresh(self)
         except IntegrityError as exc:
-            session.rollback()
+            if _current_atomic_session.get() is not session:
+                session.rollback()
             raise HTTPException(409, "Duplicate or conflicting data") from exc
         return self
 
@@ -899,10 +992,14 @@ class Model(DeclarativeBase):
                 )
         active_session.add(self)
         try:
-            await active_session.commit()
+            if _current_atomic_session.get() is active_session:
+                await active_session.flush()
+            else:
+                await active_session.commit()
             await active_session.refresh(self)
         except IntegrityError as exc:
-            await active_session.rollback()
+            if _current_atomic_session.get() is not active_session:
+                await active_session.rollback()
             raise HTTPException(409, "Duplicate or conflicting data") from exc
         return self
 
@@ -984,6 +1081,36 @@ def _install_non_negative_constraint(column, table):
     name = f"ck_{table.name}_{column.name}_non_negative"
     if not any(constraint.name == name for constraint in table.constraints):
         table.append_constraint(CheckConstraint(column >= 0, name=name))
+
+
+@event.listens_for(Mapper, "after_mapper_constructed")
+def _prefer_explicit_non_negative_constraint(mapper, model_class):
+    """Avoid emitting an automatic CHECK beside an equivalent explicit one.
+
+    SQLAlchemy attaches mapped columns before applying ``__table_args__``.
+    Therefore the column-attachment listener above cannot see a matching
+    explicit constraint declared in ``__table_args__``. Once mapping is
+    complete, discard only LenAPI's generated copy when that name already
+    belongs to another constraint.
+    """
+    table = mapper.local_table
+    if table is None:
+        return
+
+    checks = [
+        constraint for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    ]
+    generated = [
+        constraint for constraint in checks
+        if constraint.info.get("lenapi_generated_non_negative")
+    ]
+    for constraint in generated:
+        if any(
+            other is not constraint and other.name == constraint.name
+            for other in checks
+        ):
+            table.constraints.discard(constraint)
 
 
 def _field(sql_type: Any, **kwargs):
@@ -1314,9 +1441,15 @@ def ManyToManyField(target, *, table_name: str | None = None, back_populates: st
 
         target_class = target if isinstance(target, type) else None
         target_name = target_class.__name__ if target_class is not None else str(target).rsplit(".", 1)[-1]
-        target_table = getattr(target_class, "__tablename__", target_name.lower())
-        source_table = cls.__tablename__
-        association_name = table_name or f"{source_table}_{field_name}"
+        target_table = (
+            target_class.__table__.name
+            if target_class is not None
+            else project_object_name(target_name.lower())
+        )
+        source_table = project_object_name(cls.__tablename__)
+        association_name = project_object_name(
+            table_name or f"{source_table}_{field_name}"
+        )
         association = cls.metadata.tables.get(association_name)
         if association is None:
             source_pk = next((
@@ -1375,7 +1508,7 @@ def ManyToManyField(target, *, table_name: str | None = None, back_populates: st
 # Shared persistent key/value table for stateful security features. It is part
 # of normal model metadata so `python lenora.py migration` manages its lifecycle.
 SECURITY_STORE_TABLE = Table(
-    "lenapi_security_store",
+    project_object_name("lenapi_security_store"),
     Model.metadata,
     Column("key", String(64), primary_key=True),
     Column("value", Text, nullable=True),
@@ -1385,20 +1518,20 @@ SECURITY_STORE_TABLE = Table(
 # Maps stable external provider subjects to framework users for SocialAuth.
 # This table is framework-owned and included in normal migrations.
 SOCIAL_ACCOUNT_TABLE = Table(
-    "lenapi_social_accounts",
+    project_object_name("lenapi_social_accounts"),
     Model.metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("provider", String(32), nullable=False),
     Column("subject", String(255), nullable=False),
-    Column("user_id", ForeignKey("user.id", ondelete="CASCADE"), nullable=False),
+    Column("user_id", ForeignKey(f"{project_object_name('user')}.id", ondelete="CASCADE"), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
-    UniqueConstraint("provider", "subject", name="uq_lenapi_social_provider_subject"),
+    UniqueConstraint("provider", "subject", name=project_object_name("uq_lenapi_social_provider_subject")),
 )
 
 # Persistent background jobs are filtered from ordinary migrations. The
 # background-worker CLI command opts this table into migration when requested.
 BACKGROUND_JOBS_TABLE = Table(
-    "lenapi_background_jobs",
+    project_object_name("lenapi_background_jobs"),
     Model.metadata,
     Column("job_id", String(36), primary_key=True),
     Column("task_name", String(200), nullable=False, index=True),
@@ -1425,7 +1558,7 @@ class User(Model):
 
 
 class AdminUser(Model):
-    """Framework-owned administrator account for private docs access."""
+    """Framework-owned administrator account for private docs and admin UI."""
 
     __tablename__ = "admin_user"
 
@@ -1433,10 +1566,12 @@ class AdminUser(Model):
     email = EmailField(max_length=254, unique=True, nullable=False)
     password = StringField(max_length=255, nullable=False)
     created_at = FloatField(default=0.0, nullable=False)
+    is_superuser = BooleanField(default=False, nullable=False, server_default=false())
+    permissions = TextField(default="{}", nullable=True)
 
 
 ADMIN_SESSION_TABLE = Table(
-    "lenapi_admin_sessions",
+    project_object_name("lenapi_admin_sessions"),
     Model.metadata,
     Column(
         "session_hash",
@@ -1446,7 +1581,7 @@ ADMIN_SESSION_TABLE = Table(
     Column(
         "admin_user_id",
         Integer,
-        ForeignKey("admin_user.id", ondelete="CASCADE"),
+        ForeignKey(f"{project_object_name('admin_user')}.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     ),

@@ -17,6 +17,7 @@ from .authentication import authentication
 from .auth import SocialAuth
 from .authorization import require_owner, require_permission, require_role
 from .database import AsyncDatabase, Database
+from .transaction import transaction
 from .mongodb import MongoDatabase, MongoDocument, MultipleDocumentsFound
 from .parameters import Body, File
 from .logging import get_logger, logger
@@ -95,7 +96,7 @@ from .security import (
 from . import model
 
 __all__ = [
-    "Application", "LENAPI", "Router", "Depends", "BackgroundTasks", "BackgroundQueue", "Cache", "Faker", "OpenAI", "Ollama", "CORSMiddleware", "DocsAuthMiddleware", "GZipMiddleware", "RequestIDMiddleware", "TimingMiddleware", "require_role", "require_permission", "require_owner", "Database", "AsyncDatabase", "MongoDatabase", "MongoDocument", "MultipleDocumentsFound", "Body", "File", "Model", "AdminUser", "AutoField", "logger", "get_logger", "WebSocket", "WebSocketConnection", "WebSocketDisconnect", "WebSocketService",
+    "Application", "LENAPI", "Router", "Depends", "BackgroundTasks", "BackgroundQueue", "Cache", "Faker", "OpenAI", "Ollama", "CORSMiddleware", "DocsAuthMiddleware", "GZipMiddleware", "RequestIDMiddleware", "TimingMiddleware", "require_role", "require_permission", "require_owner", "Database", "AsyncDatabase", "transaction", "MongoDatabase", "MongoDocument", "MultipleDocumentsFound", "Body", "File", "Model", "AdminUser", "AutoField", "logger", "get_logger", "WebSocket", "WebSocketConnection", "WebSocketDisconnect", "WebSocketService",
     "IntegerField", "PositiveIntegerField", "BigIntField", "BigIntegerField", "PositiveBigIntegerField", "DecimalField", "StringField", "EmailField", "IPField", "PhoneField", "TextField", "UUIDField", "ImageField", "FileField", "FileImageField", "URLField", "BooleanField", "FloatField", "User",
     "DateTimeField", "DateField", "TimeField", "DurationField", "JSONField", "ForeignKeyField", "OneToOneField", "ManyToManyField", "Count", "Sum", "Min", "Max", "Avg", "Request", "UploadFile", "Response", "JSONResponse",
     "HTTPException", "JWTAuth", "APIKeyAuth", "BasicAuth", "CSRFProtect", "SessionAuth", "OpaqueBearerAuth", "HMACAuth", "OIDCAuth", "WebhookAuth", "hmac_request_signature", "session_auth", "opaque_bearer_auth", "hmac_auth", "oidc_auth", "webhook_auth", "create_authenticator", "authentication", "SocialAuth", "hash_password", "verify_password", "make_password", "check_password", "make_api_key", "hash_api_key", "UNSET", "model", "CASCADE", "SET_NULL", "PROTECT", "cascade", "null", "protected",
