@@ -8,6 +8,18 @@ LenAPI aims to reduce repetitive code and simplify common integrations, helping 
 
 **LenAPI — Compact by Design, Powerful by Capability.**
 
+## Feature overview
+
+- Typed HTTP routes with Pydantic request and response validation, Swagger UI, and ReDoc.
+- Synchronous and asynchronous ORM operations, migrations, transactions, search, aggregates, and pagination for SQLite, MySQL, and PostgreSQL. MongoDB document support is currently in beta.
+- Authentication building blocks for JWT, API keys, HTTP Basic, sessions, opaque bearer tokens, HMAC, OIDC, and social sign-in.
+- WebSockets for chat, video signaling, JSON, text, and binary messages; webhook handlers with optional HMAC verification; cache and durable background jobs with retries and delayed execution.
+- Validated public and private file uploads, middleware, throttling, and optional gzip compression.
+- An optional model admin console with explicit model/field allow-lists, per-model permissions, and CPU/RAM/process monitoring.
+- Independent generated projects that can run separately or be mounted under a path in a primary project.
+
+See the [LenAPI documentation](https://lenapi.site/) for setup guides and runnable examples.
+
 ## Python versions
 
 LenAPI is tested and supported on Python 3.11 through 3.14. Python 3.10 reached
@@ -881,6 +893,36 @@ admin.register(Course, fields=("title", "is_active"))
 ```
 
 Per-model permissions for the main project keep their existing model-name keys. Mounted-project permissions use `<project_name>:<model_name>`, for example `games:student`, so same-named models in different projects stay separate.
+
+### Mount independent projects
+
+Every generated project keeps its own settings, models, migrations, and database configuration. Run projects independently on different ports, or mount a sibling project into a primary app at any URL prefix you choose. A mount prefix does not need to match the sibling project's name.
+
+```python
+# win/main.py — primary application
+from lenapi import LENAPI
+
+app = LENAPI()
+app.mount("/gamer", "games")
+```
+
+The sibling project must be in the same parent directory and have its own generated `settings.py` with a `PROJECT_NAME`:
+
+```text
+workspace/
+├── win/
+│   ├── main.py
+│   ├── settings.py
+│   └── app/
+└── games/
+    ├── main.py
+    ├── settings.py
+    └── app/
+```
+
+The mounted app keeps its own database URL and project namespace. Its routes are reachable under `/gamer/`, while its own docs paths are under `/gamer/docs/` and `/gamer/redoc/`. Project table names include the project's namespace so separate apps sharing one database do not collide. Mounting is optional; independent projects can instead run on separate ports or deployments.
+
+For the shared admin console, enable `ADMIN_ENABLED` and create the admin account only in the primary project. Register models explicitly in each project's `app/admin.py`; after mounting, the primary `/admin/` groups those models by project and performs their data operations against each project's configured database. Keep `ADMIN_ENABLED = False` in mounted projects. Each mounted app instance can belong to only one parent admin.
 
 The sample app exposes the model queries as HTTP routes: `POST /classrooms` creates a classroom, `GET /classrooms` lists them, and `POST /students` accepts an optional `classroom_id`. `POST /students/batch` creates multiple students, `PUT /students/batch` updates multiple students by ID, and `DELETE /students/batch` deletes multiple students by ID. Batch requests are all-or-nothing: unknown IDs, duplicate names, or a protected deletion reject the whole operation. `PUT /students/{student_id}` updates one student; it returns HTTP 404 if the ID does not exist. `GET /students/{student_id}/classroom` returns the related classroom. Other student routes list, search, and check existence. These routes appear in Swagger at `/docs/`.
 

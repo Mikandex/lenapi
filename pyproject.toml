@@ -64,5 +64,5 @@ addopts = "-ra"
 [project.urls]
 Homepage = "https://github.com/Mikandex/lenapi"
 Repository = "https://github.com/Mikandex/lenapi"
-Documentation = "https://github.com/Mikandex/lenapi_documentation"
+Documentation = "https://lenapi.site/"
 Issues = "https://github.com/Mikandex/lenapi/issues"
