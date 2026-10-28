@@ -47,7 +47,8 @@ button{{width:100%;margin-top:25px;padding:13px 16px;border:0;border-radius:11px
 class DocsGuard:
     """Persist docs administrators and expiring login sessions in the app DB."""
 
-    def __init__(self, *, database=None, mongodb=None, session_lifetime_seconds=3600):
+    def __init__(self, *, database=None, mongodb=None, session_lifetime_seconds=3600,
+                 project_namespace: str | None = None):
         if database is None and mongodb is None:
             raise ValueError("Private docs access requires a configured database")
         if isinstance(session_lifetime_seconds, bool) or not isinstance(session_lifetime_seconds, int):
@@ -57,6 +58,10 @@ class DocsGuard:
         self.database = database
         self.mongodb = mongodb
         self.session_lifetime_seconds = session_lifetime_seconds
+        self.project_namespace = project_namespace
+
+    def _object_name(self, name: str) -> str:
+        return project_object_name(name, namespace=self.project_namespace)
 
     @staticmethod
     def _session_hash(session_id: str) -> str:
@@ -77,18 +82,18 @@ class DocsGuard:
     def _require_initialized(self) -> None:
         if self.mongodb is not None:
             names = set(self.mongodb.database.list_collection_names())
-            required = {project_object_name("admin_user"), project_object_name("lenapi_admin_sessions")}
+            required = {self._object_name("admin_user"), self._object_name("lenapi_admin_sessions")}
             if not required.issubset(names):
                 raise RuntimeError("Run `python lenora.py migration` before creating an admin user")
-        elif not inspect(self.database.engine).has_table(project_object_name("admin_user")) or not inspect(
+        elif not inspect(self.database.engine).has_table(self._object_name("admin_user")) or not inspect(
             self.database.engine
-        ).has_table(project_object_name("lenapi_admin_sessions")):
+        ).has_table(self._object_name("lenapi_admin_sessions")):
             raise RuntimeError("Run `python lenora.py migration` before creating an admin user")
 
     def _has_admin(self) -> bool:
         if self.mongodb is not None:
-            return self.mongodb.collection(project_object_name("admin_user")).find_one({}, {"_id": 1}) is not None
-        if not inspect(self.database.engine).has_table(project_object_name("admin_user")):
+            return self.mongodb.collection(self._object_name("admin_user")).find_one({}, {"_id": 1}) is not None
+        if not inspect(self.database.engine).has_table(self._object_name("admin_user")):
             return False
         with self.database.engine.connect() as connection:
             return connection.execute(select(AdminUser.id).limit(1)).first() is not None
@@ -96,13 +101,16 @@ class DocsGuard:
     async def has_admin(self) -> bool:
         try:
             return await asyncio.to_thread(self._has_admin)
+        except RuntimeError:
+            # Preserve actionable setup errors such as "run migration first".
+            raise
         except Exception as exc:
             raise RuntimeError("admin account database is unavailable") from exc
 
     def _has_superuser(self) -> bool:
         self._require_initialized()
         if self.mongodb is not None:
-            return self.mongodb.collection(project_object_name("admin_user")).find_one(
+            return self.mongodb.collection(self._object_name("admin_user")).find_one(
                 {"is_superuser": True}, {"_id": 1}
             ) is not None
         with self.database.engine.connect() as connection:
@@ -113,6 +121,9 @@ class DocsGuard:
     async def has_superuser(self) -> bool:
         try:
             return await asyncio.to_thread(self._has_superuser)
+        except RuntimeError:
+            # Do not hide a missing migration behind a generic DB error.
+            raise
         except Exception as exc:
             raise RuntimeError("admin account database is unavailable") from exc
 
@@ -128,7 +139,7 @@ class DocsGuard:
         created_at = time.time()
         try:
             if self.mongodb is not None:
-                result = self.mongodb.collection(project_object_name("admin_user")).insert_one({
+                result = self.mongodb.collection(self._object_name("admin_user")).insert_one({
                     "username": username,
                     "email": email,
                     "password": password_hash,
@@ -164,7 +175,7 @@ class DocsGuard:
     def _authenticate(self, username: str, password: str):
         self._require_initialized()
         if self.mongodb is not None:
-            row = self.mongodb.collection(project_object_name("admin_user")).find_one({"username": username.strip()})
+            row = self.mongodb.collection(self._object_name("admin_user")).find_one({"username": username.strip()})
             if row is None or not check_password(password, row.get("password", "")):
                 return None
             return {"id": str(row["_id"]), "username": row["username"]}
@@ -193,7 +204,7 @@ class DocsGuard:
         now = time.time()
         expires_at = now + self.session_lifetime_seconds
         if self.mongodb is not None:
-            sessions = self.mongodb.collection(project_object_name("lenapi_admin_sessions"))
+            sessions = self.mongodb.collection(self._object_name("lenapi_admin_sessions"))
             sessions.delete_many({"expires_at": {"$lte": now}})
             sessions.insert_one({
                 "_id": digest,
@@ -223,7 +234,7 @@ class DocsGuard:
         digest = self._session_hash(session_id)
         now = time.time()
         if self.mongodb is not None:
-            sessions = self.mongodb.collection(project_object_name("lenapi_admin_sessions"))
+            sessions = self.mongodb.collection(self._object_name("lenapi_admin_sessions"))
             row = sessions.find_one({"_id": digest})
             if row is None:
                 return None
@@ -232,7 +243,7 @@ class DocsGuard:
                 return None
             from .mongodb import _object_id
 
-            admin = self.mongodb.collection(project_object_name("admin_user")).find_one({
+            admin = self.mongodb.collection(self._object_name("admin_user")).find_one({
                 "_id": _object_id(row["admin_user_id"])
             })
             return None if admin is None else {"id": str(admin["_id"]), "username": admin["username"]}
@@ -262,7 +273,7 @@ class DocsGuard:
     def _delete_session(self, session_id: str) -> None:
         digest = self._session_hash(session_id)
         if self.mongodb is not None:
-            self.mongodb.collection(project_object_name("lenapi_admin_sessions")).delete_one({"_id": digest})
+            self.mongodb.collection(self._object_name("lenapi_admin_sessions")).delete_one({"_id": digest})
         else:
             with self.database.engine.begin() as connection:
                 connection.execute(delete(ADMIN_SESSION_TABLE).where(

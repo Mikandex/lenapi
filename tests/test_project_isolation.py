@@ -193,7 +193,7 @@ def test_project_settings_identity_matches_project_directory(tmp_path, monkeypat
         )
 
 
-def test_mount_routes_docs_and_openapi_under_project_prefix():
+def test_mount_routes_docs_and_openapi_under_custom_project_prefix():
     import asyncio
     root = Application(database=False)
     child = Application(database=False)
@@ -203,16 +203,16 @@ def test_mount_routes_docs_and_openapi_under_project_prefix():
     def health():
         return {"project": "games"}
 
-    root.mount("/games", child)
+    root.mount("/gamer", child)
     import httpx
 
     async def fetch():
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=root), base_url="http://test"
         ) as client:
-            response = await client.get("/games/health")
-            docs = await client.get("/games/docs/")
-            schema = await client.get("/games/openapi.json")
+            response = await client.get("/gamer/health")
+            docs = await client.get("/gamer/docs/")
+            schema = await client.get("/gamer/openapi.json")
             return response, docs, schema
 
     response, docs, schema = asyncio.run(fetch())
@@ -220,14 +220,14 @@ def test_mount_routes_docs_and_openapi_under_project_prefix():
     assert response.status_code == 200
     assert response.json() == {"project": "games"}
     assert docs.status_code == 200
-    assert "/games/openapi.json" in docs.text
+    assert "/gamer/openapi.json" in docs.text
     assert schema.status_code == 200
-    assert schema.json()["servers"] == [{"url": "/games"}]
+    assert schema.json()["servers"] == [{"url": "/gamer"}]
 
 
-def test_mount_rejects_project_name_path_mismatch():
+def test_mount_allows_prefix_to_differ_from_project_name():
     root = Application(database=False)
     child = Application(database=False)
     child.project_name = "games"
-    with pytest.raises(ValueError, match="must end with the mounted project's PROJECT_NAME"):
-        root.mount("/other", child)
+    root.mount("/gamer", child)
+    assert root._mounted_apps["/gamer"] is child

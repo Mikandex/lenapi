@@ -1504,8 +1504,34 @@ def ManyToManyField(target, *, table_name: str | None = None, back_populates: st
                     primary_key=True,
                 ),
             )
+        # Resolve string targets by their namespaced table at mapper setup time.
+        # Module strings are still ambiguous when one module is a suffix of
+        # another (for example ``app.models`` and ``games.app.models``).
+        def resolve_relationship_target():
+            matches = [
+                mapper.class_ for mapper in cls.registry.mappers
+                if mapper.local_table.name == target_table
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if not matches:
+                # Preserve support for forward references where the target
+                # model is declared after this model in the same module.
+                matches = [
+                    mapper.class_ for mapper in cls.registry.mappers
+                    if mapper.class_.__module__ == cls.__module__
+                    and mapper.class_.__name__ == target_name
+                ]
+                if len(matches) == 1:
+                    return matches[0]
+            raise LookupError(
+                f"Could not uniquely resolve ManyToManyField target {target_name!r} "
+                f"for table {target_table!r}"
+            )
+
+        relationship_target = target_class or resolve_relationship_target
         return relationship(
-            target if target_class is not None else target_name,
+            relationship_target,
             secondary=association,
             back_populates=back_populates,
             collection_class=_ManyRelatedSet,

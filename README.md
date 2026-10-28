@@ -829,7 +829,7 @@ Create `app/admin.py` to explicitly allow-list models and choose which fields ar
 ```python
 # app/admin.py
 from lenapi.admin import admin
-from app.models import Student, Course, Invoice, Staff
+from .models import Student, Course, Invoice, Staff
 
 admin.register(
     Student,
@@ -867,6 +867,20 @@ python -m pip install 'lenapi[monitoring]'
 ```
 
 The Resource Monitor page shows CPU and RAM metric cards with rolling graphs, plus the LenAPI process PID and thread count. RAM shows process resident memory and total system-memory use. Metrics refresh every two seconds while the page is open; history remains in that browser page only. The endpoint is restricted to superadmins. This is an operational status view, not a host monitoring or alerting system. Monitoring requires psutil and does not start background sampling.
+
+When a main LenAPI project mounts sibling projects, the main project's `/admin/` is the single admin entry point. It groups each mounted project's explicitly registered models under that project's name and reads or updates records through that project's own database. Enable `ADMIN_ENABLED` and create the admin account only in the main project. Keep `ADMIN_ENABLED = False` in mounted projects; they contribute their `app/admin.py` registrations but do not need their own admin login. The mount must be configured with `app.mount(...)` for the main admin to discover that project.
+
+In generated projects, prefer a relative model import in `app/admin.py` so project names and mounts remain unambiguous:
+
+```python
+from lenapi.admin import admin
+from .models import Student, Course
+
+admin.register(Student, fields=("person_name", "course"))
+admin.register(Course, fields=("title", "is_active"))
+```
+
+Per-model permissions for the main project keep their existing model-name keys. Mounted-project permissions use `<project_name>:<model_name>`, for example `games:student`, so same-named models in different projects stay separate.
 
 The sample app exposes the model queries as HTTP routes: `POST /classrooms` creates a classroom, `GET /classrooms` lists them, and `POST /students` accepts an optional `classroom_id`. `POST /students/batch` creates multiple students, `PUT /students/batch` updates multiple students by ID, and `DELETE /students/batch` deletes multiple students by ID. Batch requests are all-or-nothing: unknown IDs, duplicate names, or a protected deletion reject the whole operation. `PUT /students/{student_id}` updates one student; it returns HTTP 404 if the ID does not exist. `GET /students/{student_id}/classroom` returns the related classroom. Other student routes list, search, and check existence. These routes appear in Swagger at `/docs/`.
 

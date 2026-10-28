@@ -6,6 +6,7 @@ import asyncio
 import base64
 import html
 import json
+from pathlib import Path
 import sys
 import threading
 import time
@@ -21,12 +22,6 @@ from .project import project_object_name
 from .response import JSONResponse, Response
 
 
-_INTERNAL_TABLES = {
-    project_object_name(name) for name in (
-        "admin_user", "lenapi_admin_sessions", "lenapi_security_store",
-        "lenapi_background_jobs", "lenapi_social_accounts",
-    )
-}
 _SECRET_COLUMNS = {"password", "api_key", "key_digest", "secret", "client_secret", "token"}
 
 
@@ -160,19 +155,19 @@ async function api(path, opts={{}}){{const headers={{...(opts.headers||{{}})}};i
 function esc(x){{return String(x??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
 function beginBusy(button,label){{if(!button||button.dataset.busy==='true')return ()=>{{}};const original=button.innerHTML;button.dataset.busy='true';button.disabled=true;button.setAttribute('aria-busy','true');button.innerHTML='<span class="button-spinner" aria-hidden="true"></span>'+esc(label||'Working…');return ()=>{{button.innerHTML=original;button.disabled=false;button.removeAttribute('aria-busy');delete button.dataset.busy}}}}
 async function withBusy(button,action,label){{if(button?.dataset.busy==='true')return;const done=beginBusy(button,label);try{{return await action()}}finally{{done()}}}}
-async function loadModels(){{const d=await api('/models');document.getElementById('who').textContent=d.identity.username;document.getElementById('models').innerHTML=d.models.map(m=>`<button data-model="${{esc(m.name)}}">${{esc(m.name)}}</button>`).join('');document.querySelectorAll('[data-model]').forEach(b=>b.onclick=()=>withBusy(b,()=>loadTable(b.dataset.model),'Loading…').catch(err=>{{document.getElementById('heading').textContent=b.dataset.model;document.getElementById('notice').textContent=err.message;document.getElementById('actions').innerHTML='';document.getElementById('table').innerHTML=''}}));document.getElementById('notice').textContent=d.models.length?'Select a model to view records.':(d.has_models?'No models are available to this account. Ask a superadmin to grant view access.':'No models found. Check that your models are declared in app/models.py.');}}
-async function loadTable(name,offset=0){{clearInterval(window.monitorTimer);document.getElementById('monitor-workspace').hidden=true;document.getElementById('admin-workspace').hidden=true;document.getElementById('model-workspace').hidden=false;window.activeModel=name;document.querySelectorAll('[data-model]').forEach(b=>b.classList.toggle('active',b.dataset.model===name));document.getElementById('heading').textContent=name;const limit=50;const d=await api('/models/'+encodeURIComponent(name)+'?limit='+limit+'&offset='+offset);document.getElementById('notice').textContent=d.permissions.join(' · ');document.getElementById('actions').innerHTML='';const rows=d.rows;const page=d.pagination||{{limit,offset,total_count:rows.length,previous_offset:null,next_offset:null}};if(offset>0&&offset>=page.total_count)return loadTable(name,Math.max(0,offset-limit));window.currentOffset=page.offset;window.formFields=d.fields||[];window.primaryKey=d.primary_key;window.lastRows=Object.fromEntries(rows.map(row=>[String(row[d.primary_key]),row]));const start=page.total_count?offset+1:0;const end=Math.min(offset+rows.length,page.total_count);const columns=d.columns||[];const header='<tr><th>Record</th>'+columns.map(field=>'<th>'+esc(field)+'</th>').join('')+'<th>Actions</th></tr>';const body=rows.map((row,index)=>'<tr><td>'+esc(d.display[index])+'</td>'+columns.map(field=>{{const value=row[field];return '<td>'+esc(value&&typeof value==='object'?JSON.stringify(value):value)+'</td>'}}).join('')+'<td>'+(d.permissions.includes('write')?`<button data-edit="${{esc(row[d.primary_key])}}">Edit</button>`:'')+(d.permissions.includes('delete')?`<button data-delete="${{esc(row[d.primary_key])}}">Delete</button>`:'')+'</td></tr>').join('');document.getElementById('table').innerHTML='<table><thead>'+header+'</thead><tbody>'+body+'</tbody></table>'+'<div class="pagination-controls"><button type="button" id="page-previous"'+(page.previous_offset===null?' disabled':'')+'>Previous</button><span>Showing '+start+'–'+end+' of '+page.total_count+'</span><button type="button" id="page-next"'+(page.next_offset===null?' disabled':'')+'>Next</button></div>';document.getElementById('page-previous').onclick=()=>loadTable(name,page.previous_offset).catch(err=>{{document.getElementById('notice').textContent=err.message}});document.getElementById('page-next').onclick=()=>loadTable(name,page.next_offset).catch(err=>{{document.getElementById('notice').textContent=err.message}});document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>edit(b.dataset.edit));document.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>removeRow(b.dataset.delete,b).catch(err=>{{document.getElementById('notice').textContent=err.message}}));}}
+async function loadModels(){{const d=await api('/models');document.getElementById('who').textContent=d.identity.username;const groups=new Map();for(const m of d.models){{if(!groups.has(m.project))groups.set(m.project,{{name:m.project_name,models:[]}});groups.get(m.project).models.push(m)}}document.getElementById('models').innerHTML=[...groups.entries()].map(([project,group])=>'<h3 class="project-heading">'+esc(group.name)+'</h3>'+group.models.map(m=>`<button data-model="${{esc(m.name)}}" data-project="${{esc(m.project)}}" data-permission-key="${{esc(m.permission_key)}}">${{esc(m.name)}}</button>`).join('')).join('');document.querySelectorAll('[data-model]').forEach(b=>b.onclick=()=>withBusy(b,()=>loadTable(b.dataset.model,0,b.dataset.project),'Loading…').catch(err=>{{document.getElementById('heading').textContent=b.dataset.model;document.getElementById('notice').textContent=err.message;document.getElementById('actions').innerHTML='';document.getElementById('table').innerHTML=''}}));document.getElementById('notice').textContent=d.models.length?'Select a model to view records.':(d.has_models?'No models are available to this account. Ask a superadmin to grant view access.':'No models found. Check each project’s app/models.py and app/admin.py.');}}
+async function loadTable(name,offset=0,project=window.activeProject){{clearInterval(window.monitorTimer);document.getElementById('monitor-workspace').hidden=true;document.getElementById('admin-workspace').hidden=true;document.getElementById('model-workspace').hidden=false;window.activeModel=name;window.activeProject=project||document.querySelector(`[data-model="${{CSS.escape(name)}}"]`)?.dataset.project;document.querySelectorAll('[data-model]').forEach(b=>b.classList.toggle('active',b.dataset.model===name&&b.dataset.project===window.activeProject));document.getElementById('heading').textContent=window.activeProject+' / '+name;const limit=50;const d=await api('/models/'+encodeURIComponent(name)+'?project='+encodeURIComponent(window.activeProject)+'&limit='+limit+'&offset='+offset);document.getElementById('notice').textContent=d.permissions.join(' · ');document.getElementById('actions').innerHTML='';const rows=d.rows;const page=d.pagination||{{limit,offset,total_count:rows.length,previous_offset:null,next_offset:null}};if(offset>0&&offset>=page.total_count)return loadTable(name,Math.max(0,offset-limit),window.activeProject);window.currentOffset=page.offset;window.formFields=d.fields||[];window.primaryKey=d.primary_key;window.lastRows=Object.fromEntries(rows.map(row=>[String(row[d.primary_key]),row]));const start=page.total_count?offset+1:0;const end=Math.min(offset+rows.length,page.total_count);const columns=d.columns||[];const header='<tr><th>Record</th>'+columns.map(field=>'<th>'+esc(field)+'</th>').join('')+'<th>Actions</th></tr>';const body=rows.map((row,index)=>'<tr><td>'+esc(d.display[index])+'</td>'+columns.map(field=>{{const value=row[field];return '<td>'+esc(value&&typeof value==='object'?JSON.stringify(value):value)+'</td>'}}).join('')+'<td>'+(d.permissions.includes('write')?`<button data-edit="${{esc(row[d.primary_key])}}">Edit</button>`:'')+(d.permissions.includes('delete')?`<button data-delete="${{esc(row[d.primary_key])}}">Delete</button>`:'')+'</td></tr>').join('');document.getElementById('table').innerHTML='<table><thead>'+header+'</thead><tbody>'+body+'</tbody></table>'+'<div class="pagination-controls"><button type="button" id="page-previous"'+(page.previous_offset===null?' disabled':'')+'>Previous</button><span>Showing '+start+'–'+end+' of '+page.total_count+'</span><button type="button" id="page-next"'+(page.next_offset===null?' disabled':'')+'>Next</button></div>';document.getElementById('page-previous').onclick=()=>loadTable(name,page.previous_offset,window.activeProject).catch(err=>{{document.getElementById('notice').textContent=err.message}});document.getElementById('page-next').onclick=()=>loadTable(name,page.next_offset,window.activeProject).catch(err=>{{document.getElementById('notice').textContent=err.message}});document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>edit(b.dataset.edit));document.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>removeRow(b.dataset.delete,b).catch(err=>{{document.getElementById('notice').textContent=err.message}}));}}
 function renderField(field,value){{const id='record-field-'+field.name;const label=esc(field.name);const required=field.required?' required':'';const current=value==null?'':value;if(field.readonly)return '<label>'+label+'<input id="'+esc(id)+'" value="'+esc(current)+'" readonly></label>';if(field.kind==='boolean')return '<label>'+label+'<input id="'+esc(id)+'" name="'+label+'" type="checkbox" data-kind="boolean"'+(value?' checked':'')+'></label>';if(field.kind==='json')return '<label>'+label+'<textarea id="'+esc(id)+'" name="'+label+'" data-kind="json"'+required+'>'+esc(current===''?'{{}}':JSON.stringify(value,null,2))+'</textarea></label>';const inputType=field.kind==='integer'||field.kind==='number'?'number':field.kind;return '<label>'+label+'<input id="'+esc(id)+'" name="'+label+'" type="'+esc(inputType)+'" data-kind="'+esc(field.kind)+'"'+(field.max_length?' maxlength="'+field.max_length+'"':'')+(field.step?' step="'+field.step+'"':'')+(field.max!==null?' max="'+esc(field.max)+'"':'')+(field.min!==null?' min="'+esc(field.min)+'"':'')+' value="'+esc(current)+'"'+required+'></label>'}}
 function edit(id){{if(!id)return;const dlg=document.getElementById('editor');const record=window.lastRows?.[id];if(!record)return;document.getElementById('edit-title').textContent='Edit record';document.getElementById('record-fields').innerHTML=window.formFields.map(field=>renderField(field,record[field.name])).join('');document.getElementById('record-error').textContent='';dlg.dataset.id=id;dlg.showModal()}}
-async function removeRow(id,button){{if(!confirm('Delete this record?'))return;return withBusy(button,async()=>{{await api('/models/'+encodeURIComponent(activeModel)+'/'+encodeURIComponent(id),{{method:'DELETE'}});await loadTable(activeModel,window.currentOffset||0)}},'Deleting…')}}
+async function removeRow(id,button){{if(!confirm('Delete this record?'))return;return withBusy(button,async()=>{{await api('/models/'+encodeURIComponent(activeModel)+'/'+encodeURIComponent(id)+'?project='+encodeURIComponent(window.activeProject),{{method:'DELETE'}});await loadTable(activeModel,window.currentOffset||0,window.activeProject)}},'Deleting…')}}
 document.getElementById('cancel-editor')?.addEventListener('click',()=>document.getElementById('editor').close());
-document.querySelector('#record-form')?.addEventListener('submit',async e=>{{e.preventDefault();const error=document.getElementById('record-error');const done=beginBusy(e.submitter||document.getElementById('save'),'Saving…');error.textContent='';try{{const value={{}};for(const field of window.formFields){{if(field.readonly)continue;const input=document.getElementById('record-field-'+field.name);if(field.kind==='boolean'){{value[field.name]=input.checked;continue}}const raw=input.value;if(raw===''){{if(field.required)throw new Error(field.name+' is required');if(field.nullable&&!field.has_default)value[field.name]=null;continue}}if(field.kind==='json')value[field.name]=JSON.parse(raw);else if(field.kind==='integer')value[field.name]=Number(raw);else value[field.name]=raw}}const id=document.getElementById('editor').dataset.id;if(!id)throw new Error('Select a record to edit.');delete value[window.primaryKey];await api('/models/'+encodeURIComponent(activeModel)+'/'+encodeURIComponent(id),{{method:'PATCH',body:JSON.stringify(value)}});document.getElementById('editor').close();await loadTable(activeModel,window.currentOffset||0)}}catch(err){{error.textContent=err.message}}finally{{done()}}}});
+document.querySelector('#record-form')?.addEventListener('submit',async e=>{{e.preventDefault();const error=document.getElementById('record-error');const done=beginBusy(e.submitter||document.getElementById('save'),'Saving…');error.textContent='';try{{const value={{}};for(const field of window.formFields){{if(field.readonly)continue;const input=document.getElementById('record-field-'+field.name);if(field.kind==='boolean'){{value[field.name]=input.checked;continue}}const raw=input.value;if(raw===''){{if(field.required)throw new Error(field.name+' is required');if(field.nullable&&!field.has_default)value[field.name]=null;continue}}if(field.kind==='json')value[field.name]=JSON.parse(raw);else if(field.kind==='integer')value[field.name]=Number(raw);else value[field.name]=raw}}const id=document.getElementById('editor').dataset.id;if(!id)throw new Error('Select a record to edit.');delete value[window.primaryKey];await api('/models/'+encodeURIComponent(activeModel)+'/'+encodeURIComponent(id)+'?project='+encodeURIComponent(window.activeProject),{{method:'PATCH',body:JSON.stringify(value)}});document.getElementById('editor').close();await loadTable(activeModel,window.currentOffset||0,window.activeProject)}}catch(err){{error.textContent=err.message}}finally{{done()}}}});
 document.getElementById('logout')?.addEventListener('click',()=>{{adminAuthorization='';location.reload()}});
 window.monitorHistory={{cpu:[],ram:[]}};function drawChart(id,values,color){{const canvas=document.getElementById(id);if(!canvas)return;const rect=canvas.getBoundingClientRect();const ratio=window.devicePixelRatio||1;canvas.width=Math.max(1,Math.floor(rect.width*ratio));canvas.height=Math.max(1,Math.floor(rect.height*ratio));const ctx=canvas.getContext('2d');ctx.scale(ratio,ratio);const w=rect.width,h=rect.height;ctx.clearRect(0,0,w,h);ctx.strokeStyle='#e8edf4';ctx.lineWidth=1;for(let i=1;i<=3;i++){{const y=h*i/4;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}}if(values.length<2)return;const max=Math.max(...values,1);const min=Math.min(0,...values);ctx.strokeStyle=color;ctx.lineWidth=2.5;ctx.lineJoin='round';ctx.beginPath();values.forEach((value,index)=>{{const x=index*(w/(values.length-1));const y=h-5-((value-min)/(max-min||1))*(h-10);if(index===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)}});ctx.stroke();ctx.lineTo(w,h);ctx.lineTo(0,h);ctx.closePath();ctx.globalAlpha=.1;ctx.fillStyle=color;ctx.fill();ctx.globalAlpha=1}}
 async function refreshMonitor(){{try{{const d=await api('/monitor');document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-process-value').textContent=d.process_memory_mb+' MB';document.getElementById('ram-system-value').textContent='System RAM '+d.system_memory_percent+'%';document.getElementById('process-value').textContent='PID '+d.pid+' · '+d.thread_count+' threads';document.getElementById('process-name').textContent=d.process_name||'LenAPI process';document.getElementById('monitor-updated').textContent='Updated '+new Date().toLocaleTimeString();document.getElementById('monitor-error').textContent='';window.monitorHistory.cpu.push(Number(d.cpu_percent)||0);window.monitorHistory.ram.push(Number(d.process_memory_mb)||0);window.monitorHistory.cpu=window.monitorHistory.cpu.slice(-30);window.monitorHistory.ram=window.monitorHistory.ram.slice(-30);drawChart('cpu-chart',window.monitorHistory.cpu,'#2563eb');drawChart('ram-chart',window.monitorHistory.ram,'#7c3aed')}}catch(err){{document.getElementById('monitor-error').textContent=err.message}}}}
 document.getElementById('monitor')?.addEventListener('click',e=>withBusy(e.currentTarget,async()=>{{document.getElementById('model-workspace').hidden=true;document.getElementById('admin-workspace').hidden=true;document.getElementById('monitor-workspace').hidden=false;await refreshMonitor();clearInterval(window.monitorTimer);window.monitorTimer=setInterval(refreshMonitor,2000)}},'Loading…').catch(err=>{{document.getElementById('monitor-error').textContent=err.message}}));
-function permissionMatrix(containerId,permissions){{const container=document.getElementById(containerId);const models=[...document.querySelectorAll('#models [data-model]')].map(button=>button.dataset.model);const capabilities=['view','read','write','delete'];container.innerHTML=models.map(name=>'<div class="permission-row"><strong>'+esc(name)+'</strong>'+capabilities.map(cap=>'<label><input type="checkbox" data-model="'+esc(name)+'" data-capability="'+cap+'"'+(permissions?.[name]?.[cap]?' checked':'')+'> '+cap+'</label>').join('')+'</div>').join('')||'<p>No application models were discovered.</p>'}}
-function readPermissionMatrix(containerId){{const permissions={{}};document.querySelectorAll('#'+containerId+' [data-capability]').forEach(input=>{{const model=input.dataset.model;permissions[model]??={{}};permissions[model][input.dataset.capability]=input.checked}});return permissions}}
+function permissionMatrix(containerId,permissions){{const container=document.getElementById(containerId);const models=[...document.querySelectorAll('#models [data-model]')].map(button=>({{name:button.dataset.model,key:button.dataset.permissionKey,project:button.dataset.project}}));const capabilities=['view','read','write','delete'];container.innerHTML=models.map(m=>'<div class="permission-row"><strong>'+esc(m.project)+' / '+esc(m.name)+'</strong>'+capabilities.map(cap=>'<label><input type="checkbox" data-permission-key="'+esc(m.key)+'" data-capability="'+cap+'"'+(permissions?.[m.key]?.[cap]?' checked':'')+'> '+cap+'</label>').join('')+'</div>').join('')||'<p>No registered application models were discovered.</p>'}}
+function readPermissionMatrix(containerId){{const permissions={{}};document.querySelectorAll('#'+containerId+' [data-permission-key][data-capability]').forEach(input=>{{const model=input.dataset.permissionKey;permissions[model]??={{}};permissions[model][input.dataset.capability]=input.checked}});return permissions}}
 async function loadAdmins(){{const notice=document.getElementById('admin-notice');try{{const d=await api('/admins');const select=document.getElementById('managed-admin');select.innerHTML='<option value="">Choose an administrator</option>'+d.admins.map(a=>`<option value="${{esc(a.id)}}">${{esc(a.username)}}${{a.is_superuser?' (superadmin)':''}}</option>`).join('');document.getElementById('admin-table').innerHTML='<table><thead><tr><th>Username</th><th>Email</th><th>Role</th></tr></thead><tbody>'+d.admins.map(a=>'<tr><td>'+esc(a.username)+'</td><td>'+esc(a.email)+'</td><td>'+(a.is_superuser?'Superadmin':'Admin')+'</td></tr>').join('')+'</tbody></table>';notice.textContent=d.admins.length+' administrator(s)';window.adminRows=Object.fromEntries(d.admins.map(a=>[String(a.id),a]));permissionMatrix('create-permission-matrix',{{}});permissionMatrix('edit-permission-matrix',{{}})}}catch(err){{notice.textContent=err.message}}}}
 document.getElementById('admins')?.addEventListener('click',e=>withBusy(e.currentTarget,async()=>{{clearInterval(window.monitorTimer);document.getElementById('model-workspace').hidden=true;document.getElementById('monitor-workspace').hidden=true;document.getElementById('admin-workspace').hidden=false;await loadAdmins()}},'Loading…'));
 document.getElementById('back-to-models')?.addEventListener('click',()=>{{document.getElementById('admin-workspace').hidden=true;document.getElementById('model-workspace').hidden=false}});
@@ -197,12 +192,26 @@ class AdminConsole:
 
     def _models(self):
         registered = self._registered_models()
+        namespace = (getattr(self.app, "project_namespace", None) or "").strip().lower()
+        prefix = f"{namespace}_" if namespace else ""
+
+        def public_name(name):
+            return name[len(prefix):] if prefix and name.startswith(prefix) else name
+
+        def is_project_model(name):
+            # Keep each project's admin scoped to its own namespaced tables.
+            return not prefix or name.startswith(prefix)
+
+        internal_names = {
+            "admin_user", "lenapi_admin_sessions", "lenapi_security_store",
+            "lenapi_background_jobs", "lenapi_social_accounts",
+        }
         if self.app.mongodb is not None:
             from importlib import import_module
             from .mongodb import MongoDocument
 
             try:
-                module = import_module("app.models")
+                module = self._import_project_module("app.models")
             except ModuleNotFoundError as exc:
                 if exc.name not in {"app", "app.models"}:
                     raise
@@ -216,7 +225,9 @@ class AdminConsole:
             for module_name, candidate_module in tuple(sys.modules.items()):
                 if candidate_module is None:
                     continue
-                if (module_name == "main" or module_name.startswith("app.")):
+                package = self._project_package()
+                if (module_name == "main" or module_name.startswith("app.")
+                        or (package and module_name.startswith(f"{package}.app."))):
                     modules[module_name] = candidate_module
             result = {}
             for candidate_module in modules.values():
@@ -225,22 +236,26 @@ class AdminConsole:
                             and issubclass(model, MongoDocument)):
                         model.bind(self.app.mongodb)
                         name = model._collection_name()
-                        if name not in _INTERNAL_TABLES and not name.startswith("lenapi_"):
-                            result[name] = model
+                        clean_name = public_name(name)
+                        if (is_project_model(name) and clean_name not in internal_names
+                                and not clean_name.startswith("lenapi_")):
+                            result[clean_name] = model
             return self._apply_registration(result, registered)
         result = {}
         for mapper in Model.registry.mappers:
             model = mapper.class_
             table = mapper.local_table
-            if table.name not in _INTERNAL_TABLES and not table.name.startswith("lenapi_"):
-                result[table.name] = table
+            clean_name = public_name(table.name)
+            if (is_project_model(table.name) and clean_name not in internal_names
+                    and not clean_name.startswith("lenapi_")):
+                result[clean_name] = table
         # Explicitly load and inspect the generated project model module too.
         # This makes the admin model list independent of import ordering and
         # covers projects where models are not yet present in the registry
         # when the AdminConsole instance is created.
         from importlib import import_module
         try:
-            module = import_module("app.models")
+            module = self._import_project_module("app.models")
         except ModuleNotFoundError as exc:
             if exc.name not in {"app", "app.models"}:
                 raise
@@ -251,16 +266,52 @@ class AdminConsole:
                         or not issubclass(candidate, Model)):
                     continue
                 table = candidate.__table__
-                if table.name not in _INTERNAL_TABLES and not table.name.startswith("lenapi_"):
-                    result[table.name] = table
+                clean_name = public_name(table.name)
+                if (is_project_model(table.name) and clean_name not in internal_names
+                        and not clean_name.startswith("lenapi_")):
+                    result[clean_name] = table
         return self._apply_registration(result, registered)
 
-    @staticmethod
-    def _registered_models():
-        """Load app/admin.py when present; its registry becomes an allow-list."""
+    def _project_package(self):
+        """Return the import package that owns this app, if it has one."""
+        for module_name, module in tuple(sys.modules.items()):
+            if getattr(module, "app", None) is self.app:
+                package, separator, _module = module_name.rpartition(".")
+                if separator:
+                    return package
+                return None
+        project_dir = getattr(self.app, "project_dir", None)
+        project_name = getattr(self.app, "project_name", None)
+        if project_dir is not None and project_name:
+            if Path(project_dir).resolve() != Path.cwd().resolve():
+                return project_name
+        return None
+
+    def _import_project_module(self, module_name):
+        """Import a generated project's module without resolving another app's ``app`` package."""
         from importlib import import_module
+
+        package = self._project_package()
+        if not package:
+            return import_module(module_name)
+        project_dir = getattr(self.app, "project_dir", None)
+        parent = str(Path(project_dir).resolve().parent) if project_dir else None
+        inserted = bool(parent and parent not in sys.path)
+        if inserted:
+            sys.path.insert(0, parent)
         try:
-            module = import_module("app.admin")
+            return import_module(f"{package}.{module_name}")
+        finally:
+            if inserted:
+                try:
+                    sys.path.remove(parent)
+                except ValueError:
+                    pass
+
+    def _registered_models(self):
+        """Load app/admin.py when present; its registry becomes an allow-list."""
+        try:
+            module = self._import_project_module("app.admin")
         except ModuleNotFoundError as exc:
             if exc.name not in {"app", "app.admin"}:
                 raise
@@ -268,7 +319,48 @@ class AdminConsole:
         registry = getattr(module, "admin", None)
         if not isinstance(registry, AdminRegistry):
             raise TypeError("app/admin.py must import `admin` from lenapi.admin")
-        return dict(registry.items())
+        namespace = (getattr(self.app, "project_namespace", None) or "").strip().lower()
+        prefix = f"{namespace}_" if namespace else ""
+        return {
+            name[len(prefix):] if prefix and name.startswith(prefix) else name: options
+            for name, options in registry.items()
+            if not prefix or name.startswith(prefix)
+        }
+
+    @staticmethod
+    def _project_name(app):
+        return (getattr(app, "project_name", None)
+                or getattr(app, "project_namespace", None)
+                or "main")
+
+    def _project_admins(self):
+        """Return this app and every mounted app, each with its own admin console."""
+        projects = []
+        seen = set()
+
+        def visit(app, console, mount_path=""):
+            name = self._project_name(app)
+            key = str(name).strip().lower()
+            if key in seen:
+                raise RuntimeError(f"Duplicate mounted project name {name!r}")
+            seen.add(key)
+            projects.append({
+                "key": key,
+                "name": str(name),
+                "console": console,
+                "mount_path": mount_path,
+                "models": console._models(),
+            })
+            for prefix, child in getattr(app, "_mounted_apps", {}).items():
+                visit(child, child.admin_console, mount_path + prefix)
+
+        visit(self.app, self)
+        return projects
+
+    @staticmethod
+    def _permission_key(project_key, model_name, *, primary=False):
+        # Keep existing primary-project permission records compatible.
+        return model_name if primary else f"{project_key}:{model_name}"
 
     @staticmethod
     def _apply_registration(discovered, registered):
@@ -363,13 +455,13 @@ class AdminConsole:
     def _response(self, status, detail):
         return JSONResponse({"detail": detail}, status_code=status)
 
-    async def dispatch(self, scope, receive):
+    async def dispatch(self, scope, receive, *, identity_override=None, internal=False):
         path = scope.get("path", "")
         method = scope.get("method", "GET").upper()
         base = self.path
         if path not in {base, base + "/"} and not path.startswith(base + "/api/" ):
             return None
-        if not self.app.admin_enabled:
+        if not internal and (self.app._admin_parent is not None or not self.app.admin_enabled):
             return self._response(404, "Not found")
         from .request import Request
         req = Request(scope, receive, max_body_size=self.app.max_request_body_size,
@@ -414,17 +506,35 @@ class AdminConsole:
             return JSONResponse({"authenticated": True, "identity": {
                 "username": identity["username"], "root": identity["root"]
             }})
-        identity = await asyncio.to_thread(self._identity, req.headers.get("authorization", ""))
+        identity = identity_override
+        if identity is None:
+            identity = await asyncio.to_thread(self._identity, req.headers.get("authorization", ""))
         if identity is None:
             return self._response(401, "Admin sign in required")
         if endpoint == "/logout" and method == "POST":
             return JSONResponse({"logged_out": True})
         if endpoint == "/models" and method == "GET":
-            available_models = sorted(self._models())
-            models = [{"name": name} for name in available_models
-                      if identity["root"] or self._has(identity, name, "view")]
+            models = []
+            projects = self._project_admins()
+            for index, project in enumerate(projects):
+                for name in sorted(project["models"]):
+                    permission_key = self._permission_key(
+                        project["key"], name, primary=index == 0
+                    )
+                    if identity["root"] or self._has(identity, permission_key, "view"):
+                        models.append({
+                            "name": name,
+                            "project": project["key"],
+                            "project_name": project["name"],
+                            "permission_key": permission_key,
+                        })
             return JSONResponse({"identity": {"username": identity["username"]},
-                                 "models": models, "has_models": bool(available_models)})
+                                 "models": models,
+                                 "has_models": any(project["models"] for project in projects),
+                                 "projects": [
+                                     {"key": project["key"], "name": project["name"]}
+                                     for project in projects
+                                 ]})
         if endpoint == "/monitor" and method == "GET":
             if not self.monitor:
                 return self._response(404, "Resource monitoring is disabled")
@@ -518,6 +628,30 @@ class AdminConsole:
             return JSONResponse({"updated": changed})
 
         parts = endpoint.strip("/").split("/")
+        if len(parts) >= 2 and parts[0] == "models":
+            project_key = (req.query_params.get("project") or
+                           str(self._project_name(self.app)).strip().lower())
+            projects = self._project_admins()
+            project_index = next((i for i, project in enumerate(projects)
+                                  if project["key"] == project_key), None)
+            if project_index is None:
+                return self._response(404, "Project not found")
+            if project_index:
+                project = projects[project_index]
+                local_permissions = {}
+                for name in project["models"]:
+                    key = self._permission_key(project["key"], name)
+                    permission = identity["permissions"].get(key, {})
+                    if isinstance(permission, dict):
+                        local_permissions[name] = permission
+                child_identity = {**identity, "permissions": local_permissions}
+                child_scope = dict(scope)
+                child_scope["path"] = project["console"].path + "/api/" + endpoint.lstrip("/")
+                response = await project["console"].dispatch(
+                    child_scope, receive, identity_override=child_identity, internal=True
+                )
+                return response
+            # Primary project keeps the historical permission key (model name).
         if len(parts) >= 2 and parts[0] == "models":
             model_name = parts[1]
             spec = self._models().get(model_name)

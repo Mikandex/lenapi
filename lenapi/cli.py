@@ -109,49 +109,11 @@ TOKEN = {
     "ISSUER": API_TITLE,
 }
 ''',
-    "project_context.py": '''"""Validate project identity before importing LenAPI."""
-
-import os
-from pathlib import Path
-import re
-
-
-def configure_project_context(source_file, settings_module):
-    project_dir = Path(source_file).resolve().parent
-    project_name = settings_module.PROJECT_NAME
-    if not isinstance(project_name, str) or not project_name.isidentifier():
-        raise RuntimeError("settings.PROJECT_NAME must be a valid Python identifier")
-    if project_name.lower() == "lenora":
-        raise RuntimeError("'lenora' is reserved for the LenAPI framework")
-    if project_name != project_dir.name:
-        raise RuntimeError(
-            f"PROJECT_NAME {project_name!r} must match project directory "
-            f"{project_dir.name!r}"
-        )
-    namespace = settings_module.PROJECT_NAMESPACE
-    if not isinstance(namespace, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,29}", namespace.lower()):
-        raise RuntimeError("PROJECT_NAMESPACE must be a valid database namespace of at most 30 characters")
-    os.environ["LENAPI_PROJECT_NAME"] = project_name
-    os.environ["LENAPI_PROJECT_NAMESPACE"] = namespace.lower()
-''',
     "main.py": '''"""Application routes."""
 
-if __package__:
-    from . import settings
-    from .project_context import configure_project_context
-else:
-    import settings
-    from project_context import configure_project_context
+from lenapi_bootstrap import create_app
 
-configure_project_context(__file__, settings)
-
-from lenapi import LENAPI
-if __package__:
-    from .app import models  # Import models so migrations can discover them.
-else:
-    from app import models
-
-app = LENAPI(settings=settings)
+app = create_app(__file__, __package__)
 
 
 @app.get("/")
@@ -195,7 +157,7 @@ When this file has no registrations, the console exposes no application models.
 from lenapi.admin import admin
 
 # Example:
-# from app.models import Student
+# from .models import Student
 #
 # admin.register(
 #     Student,
@@ -206,17 +168,10 @@ from lenapi.admin import admin
 ''',
     "lenora.py": '''"""Project-local command launcher."""
 
-import sys
-from pathlib import Path
-from project_context import configure_project_context
-import settings
+from lenapi_bootstrap import configure_project
+configure_project(__file__)
 
-project_dir = Path(__file__).resolve().parent
-configure_project_context(__file__, settings)
-sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != project_dir]
-sys.path.insert(0, str(project_dir.parent))
 from lenapi.cli import main
-sys.path.insert(0, str(project_dir))
 
 
 if __name__ == "__main__":
@@ -277,9 +232,13 @@ config = context.config
 def include_migration_object(obj, name, type_, reflected, compare_to):
     if type_ == "table" and name == project_object_name("lenapi_background_jobs"):
         return config.attributes.get("lenapi_include_background_jobs", False)
-    namespace = project_namespace()
-    if type_ == "table" and reflected and namespace and not name.startswith(f"{namespace}_"):
+    namespace = config.attributes.get("lenapi_project_namespace") or project_namespace()
+    if type_ == "table" and namespace and not name.startswith(f"{namespace}_"):
         return False
+    if type_ != "table" and namespace:
+        table = getattr(obj, "table", None)
+        if table is not None and not table.name.startswith(f"{namespace}_"):
+            return False
     # A newer LenApi naming convention can assign a name to a unique
     # constraint that an older database already has unnamed. Treat matching
     # column sets as the same constraint instead of generating a duplicate.
@@ -424,6 +383,31 @@ def _run_registered_background_worker(module_name: str, app) -> None:
         raise TypeError("the app's queue/background_queue must be a lenApi BackgroundQueue")
     import asyncio
     asyncio.run(queue.run_worker())
+
+
+def _mounted_app_reload_dirs(app_import_string: str, fallback: Path) -> list[str]:
+    """Return project directories Uvicorn should watch for mounted app changes."""
+    module_name, separator, attribute_path = app_import_string.partition(":")
+    if not separator:
+        raise ValueError("ASGI app must use an import string such as 'main:app'")
+    application = import_module(module_name)
+    for attribute in attribute_path.split(".") if attribute_path else []:
+        application = getattr(application, attribute)
+
+    directories: set[Path] = set()
+    visited: set[int] = set()
+
+    def collect(current):
+        if id(current) in visited:
+            return
+        visited.add(id(current))
+        project_dir = getattr(current, "project_dir", None)
+        directories.add(Path(project_dir).resolve() if project_dir else fallback.resolve())
+        for mounted in getattr(current, "_mounted_apps", {}).values():
+            collect(mounted)
+
+    collect(application)
+    return [str(path) for path in sorted(directories)]
 
 
 def _main() -> None:
@@ -843,7 +827,15 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         except ImportError:
             parser.error("run requires Uvicorn; install LenApi with `python -m pip install lenapi`")
         print(f"lenApi server: http://{args.host}:{args.port}", flush=True)
-        uvicorn.run(args.app, host=args.host, port=args.port, reload=args.reload)
+        run_options = {}
+        if args.reload:
+            try:
+                run_options["reload_dirs"] = _mounted_app_reload_dirs(args.app, Path.cwd())
+            except (ImportError, AttributeError, OSError, ValueError) as exc:
+                parser.error(f"could not inspect mounted apps for reload: {exc}")
+        uvicorn.run(
+            args.app, host=args.host, port=args.port, reload=args.reload, **run_options
+        )
         return
 
     try:
@@ -869,7 +861,18 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     for attribute in attribute_path.split(".") if attribute_path else []:
         app = getattr(app, attribute)
 
-    namespace = project_namespace()
+    # The application settings are authoritative. The environment can contain
+    # a namespace left by another mounted/imported project in this process, so
+    # do not classify this project's migration files using that stale value.
+    configured_namespace = getattr(app, "project_namespace", None)
+    namespace = (
+        configured_namespace.strip().lower()
+        if isinstance(configured_namespace, str) and configured_namespace.strip()
+        else project_namespace()
+    )
+    if namespace:
+        os.environ["LENAPI_PROJECT_NAMESPACE"] = namespace
+    config.attributes["lenapi_project_namespace"] = namespace
     version_table = project_object_name("alembic_version")
 
     def confirm_project_orphans(names, kind):
@@ -901,7 +904,19 @@ def test_http_endpoint_is_registered_and_documented(method, path):
                 username, email, password, is_superuser=is_first_admin
             )
         except (ValueError, RuntimeError) as exc:
-            parser.error(str(exc))
+            message = str(exc)
+            cause = exc.__cause__
+            if cause is not None:
+                # Include the actionable DBAPI detail (for example, a missing
+                # table) while redacting credentials in any URL-like text.
+                import re
+
+                cause_detail = str(cause).splitlines()[0]
+                cause_detail = re.sub(
+                    r"(?i)(://[^:/\s]+:)[^@/\s]+@", r"\1***@", cause_detail
+                )
+                message = f"{message} ({type(cause).__name__}: {cause_detail})"
+            parser.error(message)
         print("Administrator account created successfully.")
         if app.mongodb is not None:
             import asyncio
@@ -1026,7 +1041,22 @@ def test_http_endpoint_is_registered_and_documented(method, path):
                 ):
                     continue
                 table_name = node.args[0].value
-                if not table_name.startswith(f"{namespace}_"):
+                # Projects may share a database while retaining independent
+                # namespaced migrations (for example testinglenapi_win_* and
+                # testinglenapi_games_*). Those are foreign project objects,
+                # not unsafe pre-namespace revisions.
+                project_name = getattr(app, "project_name", None)
+                namespace_root = (
+                    namespace[:-(len(project_name) + 1)] + "_"
+                    if project_name and namespace.endswith(f"_{project_name}")
+                    else None
+                )
+                is_other_project_namespace = bool(
+                    namespace_root
+                    and table_name.startswith(namespace_root)
+                    and not table_name.startswith(f"{namespace}_")
+                )
+                if not table_name.startswith(f"{namespace}_") and not is_other_project_namespace:
                     legacy_create_tables.append((path.name, table_name))
         if legacy_create_tables:
             affected = ", ".join(
@@ -1148,8 +1178,12 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     def include_migration_object(obj, name, type_, reflected, compare_to):
         if type_ == "table" and name == project_object_name("lenapi_background_jobs"):
             return config.attributes.get("lenapi_include_background_jobs", False)
-        if type_ == "table" and reflected and namespace and not name.startswith(f"{namespace}_"):
+        if type_ == "table" and namespace and not name.startswith(f"{namespace}_"):
             return False
+        if type_ != "table" and namespace:
+            table = getattr(obj, "table", None)
+            if table is not None and not table.name.startswith(f"{namespace}_"):
+                return False
         if type_ == "unique_constraint" and not reflected:
             table = getattr(obj, "table", None)
             columns = tuple(column.name for column in getattr(obj, "columns", ()))

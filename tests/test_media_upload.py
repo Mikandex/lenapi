@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import stat
 
 from lenapi import Application, AsyncDatabase, Database, File, Model, StringField, UploadFile
 from lenapi.service import WebSocket
@@ -133,6 +135,24 @@ def test_upload_with_existing_filename_does_not_replace_file(tmp_path):
         raise AssertionError("save_image should refuse to overwrite an existing path")
 
     assert destination.read_bytes() == original
+
+
+def test_private_upload_is_not_readable_by_other_local_users(tmp_path):
+    if os.name != "posix":
+        return
+
+    private_root = tmp_path / "private"
+    upload = UploadFile(
+        "private.png",
+        "image/png",
+        PNG_BYTES,
+        private_media_root=private_root,
+    )
+
+    filename = asyncio.run(upload.save("profiles", private=True))
+    mode = stat.S_IMODE((private_root / "profiles" / filename).stat().st_mode)
+
+    assert mode & 0o077 == 0
 
 
 def test_media_serving_rejects_paths_outside_media_root(tmp_path):

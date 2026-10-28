@@ -98,7 +98,9 @@ class UploadFile:
         destination.mkdir(parents=True, exist_ok=True)
         return destination
 
-    async def _write(self, directory: str | Path, safe_name: str) -> str:
+    async def _write(
+        self, directory: str | Path, safe_name: str, *, private: bool = False
+    ) -> str:
         root = Path(directory).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         destination = (root / safe_name).resolve()
@@ -108,7 +110,10 @@ class UploadFile:
         def write_exclusive() -> None:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
             try:
-                fd = os.open(destination, flags, 0o644)
+                # Private media must not be readable by other local accounts.
+                # The process umask may further restrict either permission set.
+                mode = 0o600 if private else 0o644
+                fd = os.open(destination, flags, mode)
             except FileExistsError as exc:
                 raise ValueError("A file with this filename already exists") from exc
             try:
@@ -196,7 +201,7 @@ class UploadFile:
 
         directory_path = self._directory(root, directory)
         safe_name = self._safe_name(self.filename) if keep_filename else f"{uuid.uuid4().hex}{extension}"
-        return await self._write(directory_path, safe_name)
+        return await self._write(directory_path, safe_name, private=private)
 
     async def save_image(self, directory: str | Path, *, filename: str | None = None) -> str:
         """Validate common image signatures and save safely; return the filename."""

@@ -277,7 +277,8 @@ class Application(Router):
                  admin_enabled: bool = False, admin_url: str = "/admin/",
                  admin_session_lifetime_seconds: int = 3600,
                  admin_cookie_secure: bool | None = None,
-                 admin_monitoring_enabled: bool = False) -> None:
+                 admin_monitoring_enabled: bool = False,
+                 project_namespace: str | None = None) -> None:
         if session_factory is not None and database is not None:
             raise ValueError("Pass either session_factory or database, not both")
         if not isinstance(debug, bool):
@@ -338,6 +339,7 @@ class Application(Router):
         self.docs_login_window_seconds = docs_login_window_seconds
         self._docs_login_attempts: dict[str, tuple[float, int]] = {}
         self._docs_login_lock = threading.Lock()
+        self.project_namespace = project_namespace
         if self.safe_guard_docs_url and self.docs_url is None:
             raise ValueError("SAFE_GUARD_DOCS_URL requires DOCS_URL to be enabled")
         self.docs_guard = (
@@ -345,6 +347,7 @@ class Application(Router):
                 database=self.database,
                 mongodb=self.mongodb,
                 session_lifetime_seconds=docs_session_lifetime_seconds,
+                project_namespace=project_namespace,
             )
             if self.database is not None or self.mongodb is not None
             else None
@@ -376,6 +379,7 @@ class Application(Router):
         self.user_middleware: list[tuple[type, dict[str, Any]]] = []
         self._middleware_stack = None
         self._mounted_apps: dict[str, Application] = {}
+        self._admin_parent: Application | None = None
         self.security_storage = (security_storage or ip_flag_backend or "memory").lower()
         self.security_store = create_security_store(
             self.security_storage,
@@ -408,27 +412,44 @@ class Application(Router):
             self._middleware_stack = app
         await self._middleware_stack(scope, receive, send)
 
-    def mount(self, path: str, app: "Application") -> None:
-        """Mount an independent LenAPI app at its matching project path."""
+    def mount(self, path: str, app: "Application | str") -> None:
+        """Mount an independent LenAPI app at any chosen URL prefix.
+
+        Pass an application instance, or the name of a sibling generated
+        project (for example ``app.mount("/gamer", "games")``).
+        """
         if not isinstance(path, str) or not path.startswith("/"):
-            raise ValueError("mount path must be an absolute path such as '/games'")
+            raise ValueError("mount path must be an absolute path such as '/gamer'")
         normalized = "/" + path.strip("/")
         if normalized == "/" or "?" in normalized or "#" in normalized:
-            raise ValueError("mount path must be a named absolute path such as '/games'")
+            raise ValueError("mount path must be a named absolute path such as '/gamer'")
+        if isinstance(app, str):
+            if not app.isidentifier() or app.lower() == "lenora":
+                raise ValueError("mounted project must be a valid project name")
+            project_dir = getattr(self, "project_dir", None)
+            if project_dir is None:
+                raise ValueError(
+                    "mounting a project name requires an app created by the generated "
+                    "LenAPI project bootstrap"
+                )
+            from lenapi_bootstrap import load_project_app
+
+            child_dir = project_dir.parent / app
+            if not child_dir.is_dir():
+                raise ValueError(f"mounted project directory does not exist: {child_dir}")
+            app = load_project_app(child_dir)
         if not isinstance(app, Application):
-            raise TypeError("mount expects another LENAPI application")
+            raise TypeError("mount expects another LENAPI application or a sibling project name")
         project_name = getattr(app, "project_name", None)
         if not project_name:
             raise ValueError("mounted application must define PROJECT_NAME in its settings")
-        if normalized.rsplit("/", 1)[-1] != project_name:
-            raise ValueError(
-                f"mount path {normalized!r} must end with the mounted project's "
-                f"PROJECT_NAME {project_name!r}"
-            )
         if normalized in self._mounted_apps:
             raise ValueError(f"an application is already mounted at {normalized!r}")
         if app is self:
             raise ValueError("an application cannot mount itself")
+        if app._admin_parent is not None and app._admin_parent is not self:
+            raise ValueError("a mounted application can have only one parent admin")
+        app._admin_parent = self
         self._mounted_apps[normalized] = app
 
     async def _dispatch_mounted_app(self, scope, receive, send) -> bool:
@@ -1266,6 +1287,13 @@ class LENAPI(Application):
                     raise
                 project_settings = None
 
+        if project_settings is not None:
+            project_dir = getattr(project_settings, "BASE_DIR", None)
+            if project_dir is not None and getattr(project_settings, "PROJECT_NAME", None):
+                from .project import configure_project_from_settings
+
+                configure_project_from_settings(project_settings, project_dir)
+
         configured_database = database
         configured_async_database = async_database
         configured_mongodb = mongodb
@@ -1398,9 +1426,14 @@ class LENAPI(Application):
             ),
             admin_monitoring_enabled=(admin_monitoring_enabled if admin_monitoring_enabled is not None else
                                       getattr(project_settings, "ADMIN_MONITORING_ENABLED", False)),
+            project_namespace=getattr(project_settings, "PROJECT_NAMESPACE", None),
         )
         self.project_name = getattr(project_settings, "PROJECT_NAME", None)
         self.project_namespace = getattr(project_settings, "PROJECT_NAMESPACE", None)
+        self.project_dir = (
+            Path(getattr(project_settings, "BASE_DIR", Path.cwd())).resolve()
+            if project_settings is not None else None
+        )
         if project_settings is not None:
             from .authentication import install_default_authentication
 
