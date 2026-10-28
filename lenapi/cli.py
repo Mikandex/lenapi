@@ -909,8 +909,6 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             if cause is not None:
                 # Include the actionable DBAPI detail (for example, a missing
                 # table) while redacting credentials in any URL-like text.
-                import re
-
                 cause_detail = str(cause).splitlines()[0]
                 cause_detail = re.sub(
                     r"(?i)(://[^:/\s]+:)[^@/\s]+@", r"\1***@", cause_detail
