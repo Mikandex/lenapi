@@ -116,6 +116,7 @@ def jwt_auth(settings, user_model=None, *, identifier_field="username", password
         refresh_token_lifetime_seconds=token.get("REFRESH_LIFETIME_SECONDS", 60 * 60 * 24 * 30),
         issuer=token.get("ISSUER"),
         security_store=security_store,
+        login_field=identifier_field,
         authenticate=(
             _user_authenticator(user_model, identifier_field, password_field)
             if user_model is not None else None
@@ -149,20 +150,38 @@ def webhook(secret, *, tolerance_seconds=300, nonce_store=None):
     return WebhookAuth(secret, tolerance_seconds=tolerance_seconds, nonce_store=nonce_store)
 
 
-def configure(settings, user_model=None, *, security_store=None, api_key_field=None):
+def configure(
+    settings,
+    user_model=None,
+    *,
+    security_store=None,
+    api_key_field=None,
+    identifier_field=None,
+    password_field="password",
+):
     """Build the primary authenticator selected by ``settings.AUTHENTICATION``."""
     if user_model is None:
         from .models import User
 
         user_model = User
     mode = getattr(settings, "AUTHENTICATION", "jwt").lower()
-    identifier_field = getattr(settings, "BASIC_AUTH_FIELD", "username")
+    identifier_field = identifier_field or getattr(settings, "BASIC_AUTH_FIELD", "username")
     if mode == "basic_login":
-        return basic(user_model, identifier_field=identifier_field)
+        return basic(
+            user_model,
+            identifier_field=identifier_field,
+            password_field=password_field,
+        )
     if mode == "api_key":
         return api_key(user_model, field=api_key_field or "api_key")
     if mode == "jwt":
-        return jwt_auth(settings, user_model, security_store=security_store)
+        return jwt_auth(
+            settings,
+            user_model,
+            identifier_field=identifier_field,
+            password_field=password_field,
+            security_store=security_store,
+        )
     if mode == "session":
         options = getattr(settings, "SESSION", {})
         return session(store=security_store, cookie_name=options.get("COOKIE_NAME", "lenapi_session"))
@@ -181,7 +200,16 @@ def configure(settings, user_model=None, *, security_store=None, api_key_field=N
     raise ValueError(f"Unknown AUTHENTICATION mode: {mode}")
 
 
-def authentication_type(auth_type, *, settings, user_model=None, api_key_field=None, app=None):
+def authentication_type(
+    auth_type,
+    *,
+    settings,
+    user_model=None,
+    api_key_field=None,
+    identifier_field=None,
+    password_field="password",
+    app=None,
+):
     """Create the authenticator selected by a project settings module.
 
     ``auth_type`` may be ``"jwt"``, ``"api_key"``, ``"basic_login``,
@@ -208,16 +236,29 @@ def authentication_type(auth_type, *, settings, user_model=None, api_key_field=N
         user_model,
         security_store=getattr(app, "security_store", None),
         api_key_field=api_key_field,
+        identifier_field=identifier_field,
+        password_field=password_field,
     )
     return authenticator
 
 
-def authentication(type="jwt", *, settings=None, user_model=None, api_key_field=None, app=None):
+def authentication(
+    type="jwt",
+    *,
+    settings=None,
+    user_model=None,
+    api_key_field=None,
+    identifier_field=None,
+    password_field="password",
+    app=None,
+):
     """Create a route authentication dependency from project settings.
 
     By default, ``settings`` is imported from the current project and the
-    framework's built-in ``User`` model is used. Pass explicit values when
-    configuring authentication outside a generated project.
+    framework's built-in ``User`` model is used. ``identifier_field`` selects
+    the database field used for JWT/Basic login; for JWT it also names the
+    identifier property in the token endpoint's JSON body. Pass the actual
+    LENAPI instance as ``app`` to share its security store.
     """
     if settings is None:
         try:
@@ -233,6 +274,8 @@ def authentication(type="jwt", *, settings=None, user_model=None, api_key_field=
         settings=settings,
         user_model=user_model,
         api_key_field=api_key_field,
+        identifier_field=identifier_field,
+        password_field=password_field,
         app=app,
     )
 

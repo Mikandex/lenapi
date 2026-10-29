@@ -681,7 +681,8 @@ class Application(Router):
                 hint = (
                     "Run `python lenora.py migration` to create or update the security store table."
                     if self.security_storage == "database"
-                    else "Install `lenapi[redis]` and check REDIS_URL and Redis availability."
+                    else "Install the Redis extra in the environment running LenAPI with "
+                    "`python -m pip install 'lenapi[redis]'`, then check REDIS_URL and Redis availability."
                 )
                 response = JSONResponse(
                     {"detail": f"Security storage is unavailable. {hint}"}, status_code=503

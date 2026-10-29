@@ -373,7 +373,7 @@ app.include_router(api)
 
 Rate strings accept seconds, minutes, hours, or days, for example `"10/second"`, `"60/minute"`, and `"1000/day"`. Throttling uses a fixed window that starts with the first request. `ip` counts every request from the client address before authentication. `anonymous` counts public calls and, on routes using `auth=`, all requests from that IP before credentials are verified. This intentionally includes successful logins so repeated password checks are stopped before they consume CPU. `authenticated` counts successful route-level authentication by a stable identity returned from `auth=`. Routes using `BasicAuth` receive a default `ip` limit of 10 requests per minute if no pre-auth `ip` or `anonymous` limit is configured. Set `throttle={}` to deliberately disable the inherited and default limit. Route and router `throttle=` values otherwise override inherited limits; an empty mapping disables inherited limits for that route or router. Endpoint-only auth declared with `Depends(...)` does not supply the identity to the authenticated quota; attach it with `auth=` when you want identity-based quotas.
 
-When a quota is exceeded, LenAPI returns `429 Too Many Requests` with `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers. Quota counters use the same security backend as IP cooldowns. Choose `SECURITY_STORAGE = "database"` or `"redis"` in project `settings.py`. Database mode stores state in the internal `lenapi_security_store` table or MongoDB collection, initialized by migrations. Redis mode uses `REDIS_URL` and requires `pip install 'lenapi[redis]'` plus a running Redis server. The generated settings default to database storage and include `REDIS_URL = "redis://127.0.0.1:6379/0"` for switching to Redis. Shared database or Redis storage coordinates limits across workers. `SECURITY_STORAGE = "memory"` keeps counters in each process, so use it only for single-process development. LenAPI uses the ASGI connection's client address and does not trust forwarded-IP headers automatically; configure trusted proxy handling at your deployment edge before relying on IP quotas behind a proxy.
+When a quota is exceeded, LenAPI returns `429 Too Many Requests` with `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers. Quota counters use the same security backend as IP cooldowns. Choose `SECURITY_STORAGE = "database"` or `"redis"` in project `settings.py`. Database mode stores state in the internal `lenapi_security_store` table or MongoDB collection, initialized by migrations. Redis mode uses `REDIS_URL` and requires `python -m pip install 'lenapi[redis]'` plus a running Redis server. Run the install command with the same Python environment that starts LenAPI; keep the quotes around the extra in zsh. The generated settings default to database storage and include `REDIS_URL = "redis://127.0.0.1:6379/0"` for switching to Redis. Shared database or Redis storage coordinates limits across workers. `SECURITY_STORAGE = "memory"` keeps counters in each process, so use it only for single-process development. LenAPI uses the ASGI connection's client address and does not trust forwarded-IP headers automatically; configure trusted proxy handling at your deployment edge before relying on IP quotas behind a proxy.
 
 For example, app-level limits are inherited by routes that do not set their own throttle. A route-specific mapping replaces the inherited mapping, so repeat any global scopes that you still want on that route:
 
@@ -1037,7 +1037,31 @@ app.include_router(public)
 
 The framework-backed JWT authenticator checks the submitted username and password against the database `User` model and its stored password hash. `POST /auth/token` accepts `{"username": "...", "password": "..."}` and returns an access token plus a refresh token. Send the access token as `Authorization: Bearer <access_token>`. `POST /auth/refresh` accepts `{"refresh_token": "..."}` and returns replacement tokens. The token and refresh routes are intentionally hidden from Swagger; protected API routes still show their Bearer scheme and Swagger's **Authorize** control. These routes have a default IP limit of 10 requests per minute, including failed credential checks; pass `throttle={"ip": "5/minute"}` to `jwt.router(...)` for a different limit. In production, use shared `SECURITY_STORAGE = "database"` or `"redis"` for refresh replay protection across workers. Refresh tokens are single-use; the in-memory fallback coordinates only within one process.
 
-For a custom user table, create the JWT dependency with `authentication("jwt", user_model=YourUser)`. Basic and JWT can use your model as long as it has the selected identifier column and a `password` column containing LenAPI-compatible password hashes. For Basic, select the identifier with `BASIC_AUTH_FIELD`. Or configure `JWTAuth` with an `authenticate(username, password)` callback. That callback must verify a password hash and return the user's string ID, `(string_id, claims)`, or `None`. `JWTAuth` signs and verifies HS256 tokens, checks expiry and configured issuer, and rejects refresh tokens when used as access tokens. Keep the signing key secret and serve credentials only over HTTPS.
+For a custom user table, create the JWT dependency with `authentication("jwt", user_model=YourUser)`. Basic and JWT can use your model as long as it has the selected identifier column and a `password` column containing LenAPI-compatible password hashes. For Basic, select the identifier with `BASIC_AUTH_FIELD`. JWT defaults to the `username` column; pass `identifier_field="email"` (or another model column) to use a different login identifier. That field name is also used in the `/auth/token` JSON body. Pass the actual `LENAPI` instance with `app=app` when you want refresh-token replay protection to use its shared security store; do not pass a `Router` there.
+
+For example, a custom model with `email` and a hashed `password` can sign in using `{"email": "ada@example.com", "password": "..."}`:
+
+```python
+from lenapi_bootstrap import create_app
+from lenapi import Depends, authentication
+
+app = create_app(__file__, __package__)
+from app.models import Customer
+auth = authentication(
+    "jwt",
+    user_model=Customer,
+    identifier_field="email",
+    app=app,
+)
+
+app.include_router(auth.router())  # POST /auth/token and POST /auth/refresh
+
+@app.get("/profile", auth=auth)
+def profile(identity=Depends(auth)):
+    return {"customer_id": identity["sub"]}
+```
+
+`Customer` must define an `email` column and a `password` column containing a LenAPI-compatible password hash. Your registration or provisioning flow is responsible for collecting the email and storing the password hash. `JWTAuth` signs and verifies HS256 tokens, checks expiry and configured issuer, and rejects refresh tokens when used as access tokens. Keep the signing key secret and serve credentials only over HTTPS.
 
 ## API-key authentication
 

@@ -188,7 +188,11 @@ class RedisSecurityStore:
         try:
             from redis.asyncio import Redis
         except ImportError as exc:
-            raise ValueError("Redis security storage requires `pip install lenapi[redis]`") from exc
+            raise ValueError(
+                "Redis security storage requires the Redis extra. Install it in the same "
+                "environment that runs LenAPI with: `python -m pip install 'lenapi[redis]'`. "
+                "Keep the quotes around the extra in zsh."
+            ) from exc
         self.client = Redis.from_url(url, decode_responses=True)
 
     @staticmethod

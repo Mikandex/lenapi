@@ -1016,6 +1016,46 @@ def test_authentication_factory_modes_and_database_user_password_helpers():
     assert callable(register_user)
 
 
+def test_jwt_custom_identifier_uses_email_for_lookup_and_token_request(monkeypatch):
+    class EmailAuthCustomer(Model):
+        email = StringField(max_length=254, unique=True)
+        password = StringField(max_length=255)
+
+    from lenapi import authentication
+
+    settings = SimpleNamespace(
+        AUTHENTICATION="jwt",
+        TOKEN={"SECRET_KEY": "e" * 32},
+    )
+    auth = authentication(
+        "jwt",
+        settings=settings,
+        user_model=EmailAuthCustomer,
+        identifier_field="email",
+    )
+    lookups = []
+
+    class QueryResult:
+        def get(self):
+            return SimpleNamespace(id=17, password="encoded-password")
+
+    def fake_get(cls, **filters):
+        lookups.append(filters)
+        return QueryResult()
+
+    auth_module = importlib.import_module("lenapi.authentication")
+    monkeypatch.setattr(EmailAuthCustomer, "get", classmethod(fake_get))
+    monkeypatch.setattr(auth_module, "check_password", lambda raw, encoded: encoded == "encoded-password")
+
+    assert auth.authenticate("ada@example.com", "secret") == "17"
+    assert lookups == [{"email": "ada@example.com"}]
+
+    token_router = auth.router()
+    token_route = next(route for route in token_router.routes if route.path == "/auth/token")
+    credentials_model = token_route.endpoint.__annotations__["credentials"]
+    assert set(credentials_model.model_fields) == {"email", "password"}
+
+
 def test_custom_model_api_key_field_is_required_validated_and_used(monkeypatch):
     class CustomerForAPIKey(Model):
         username = StringField(max_length=64, unique=True)

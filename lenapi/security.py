@@ -12,7 +12,7 @@ import threading
 import time
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 from .concurrency import call_sync_or_async
 from .request import Request
@@ -117,6 +117,7 @@ class JWTAuth:
         issuer: str | None = None,
         authenticate=None,
         security_store=None,
+        login_field: str = "username",
     ) -> None:
         key = secret_key.encode("utf-8") if isinstance(secret_key, str) else secret_key
         if not isinstance(key, bytes) or len(key) < 32:
@@ -125,12 +126,15 @@ class JWTAuth:
             raise ValueError("token_lifetime_seconds must be positive")
         if refresh_token_lifetime_seconds <= 0:
             raise ValueError("refresh_token_lifetime_seconds must be positive")
+        if not isinstance(login_field, str) or not login_field.isidentifier() or login_field == "password":
+            raise ValueError("login_field must be a valid model field name other than 'password'")
         self.secret_key = key
         self.token_lifetime_seconds = token_lifetime_seconds
         self.refresh_token_lifetime_seconds = refresh_token_lifetime_seconds
         self.issuer = issuer
         self.authenticate = authenticate
         self.security_store = security_store
+        self.login_field = login_field
         self._refresh_namespace = hashlib.sha256(key).hexdigest()[:32]
         self._used_refresh_tokens: dict[str, float] = {}
         self._refresh_lock = threading.Lock()
@@ -229,15 +233,16 @@ class JWTAuth:
                security_store=None):
         """Build `/auth/token` and `/auth/refresh` routes for an app.
 
-        `authenticate(username, password)` may be supplied here or when
-        constructing the instance. It must return the user's string ID, or
+        `authenticate(identifier, password)` may be supplied here or when
+        constructing the instance. The identifier field name is controlled by
+        `login_field`. The callback must return the user's string ID, or
         `(string_id, claims)`, when credentials are valid; otherwise return None.
         """
         from .application import Router
 
         authenticate = authenticate or self.authenticate
         if authenticate is None:
-            raise ValueError("JWT token routes require an authenticate(username, password) callback")
+            raise ValueError("JWT token routes require an authenticate(identifier, password) callback")
 
         # Keep password verification endpoints rate-limited even when the app
         # has no global throttle configured. An empty mapping explicitly opts
@@ -245,14 +250,21 @@ class JWTAuth:
         token_throttle = {"ip": "10/minute"} if throttle is None else throttle
         refresh_store = security_store if security_store is not None else self.security_store
         router = Router(prefix="/auth")
+        credentials_model = create_model(
+            f"JWTTokenCredentials_{self.login_field}",
+            **{
+                self.login_field: (str, Field(min_length=1)),
+                "password": (str, Field(min_length=1)),
+            },
+        )
 
         @router.post("/token", include_in_schema=False, throttle=token_throttle)
-        async def issue_token(credentials: _Credentials):
+        async def issue_token(credentials: credentials_model):
             user = await call_sync_or_async(
-                authenticate, credentials.username, credentials.password
+                authenticate, getattr(credentials, self.login_field), credentials.password
             )
             if user is None or user is False:
-                raise HTTPException(401, "Invalid username or password")
+                raise HTTPException(401, "Invalid login credentials")
             if isinstance(user, tuple) and len(user) == 2:
                 subject, claims = user
             else:
