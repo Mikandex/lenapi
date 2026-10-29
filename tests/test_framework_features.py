@@ -143,6 +143,38 @@ def test_lenapi_is_the_only_public_application_class():
     app.database.close()
 
 
+def test_malformed_json_returns_400_instead_of_server_error():
+    app = make_app()
+
+    class Payload(BaseModel):
+        phone_number: str
+
+    @app.post("/payload")
+    def payload(data: Payload):
+        return {"phone_number": data.phone_number}
+
+    valid_status, _, valid_body = asgi_request(
+        app,
+        "/payload",
+        method="POST",
+        body=b'{"phone_number": "08099448550"}',
+        headers=[(b"content-type", b"application/json")],
+    )
+    assert valid_status == 200
+    assert json.loads(valid_body) == {"phone_number": "08099448550"}
+
+    status, _, body = asgi_request(
+        app,
+        "/payload",
+        method="POST",
+        body=b'{"phone_number": 08099448550}',
+        headers=[(b"content-type", b"application/json")],
+    )
+    assert status == 400
+    assert json.loads(body) == {"detail": "Malformed JSON request body"}
+    app.database.close()
+
+
 def test_multiple_routers_validation_response_models_and_openapi_visibility():
     class Input(BaseModel):
         name: str
@@ -690,6 +722,8 @@ def test_model_fields_defaults_uuid_unique_indexes_and_all_crud_helpers(tmp_path
         assert FeatureRecord.get(name="Ada").get().info == {"active": True}
         assert FeatureRecord.get_or_404(name="Grace").amount == Decimal("25.00")
         assert FeatureRecord.get(name="missing").exists() is False
+        assert FeatureRecord.filter(group="math").exists() is True
+        assert FeatureRecord.filter(group="missing").exists() is False
         assert FeatureRecord.get_or_create(name="Ada")[1] is False
         assert FeatureRecord.get_or_create({"group": "logic"}, name="Turing")[0].group == "logic"
         assert FeatureRecord.create_update({"amount": Decimal("13")}, name="Ada").amount == Decimal("13")
@@ -836,7 +870,7 @@ def test_new_fields_validate_values_and_default_temporal_fields(tmp_path):
     db = Database(f"sqlite:///{tmp_path / 'new-model-fields.db'}")
     tables = [
         PositiveFieldRecord.__table__, TimestampDurationRecord.__table__,
-        UniqueMessageRecord.__table__,
+        UniqueMessageRecord.__table__, ValidatedFieldRecord.__table__,
     ]
     Model.metadata.create_all(db.engine, tables=tables)
     session = db.session()
@@ -853,6 +887,12 @@ def test_new_fields_validate_values_and_default_temporal_fields(tmp_path):
         assert isinstance(record.created_time, time_type)
         assert isinstance(record.created_at, datetime)
         assert record.trial_period == timedelta(days=7)
+
+        local_phone = ValidatedFieldRecord.create(
+            email="local@example.com", phone="08099448550", address="127.0.0.1",
+            website="https://example.com", public_id=uuid.uuid4(),
+        )
+        assert local_phone.phone == "08099448550"
 
         UniqueMessageRecord.create(email="ada@example.com")
         with pytest.raises(HTTPException) as duplicate:

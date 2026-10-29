@@ -372,6 +372,10 @@ class _QuerySet:
         row = result.mappings().first()
         return None if row is None else dict(row)
 
+    def exists(self) -> bool:
+        """Return whether this query matches at least one row."""
+        return self.first() is not None
+
     def one_or_none(self):
         """Return the sole matching row, or raise if the lookup is ambiguous."""
         result = _session().execute(self._statement())
@@ -1234,7 +1238,12 @@ def IPField(max_length: int = 45, **kwargs):
 
 
 def PhoneField(max_length: int = 18, **kwargs):
-    """Declare a string column intended for an international phone number."""
+    """Declare a string phone column accepting international or local numbers.
+
+    International values begin with ``+`` and a country code. Local values may
+    begin with ``0`` (for example, ``"08099448550"``). Store phone numbers as
+    strings so leading zeroes are preserved.
+    """
     info = dict(kwargs.pop("info", {}) or {})
     info["lenapi_validation"] = "phone"
     return _field(String(max_length), info=info, **kwargs)
@@ -1337,8 +1346,14 @@ def _validate_instance(instance):
             valid = isinstance(value, str) and re.fullmatch(r"[^\s@]+@[^\s@]+", value) is not None
             message = _validation_error(column, rule, "Enter a valid email address")
         elif rule == "phone":
-            valid = isinstance(value, str) and re.fullmatch(r"\+[1-9][0-9]{0,16}", value) is not None
-            message = _validation_error(column, rule, "Phone must start with + and contain at most 18 digits")
+            valid = isinstance(value, str) and re.fullmatch(
+                r"(?:\+[1-9][0-9]{0,16}|0[0-9]{7,17})", value
+            ) is not None
+            message = _validation_error(
+                column,
+                rule,
+                "Enter a phone number with +country code or a local number starting with 0 (up to 18 digits)",
+            )
         elif rule == "ip":
             try:
                 ipaddress.ip_address(value)

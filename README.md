@@ -1875,7 +1875,7 @@ student = Student.create(
 
 `DateField`, `TimeField`, and `DateTimeField` default to the current UTC date or time when no value or explicit default is supplied. Pass `auto_add_now=False` to disable this behavior, or provide your own `default`. `DurationField(weeks=1)` stores a fixed seven-day `timedelta`; add it to a timestamp when calculating an expiry date. Months and years are calendar intervals and should use calendar-aware date arithmetic.
 
-`PositiveIntegerField` and `PositiveBigIntegerField` reject negative values in LenAPI and add a named database `CHECK` constraint, so direct SQL writes are protected too. `EmailField`, `PhoneField`, `IPField`, `URLField`, and `UUIDField` validate values when a model instance is saved. `PhoneField` accepts a leading `+` followed by country code and digits, up to 18 characters total. `IPField` accepts IPv4 and IPv6. `URLField` accepts `http://`, `https://`, and `www.` URLs. Customize messages with `error_messages`, for example `email = model.EmailField(error_messages={"email": "This is not an email"})`; `unique` is also a supported message key for a unique field.
+`PositiveIntegerField` and `PositiveBigIntegerField` reject negative values in LenAPI and add a named database `CHECK` constraint, so direct SQL writes are protected too. `EmailField`, `PhoneField`, `IPField`, `URLField`, and `UUIDField` validate values when a model instance is saved. `PhoneField` accepts either a `+` country-code number or a local number beginning with `0`, up to 18 characters. Declare phone numbers as strings and send them quoted in JSON so leading zeroes are preserved; bare JSON numbers such as `08099448550` are invalid JSON. `IPField` accepts IPv4 and IPv6. `URLField` accepts `http://`, `https://`, and `www.` URLs. Customize messages with `error_messages`, for example `email = model.EmailField(error_messages={"email": "This is not an email"})`; `unique` is also a supported message key for a unique field.
 
 The base model supplies an auto-incrementing integer `id`. A model may declare its own primary key instead; LenAPI will not add a second `id` key:
 
@@ -2054,7 +2054,14 @@ async_total = async_page.total_count
 async_pages = async_page.page_count
 ```
 
-`Student.get.all()` returns all rows synchronously; its async counterpart is `await Student.aget.all()`. For filtered async lists, use `await Student.afilter(...).all()`. `Student.get(...)` builds a single-row lookup; call `.get()` for the model instance or `.exists()` for a boolean. The async single-row counterpart is `await Student.aget(...)`, and its existence check is `await Student.aget(...).exists()`. Multiple matches are an error rather than an arbitrary row selection. `Student.get("field", ...).get(...)` selects one or more columns; one selected column returns a scalar and multiple columns return a mapping. This is a query projection, not a uniqueness constraint. To make the database reject duplicates, declare `unique=True` on the field.
+`Student.get.all()` returns all rows synchronously; its async counterpart is `await Student.aget.all()`. For filtered lists, use `Student.filter(...).all()` or `await Student.afilter(...).all()`. Both sync and async filtered querysets support existence checks:
+
+```python
+has_python_students = Student.filter(course="Python").exists()
+has_python_students_async = await Student.afilter(course="Python").exists()
+```
+
+`Student.get(...)` builds a single-row lookup; call `.get()` for the model instance or `.exists()` for a boolean. The async single-row counterpart is `await Student.aget(...)`, and its existence check is `await Student.aget(...).exists()`. Multiple matches are an error rather than an arbitrary row selection. `Student.get("field", ...).get(...)` selects one or more columns; one selected column returns a scalar and multiple columns return a mapping. This is a query projection, not a uniqueness constraint. To make the database reject duplicates, declare `unique=True` on the field.
 
 ### Fetch related records
 

@@ -332,7 +332,12 @@ class Request:
         return self._body
 
     async def json(self):
-        return json.loads((await self.body()).decode("utf-8"))
+        """Parse a JSON request body, returning HTTP 400 for malformed JSON."""
+        try:
+            text = (await self.body()).decode("utf-8")
+            return json.loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(400, "Malformed JSON request body") from exc
 
     async def form(self) -> dict[str, str | UploadFile | list[str | UploadFile]]:
         """Parse URL-encoded or multipart form data, including file uploads."""
