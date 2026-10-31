@@ -879,7 +879,7 @@ class Model(DeclarativeBase):
         """Return the single matching row, or raise an HTTP 404 exception."""
         instance = cls.get(**filters).get()
         if instance is None:
-            raise HTTPException(404, f"{cls.__name__} not found")
+            raise HTTPException(404, "Not found")
         return instance
 
     @classmethod
@@ -887,7 +887,7 @@ class Model(DeclarativeBase):
         """Async counterpart to get_or_404()."""
         instance = await cls.aget(session=session, **filters)
         if instance is None:
-            raise HTTPException(404, f"{cls.__name__} not found")
+            raise HTTPException(404, "Not found")
         return instance
 
     @classmethod

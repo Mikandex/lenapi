@@ -721,6 +721,10 @@ def test_model_fields_defaults_uuid_unique_indexes_and_all_crud_helpers(tmp_path
         assert one.id == 1 and isinstance(one.public_id, uuid.UUID) and one.active is True
         assert FeatureRecord.get(name="Ada").get().info == {"active": True}
         assert FeatureRecord.get_or_404(name="Grace").amount == Decimal("25.00")
+        with pytest.raises(HTTPException) as missing_sync_get:
+            FeatureRecord.get_or_404(name="missing")
+        assert missing_sync_get.value.status_code == 404
+        assert str(missing_sync_get.value.detail) == "Not found"
         assert FeatureRecord.get(name="missing").exists() is False
         assert FeatureRecord.filter(group="math").exists() is True
         assert FeatureRecord.filter(group="missing").exists() is False
@@ -765,6 +769,7 @@ def test_async_crud_or_404_and_upsert_helpers(tmp_path):
                 with pytest.raises(HTTPException) as missing_get:
                     await FeatureRecord.aget_or_404(session=session, name="missing")
                 assert missing_get.value.status_code == 404
+                assert str(missing_get.value.detail) == "Not found"
 
                 existing, created = await FeatureRecord.aget_or_create(
                     session=session, name="Ada async", defaults={"group": "unused"}

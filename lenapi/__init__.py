@@ -8,7 +8,7 @@ if sys.version_info < (3, 11):
         "on 2026-10-01 and is no longer supported."
     )
 
-__version__ = "0.1.4.1"
+__version__ = "0.1.4.2"
 
 from .application import Application, LENAPI, Router
 from .background import BackgroundQueue, BackgroundTasks
