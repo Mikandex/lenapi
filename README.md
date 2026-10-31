@@ -2243,6 +2243,31 @@ student, created = Student.get_or_create(
 
 `get_or_404`, `update_or_404`, and `delete_or_404` raise `HTTPException(404, ...)` when no record matches, which lenApi returns as an HTTP 404 response. `create_update` creates a missing row or updates an existing one and returns the model instance. `get_or_create` returns `(instance, created)`, where `created` is a boolean.
 
+Async routes can use the matching `a`-prefixed helpers with `await`:
+
+```python
+student = await Student.aget_or_404(id=student_id)
+
+student = await Student.acreate_update(
+    defaults={"course": "Python"},
+    person_name="Ifeanyi",
+)
+
+student = await Student.aupdate_or_404(
+    defaults={"course": "Java"},
+    person_name="Ifeanyi",
+)
+
+await Student.adelete_or_404(person_name="Ifeanyi")
+
+student, created = await Student.aget_or_create(
+    defaults={"course": "Python"},
+    person_name="Ifeanyi",
+)
+```
+
+The async helpers are `aget_or_404`, `acreate_update`, `aupdate_or_404`, `adelete_or_404`, and `aget_or_create`. Pass `session=...` when using an explicit `AsyncSession`; otherwise they use the active LenAPI request session. The `*_or_404` methods raise `HTTPException(404, ...)` when no row matches.
+
 For a declared foreign-key column, `.special("field_name")` resolves its related model and exposes it under that same field name:
 
 ```python

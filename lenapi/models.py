@@ -883,6 +883,14 @@ class Model(DeclarativeBase):
         return instance
 
     @classmethod
+    async def aget_or_404(cls, *, session=None, **filters):
+        """Async counterpart to get_or_404()."""
+        instance = await cls.aget(session=session, **filters)
+        if instance is None:
+            raise HTTPException(404, f"{cls.__name__} not found")
+        return instance
+
+    @classmethod
     def create_update(cls, defaults: dict | None = None, **lookup):
         """Create a row when lookup misses; otherwise apply defaults and save."""
         if not lookup:
@@ -895,6 +903,18 @@ class Model(DeclarativeBase):
         return instance.save()
 
     @classmethod
+    async def acreate_update(cls, defaults: dict | None = None, *, session=None, **lookup):
+        """Async counterpart to create_update()."""
+        if not lookup:
+            raise ValueError("acreate_update requires at least one lookup field")
+        instance = await cls.aget(session=session, **lookup)
+        if instance is None:
+            return await cls.acreate(session=session, **(lookup | (defaults or {})))
+        for field, value in (defaults or {}).items():
+            setattr(instance, field, value)
+        return await instance.asave(session=session)
+
+    @classmethod
     def update_or_404(cls, defaults: dict | None = None, **lookup):
         """Update a matching row, or raise an HTTP 404 exception."""
         if not lookup:
@@ -903,6 +923,16 @@ class Model(DeclarativeBase):
         for field, value in (defaults or {}).items():
             setattr(instance, field, value)
         return instance.save()
+
+    @classmethod
+    async def aupdate_or_404(cls, defaults: dict | None = None, *, session=None, **lookup):
+        """Async counterpart to update_or_404()."""
+        if not lookup:
+            raise ValueError("aupdate_or_404 requires at least one lookup field")
+        instance = await cls.aget_or_404(session=session, **lookup)
+        for field, value in (defaults or {}).items():
+            setattr(instance, field, value)
+        return await instance.asave(session=session)
 
 
     @classmethod
@@ -915,6 +945,15 @@ class Model(DeclarativeBase):
         return True
 
     @classmethod
+    async def adelete_or_404(cls, *, session=None, **filters) -> bool:
+        """Async counterpart to delete_or_404()."""
+        if not filters:
+            raise ValueError("adelete_or_404 requires at least one lookup field")
+        instance = await cls.aget_or_404(session=session, **filters)
+        await instance.adelete(session=session)
+        return True
+
+    @classmethod
     def get_or_create(cls, defaults: dict | None = None, **lookup):
         """Return (instance, created), following Django's get_or_create convention."""
         if not lookup:
@@ -923,6 +962,16 @@ class Model(DeclarativeBase):
         if instance is not None:
             return instance, False
         return cls.create(**(lookup | (defaults or {}))), True
+
+    @classmethod
+    async def aget_or_create(cls, defaults: dict | None = None, *, session=None, **lookup):
+        """Async counterpart to get_or_create(); returns (instance, created)."""
+        if not lookup:
+            raise ValueError("aget_or_create requires at least one lookup field")
+        instance = await cls.aget(session=session, **lookup)
+        if instance is not None:
+            return instance, False
+        return await cls.acreate(session=session, **(lookup | (defaults or {}))), True
 
     @classmethod
     def all(cls, *, limit=None, offset=0):

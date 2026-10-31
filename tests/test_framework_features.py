@@ -747,6 +747,66 @@ def test_model_fields_defaults_uuid_unique_indexes_and_all_crud_helpers(tmp_path
         db.close()
 
 
+def test_async_crud_or_404_and_upsert_helpers(tmp_path):
+    async def run():
+        db = AsyncDatabase(f"sqlite+aiosqlite:///{tmp_path / 'async-crud-helpers.db'}")
+        async with db.engine.begin() as connection:
+            await connection.run_sync(FeatureRecord.__table__.create)
+        try:
+            async with db.session() as session:
+                ada = await FeatureRecord.acreate(
+                    session=session, name="Ada async", group="logic"
+                )
+                assert ada.id is not None
+                assert (await FeatureRecord.aget_or_404(
+                    session=session, name="Ada async"
+                )).group == "logic"
+
+                with pytest.raises(HTTPException) as missing_get:
+                    await FeatureRecord.aget_or_404(session=session, name="missing")
+                assert missing_get.value.status_code == 404
+
+                existing, created = await FeatureRecord.aget_or_create(
+                    session=session, name="Ada async", defaults={"group": "unused"}
+                )
+                assert created is False and existing.group == "logic"
+                created_record, created = await FeatureRecord.aget_or_create(
+                    session=session, name="Turing async", defaults={"group": "math"}
+                )
+                assert created is True and created_record.group == "math"
+
+                updated = await FeatureRecord.acreate_update(
+                    {"group": "updated"}, session=session, name="Ada async"
+                )
+                assert updated.group == "updated"
+                inserted = await FeatureRecord.acreate_update(
+                    {"group": "new"}, session=session, name="Grace async"
+                )
+                assert inserted.group == "new"
+
+                changed = await FeatureRecord.aupdate_or_404(
+                    {"group": "updated again"}, session=session, name="Ada async"
+                )
+                assert changed.group == "updated again"
+                with pytest.raises(HTTPException) as missing_update:
+                    await FeatureRecord.aupdate_or_404(
+                        {"group": "never"}, session=session, name="missing"
+                    )
+                assert missing_update.value.status_code == 404
+
+                assert await FeatureRecord.adelete_or_404(
+                    session=session, name="Turing async"
+                ) is True
+                assert await FeatureRecord.aget(session=session, name="Turing async") is None
+                with pytest.raises(HTTPException) as missing_delete:
+                    await FeatureRecord.adelete_or_404(session=session, name="missing")
+                assert missing_delete.value.status_code == 404
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
 def test_transaction_atomic_commits_and_rolls_back_sync_model_creates(tmp_path):
     db = Database(f"sqlite:///{tmp_path / 'atomic-sync.db'}")
     FeatureRecord.__table__.create(db.engine)
