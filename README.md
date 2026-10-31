@@ -1837,7 +1837,12 @@ class Classroom(model.Model):
 class Student(model.Model):
     person_name = model.StringField(max_length=120, unique=True)
     course = model.StringField(max_length=120)
-    classroom_id = model.ForeignKeyField("classroom.id", nullable=True, model=model.null)
+    classroom_id = model.ForeignKeyField(
+        Classroom,
+        relation_name="classroom",
+        nullable=True,
+        model=model.null,
+    )
 
 class Course(model.Model):
     name = model.StringField(max_length=120)
@@ -1854,6 +1859,17 @@ class AuditLog(model.Model):
 
 class Invoice(model.Model):
     user_id = model.ForeignKeyField("user.id", model=model.protected)
+```
+
+`ForeignKeyField` accepts either a model class or the existing `"table.column"` string target. With an `_id` field name, LenAPI resolves its related object through the matching attribute (for example, `student.classroom`). Use `relation_name` when you want to choose that attribute explicitly. `.special()` accepts either the foreign-key column name or relation name and returns the related model through that name:
+
+```python
+student = Student.get(id=student_id).special("classroom")
+print(student.classroom.name)
+
+# The original string target remains supported:
+class LegacyStudent(model.Model):
+    classroom_id = model.ForeignKeyField("classroom.id", relation_name="classroom")
 ```
 
 Table names are inferred from model class names in lowercase (`Student` becomes `student`); no table-name declaration is needed. Import `model` from `lenapi` and access the model base class, fields, and relationship behaviors through it, such as `model.Model`, `model.StringField`, and `model.ForeignKeyField`.

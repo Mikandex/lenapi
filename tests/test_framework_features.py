@@ -651,6 +651,10 @@ class CascadeChild(Model):
     parent_id = ForeignKeyField("parentrecord.id", model=CASCADE)
 
 
+class ClassTargetChild(Model):
+    parent_id = ForeignKeyField(ParentRecord, model=CASCADE, relation_name="parent")
+
+
 class NullChild(Model):
     parent_id = ForeignKeyField("parentrecord.id", model=SET_NULL, nullable=True)
 
@@ -880,6 +884,29 @@ def test_foreign_key_delete_policies_and_many_to_many_relationships(tmp_path):
         ProtectedChild.create(parent_id=parent.id)
         with pytest.raises(HTTPException, match="protected records"):
             parent.delete()
+    finally:
+        reset_current_session(token)
+        session.close()
+        db.close()
+
+
+def test_foreign_key_accepts_model_class_and_relation_name(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'class-target-foreign-key.db'}")
+    Model.metadata.create_all(
+        db.engine,
+        tables=[ParentRecord.__table__, ClassTargetChild.__table__],
+    )
+    session = db.session()
+    token = set_current_session(session)
+    try:
+        parent = ParentRecord.create(name="class target")
+        child = ClassTargetChild.create(parent_id=parent.id)
+
+        assert child.parent.name == "class target"
+        by_relation_name = ClassTargetChild.get(id=child.id).special("parent")
+        assert by_relation_name.parent.name == "class target"
+        by_column_name = ClassTargetChild.get(id=child.id).special("parent_id")
+        assert by_column_name.parent.name == "class target"
     finally:
         reset_current_session(token)
         session.close()

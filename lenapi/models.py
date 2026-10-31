@@ -617,14 +617,23 @@ class _SingleQuery(_QuerySet):
         return self.delete()
 
     def special(self, foreign_key_name: str):
-        """Resolve a declared foreign key and expose its related model by field name."""
+        """Resolve a foreign key by column or relation name on this single-row query."""
         instance = self.one_or_none()
         if instance is None:
             return None
         foreign_key_column = self.model.__table__.columns.get(foreign_key_name)
+        if foreign_key_column is None:
+            foreign_key_column = next(
+                (
+                    column for column in self.model.__table__.columns
+                    if column.foreign_keys
+                    and column.info.get("lenapi_relation_name") == foreign_key_name
+                ),
+                None,
+            )
         if foreign_key_column is None or not foreign_key_column.foreign_keys:
             raise ValueError(
-                f"'{foreign_key_name}' is not a foreign key field on {self.model.__name__}"
+                f"'{foreign_key_name}' is not a foreign key field or relation on {self.model.__name__}"
             )
         foreign_key = next(iter(foreign_key_column.foreign_keys))
         target_column = foreign_key.column
@@ -640,13 +649,18 @@ class _SingleQuery(_QuerySet):
             raise ValueError(
                 f"No lenApi model is registered for foreign key target '{target_column.table.fullname}'"
             )
-        foreign_value = getattr(instance, foreign_key_name)
+        foreign_value = getattr(instance, foreign_key_column.key)
         related = None
         if foreign_value is not None:
             related = _session().scalar(
                 select(target_model).where(target_column == foreign_value)
             )
-        return _SpecialResult(instance, foreign_key_name, related)
+        return _SpecialResult(
+            instance,
+            foreign_key_column.key,
+            foreign_key_column.info.get("lenapi_relation_name"),
+            related,
+        )
 
     def __getattr__(self, name):
         return getattr(self._instance(), name)
@@ -661,13 +675,14 @@ class _SingleQuery(_QuerySet):
 class _SpecialResult:
     """Proxy for a model row with one foreign-key field resolved to its model."""
 
-    def __init__(self, instance, foreign_key_name: str, related):
+    def __init__(self, instance, foreign_key_name: str, relation_name: str | None, related):
         self._instance = instance
         self._foreign_key_name = foreign_key_name
+        self._relation_name = relation_name
         self._related = related
 
     def __getattr__(self, name):
-        if name == self._foreign_key_name:
+        if name == self._foreign_key_name or name == self._relation_name:
             return self._related
         return getattr(self._instance, name)
 
@@ -778,15 +793,25 @@ class Model(DeclarativeBase):
     adelete = _AsyncDeleteDescriptor()
 
     def __getattr__(self, name):
-        """Resolve a related model via its conventional ``<name>_id`` field.
+        """Resolve a related model via a named relation or conventional ``<name>_id`` field.
 
         For example, ``tag_id = ForeignKeyField("tag.id")`` also allows
         ``instance.tag.name`` while preserving ``instance.tag_id`` as the raw
         foreign-key value.
         """
         table = object.__getattribute__(self, "__table__")
-        foreign_key_column = table.columns.get(f"{name}_id")
-        if foreign_key_column is not None and foreign_key_column.foreign_keys:
+        foreign_key_column = next(
+            (
+                column for column in table.columns
+                if column.foreign_keys
+                and (
+                    column.info.get("lenapi_relation_name") == name
+                    or column.key == f"{name}_id"
+                )
+            ),
+            None,
+        )
+        if foreign_key_column is not None:
             foreign_key = next(iter(foreign_key_column.foreign_keys))
             target_column = foreign_key.column
             target_model = next((mapper.class_ for mapper in Model.registry.mappers
@@ -1447,8 +1472,34 @@ def JSONField(**kwargs):
     return _field(JSON, **kwargs)
 
 
-def ForeignKeyField(target: str, *, model=PROTECT, on_delete: str | None = None, **kwargs):
-    """Declare a foreign key with model=cascade.delete, model=null, or model=protected."""
+def ForeignKeyField(
+    target: str | type,
+    *,
+    model=PROTECT,
+    on_delete: str | None = None,
+    relation_name: str | None = None,
+    **kwargs,
+):
+    """Declare a FK using a model class or ``"table.column"`` target.
+
+    ``relation_name`` names the related-model attribute, for example
+    ``namespace_id = ForeignKeyField(AdminNamespace, relation_name="namespace")``.
+    """
+    if isinstance(target, type) and hasattr(target, "__table__"):
+        primary_key = next(iter(target.__table__.primary_key.columns), None)
+        if primary_key is None:
+            raise ValueError(f"Foreign-key target {target.__name__} has no primary key")
+        target = f"{target.__table__.fullname}.{primary_key.name}"
+    elif not isinstance(target, str):
+        raise TypeError("ForeignKeyField target must be a model class or 'table.column' string")
+    if not target.strip():
+        raise ValueError("ForeignKeyField target cannot be empty")
+    if relation_name is not None:
+        if not isinstance(relation_name, str) or not relation_name.strip():
+            raise ValueError("relation_name must be a non-empty string")
+        info = dict(kwargs.pop("info", {}) or {})
+        info["lenapi_relation_name"] = relation_name.strip()
+        kwargs["info"] = info
     constraint_name = kwargs.pop("constraint_name", None)
     policies = {CASCADE: "CASCADE", SET_NULL: "SET NULL", PROTECT: "RESTRICT"}
     # Keep on_delete as a readable alias while accepting the requested `model=` API.
@@ -1477,7 +1528,7 @@ def ForeignKeyField(target: str, *, model=PROTECT, on_delete: str | None = None,
     )
 
 
-def OneToOneField(target: str, *, model=PROTECT, on_delete: str | None = None, **kwargs):
+def OneToOneField(target: str | type, *, model=PROTECT, on_delete: str | None = None, **kwargs):
     """Declare a unique foreign key, giving the relationship one-to-one semantics."""
     if kwargs.get("unique") is False:
         raise ValueError("OneToOneField always enforces uniqueness")
