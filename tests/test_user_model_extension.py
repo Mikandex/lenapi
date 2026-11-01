@@ -57,3 +57,27 @@ def test_user_subclass_extends_existing_table_and_migration_detects_columns(tmp_
         text=True,
         env=environment,
     )
+
+
+def test_reserved_framework_model_names_fail_with_rename_guidance():
+    script = textwrap.dedent(
+        """
+        from lenapi.models import Model, ReservedModelNameError
+
+        for reserved_name in ("User", "AdminUser"):
+            try:
+                type(reserved_name, (Model,), {"__module__": "app.models"})
+            except ReservedModelNameError as exc:
+                message = str(exc)
+                assert "reserved LenAPI model name" in message
+                assert "Rename the application model" in message
+            else:
+                raise AssertionError(f"{reserved_name} should be reserved")
+        """
+    )
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

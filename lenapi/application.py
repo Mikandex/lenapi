@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, get_args
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
-from sqlalchemy.exc import IntegrityError, MultipleResultsFound
+from sqlalchemy.exc import DBAPIError, IntegrityError, MultipleResultsFound, NoSuchTableError
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,6 +48,63 @@ from .sentinels import UNSET
 
 
 logger = get_logger("websocket")
+
+
+def _is_missing_table_error(exc: BaseException) -> bool:
+    """Recognize common missing-table errors without exposing database details."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, NoSuchTableError):
+            return True
+        if isinstance(current, DBAPIError):
+            original = current.orig
+            code = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+            args = getattr(original, "args", ())
+            if code == "42P01" or (args and args[0] == 1146):
+                return True
+            message = str(original).lower()
+            if any(marker in message for marker in (
+                "no such table", "undefined table", "doesn't exist", "does not exist",
+            )):
+                return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _database_type_mismatch_detail(exc: BaseException) -> str | None:
+    """Return a safe validation hint for PostgreSQL integer/string comparisons."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, DBAPIError):
+            original = current.orig
+            code = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+            message = str(original).lower()
+            type_match = re.search(
+                r"(?:operator does not exist:\s*)?"
+                r"(smallint|integer|bigint|int2|int4|int8)\s*=\s*"
+                r"(character varying|varchar|text)",
+                message,
+            )
+            if code == "42883" or "no operator matches the given name and argument types" in message:
+                if type_match:
+                    statement = current.statement or ""
+                    field_match = re.search(
+                        r"(?:\.|\")([A-Za-z_][A-Za-z0-9_]*)\"?\s*=\s*%\(",
+                        statement,
+                    )
+                    field_name = field_match.group(1) if field_match else "value"
+                    required_type = (
+                        "int" if type_match.group(1) in {
+                            "smallint", "integer", "bigint", "int2", "int4", "int8"
+                        } else "number"
+                    )
+                    return f"{field_name} requires {required_type} but received string"
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def _uses_basic_auth(endpoint: Callable, auth: Any) -> bool:
@@ -689,12 +746,32 @@ class Application(Router):
                 )
             except DatabaseBackendMismatch as exc:
                 response = JSONResponse({"detail": str(exc)}, status_code=500)
-            except Exception:
-                if self.debug:
-                    logger.exception("Unhandled application error for %s %s", method, path)
+            except Exception as exc:
+                if _is_missing_table_error(exc):
+                    logger.error(
+                        "Model or table not found. Check model registration and apply pending migrations."
+                    )
+                    response = JSONResponse(
+                        {
+                            "detail": (
+                                "Model or table not found. Check that the model is registered "
+                                "and its migrations have been applied."
+                            )
+                        },
+                        status_code=500,
+                    )
+                elif type_detail := _database_type_mismatch_detail(exc):
+                    logger.error(
+                        "Invalid query value type: %s. Check the request value against the model field type.",
+                        type_detail,
+                    )
+                    response = JSONResponse({"detail": type_detail}, status_code=422)
                 else:
-                    logger.error("Unhandled application error for %s %s", method, path)
-                response = JSONResponse({"detail": "Internal Server Error"}, status_code=500)
+                    if self.debug:
+                        logger.exception("Unhandled application error for %s %s", method, path)
+                    else:
+                        logger.error("Unhandled application error for %s %s", method, path)
+                    response = JSONResponse({"detail": "Internal Server Error"}, status_code=500)
             finally:
                 reset_current_request(request_token)
                 reset_current_database_backend(database_backend_token)

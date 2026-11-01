@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, Float, ForeignKey, Integer, Interval, JSON, MetaData, Numeric, String, Table, Text, Time, Uuid, UniqueConstraint, and_, delete, false, func, inspect, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, Mapper, declared_attr, mapped_column, object_session, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, Mapper, backref, declared_attr, mapped_column, object_session, relationship, selectinload
 from sqlalchemy import event
 
 from .response import HTTPException
@@ -62,6 +62,10 @@ PROTECT = "PROTECT"
 
 class DatabaseBackendMismatch(RuntimeError):
     """Raised when SQL model operations are attempted with MongoDB selected."""
+
+
+class ReservedModelNameError(ValueError):
+    """Raised when an application declares a separate reserved framework model."""
 
 
 class _CascadePolicy:
@@ -159,6 +163,18 @@ class _ResultList(list):
         """Alias for page_count, provided for clarity in API responses."""
         return self.page_count
 
+    def special(self, foreign_key_name: str):
+        """Resolve one FK/one-to-one relation for each row with a batched lookup."""
+        return _load_special(self, foreign_key_name)
+
+    def many(self, relation_name: str):
+        """Eager-load a many-to-many collection for these rows."""
+        return _load_collection(self, relation_name, kind="many")
+
+    def batch(self, relation_name: str):
+        """Eager-load a one-to-many collection for these rows."""
+        return _load_collection(self, relation_name, kind="batch")
+
 
 class _QueryResults(_ResultList):
     """Synchronous list of model rows with bulk delete support."""
@@ -175,6 +191,15 @@ class _QueryResults(_ResultList):
 
 class _AsyncQueryResults(_ResultList):
     """Async query results; deletion must go through the async queryset."""
+
+    async def aspecial(self, foreign_key_name: str, *, session=None):
+        return await _aload_special(self, foreign_key_name, session=session)
+
+    async def amany(self, relation_name: str, *, session=None):
+        return await _aload_collection(self, relation_name, kind="many", session=session)
+
+    async def abatch(self, relation_name: str, *, session=None):
+        return await _aload_collection(self, relation_name, kind="batch", session=session)
 
 
 class _QuerySet:
@@ -199,6 +224,18 @@ class _QuerySet:
             raise HTTPException(422, "limit must be a non-negative integer")
         if isinstance(self._offset, bool) or not isinstance(self._offset, int) or self._offset < 0:
             raise HTTPException(422, "offset must be a non-negative integer")
+
+    def special(self, relation_name: str):
+        """Defer batched FK/one-to-one loading until this query is executed."""
+        return _RelatedQuery(self, relation_name, "special")
+
+    def many(self, relation_name: str):
+        """Defer eager loading of a many-to-many collection until execution."""
+        return _RelatedQuery(self, relation_name, "many")
+
+    def batch(self, relation_name: str):
+        """Defer eager loading of a one-to-many collection until execution."""
+        return _RelatedQuery(self, relation_name, "batch")
 
     def _column(self, field):
         field = "id" if field == "_id" else field
@@ -461,6 +498,15 @@ class _AsyncQuerySet(_QuerySet):
             limit=self._limit, offset=self._offset, **(self.filters | filters),
         )
 
+    def special(self, relation_name: str):
+        return _RelatedQuery(self, relation_name, "special")
+
+    def many(self, relation_name: str):
+        return _RelatedQuery(self, relation_name, "many")
+
+    def batch(self, relation_name: str):
+        return _RelatedQuery(self, relation_name, "batch")
+
     async def all(self, *, limit=None, offset=None, session=None):
         if limit is not None:
             self.limit(limit)
@@ -548,6 +594,13 @@ class _AsyncSingleQuery(_AsyncQuerySet):
     async def get(self, *, session=None, **filters):
         active_session = self.default_session if session is None else session
         return await self._clone_with_filters(filters).one_or_none(session=active_session)
+
+    async def aspecial(self, foreign_key_name: str, *, session=None):
+        instance = await self._resolve() if session is None else await super().one_or_none(session=session)
+        if instance is None:
+            return None
+        result = await _aload_special(_AsyncQueryResults(self.model, [instance]), foreign_key_name, session=session)
+        return result[0]
 
 
 class _ModelManager:
@@ -690,6 +743,170 @@ class _SpecialResult:
         return repr(self._instance)
 
 
+class _SpecialResultList(_ResultList):
+    """Rows wrapped with a resolved foreign-key value; keeps page metadata."""
+
+
+class _RelatedQuery:
+    """Query wrapper that applies one explicit relationship loader after fetching rows."""
+
+    def __init__(self, query, relation_name: str, kind: str):
+        if not isinstance(relation_name, str) or not relation_name.strip():
+            raise ValueError("Relationship name must be a non-empty string")
+        self.query = query
+        self.relation_name = relation_name.strip()
+        self.kind = kind
+
+    def all(self, **kwargs):
+        result = self.query.all(**kwargs)
+        if isinstance(self.query, _AsyncQuerySet):
+            async def load_async():
+                rows = await result
+                if self.kind == "special":
+                    return await _aload_special(rows, self.relation_name, session=kwargs.get("session"))
+                return await _aload_collection(
+                    rows, self.relation_name, kind=self.kind, session=kwargs.get("session")
+                )
+            return load_async()
+        if self.kind == "special":
+            return _load_special(result, self.relation_name)
+        return _load_collection(result, self.relation_name, kind=self.kind)
+
+
+def _foreign_key_column(model, name):
+    column = model.__table__.columns.get(name)
+    if column is None:
+        column = next((
+            candidate for candidate in model.__table__.columns
+            if candidate.foreign_keys and candidate.info.get("lenapi_relation_name") == name
+        ), None)
+    if column is None or not column.foreign_keys:
+        raise ValueError(f"'{name}' is not a foreign key field or relation on {model.__name__}")
+    return column
+
+
+def _load_special(rows, name):
+    model = rows.model
+    pagination = rows.pagination
+    rows = list(rows)
+    if not rows:
+        return _SpecialResultList(model, [], pagination=pagination)
+    column = _foreign_key_column(model, name)
+    foreign_key = next(iter(column.foreign_keys))
+    target_column = foreign_key.column
+    target_model = next((
+        mapper.class_ for mapper in Model.registry.mappers
+        if mapper.local_table is target_column.table
+    ), None)
+    if target_model is None:
+        raise ValueError("Foreign-key target is not a registered LenAPI model")
+    ids = {getattr(row, column.key) for row in rows if getattr(row, column.key) is not None}
+    related_by_id = {}
+    if ids:
+        session = object_session(rows[0]) or _session()
+        related_by_id = {
+            getattr(item, target_column.key): item
+            for item in session.scalars(select(target_model).where(target_column.in_(ids))).all()
+        }
+    relation_name = column.info.get("lenapi_relation_name")
+    resolved_rows = [
+        _SpecialResult(
+            row, column.key, relation_name,
+            related_by_id.get(getattr(row, column.key)),
+        )
+        for row in rows
+    ]
+    return _SpecialResultList(model, resolved_rows, pagination=pagination)
+
+
+async def _aload_special(rows, name, *, session=None):
+    model = rows.model
+    pagination = rows.pagination
+    rows = list(rows)
+    if not rows:
+        return _SpecialResultList(model, [], pagination=pagination)
+    column = _foreign_key_column(model, name)
+    foreign_key = next(iter(column.foreign_keys))
+    target_column = foreign_key.column
+    target_model = next((
+        mapper.class_ for mapper in Model.registry.mappers
+        if mapper.local_table is target_column.table
+    ), None)
+    if target_model is None:
+        raise ValueError("Foreign-key target is not a registered LenAPI model")
+    ids = {getattr(row, column.key) for row in rows if getattr(row, column.key) is not None}
+    related_by_id = {}
+    if ids:
+        related_result = await _async_session(session).execute(
+            select(target_model).where(target_column.in_(ids))
+        )
+        related_by_id = {
+            getattr(item, target_column.key): item for item in related_result.scalars().all()
+        }
+    relation_name = column.info.get("lenapi_relation_name")
+    resolved_rows = [
+        _SpecialResult(
+            row, column.key, relation_name,
+            related_by_id.get(getattr(row, column.key)),
+        )
+        for row in rows
+    ]
+    return _SpecialResultList(model, resolved_rows, pagination=pagination)
+
+
+def _collection_property(model, name, kind):
+    try:
+        prop = inspect(model).relationships[name]
+    except (KeyError, AttributeError) as exc:
+        raise ValueError(f"'{name}' is not a relationship on {model.__name__}") from exc
+    is_many_to_many = prop.secondary is not None
+    if kind == "many" and not is_many_to_many:
+        raise ValueError(f"'{name}' is not a many-to-many relationship")
+    if kind == "batch" and (is_many_to_many or not prop.uselist):
+        raise ValueError(f"'{name}' is not a one-to-many relationship")
+    if not prop.uselist:
+        raise ValueError(f"'{name}' is not a collection relationship")
+    return getattr(model, name)
+
+
+def _load_collection(rows, name, *, kind):
+    model = rows.model
+    original_rows = rows
+    rows = list(rows)
+    if not rows:
+        return original_rows
+    relationship_attr = _collection_property(model, name, kind)
+    primary_keys = inspect(model).primary_key
+    if len(primary_keys) != 1:
+        raise ValueError("Relationship loading currently requires a single-column primary key")
+    key = primary_keys[0]
+    values = {getattr(row, key.key) for row in rows}
+    session = object_session(rows[0]) or _session()
+    session.scalars(
+        select(model).where(key.in_(values)).options(selectinload(relationship_attr))
+    ).all()
+    return original_rows
+
+
+async def _aload_collection(rows, name, *, kind, session=None):
+    model = rows.model
+    original_rows = rows
+    rows = list(rows)
+    if not rows:
+        return original_rows
+    relationship_attr = _collection_property(model, name, kind)
+    primary_keys = inspect(model).primary_key
+    if len(primary_keys) != 1:
+        raise ValueError("Relationship loading currently requires a single-column primary key")
+    key = primary_keys[0]
+    values = {getattr(row, key.key) for row in rows}
+    result = await _async_session(session).execute(
+        select(model).where(key.in_(values)).options(selectinload(relationship_attr))
+    )
+    result.scalars().all()
+    return original_rows
+
+
 class _TableQuery(_QuerySet):
     """Full-table query whose delete operation drops the model table."""
 
@@ -775,6 +992,20 @@ class Model(DeclarativeBase):
     @classmethod
     def __table_cls__(cls, name, metadata, *args, **kwargs):
         """Namespace model tables and string foreign-key targets."""
+        if cls.__module__ != __name__ and cls.__name__ in {"User", "AdminUser"}:
+            if cls.__name__ == "User":
+                guidance = (
+                    "Rename the application model (for example, Customer), or subclass "
+                    "LenAPI's User model to extend it without declaring a separate table."
+                )
+            else:
+                guidance = (
+                    "Rename the application model (for example, ProjectAdmin); "
+                    "LenAPI manages its own AdminUser model."
+                )
+            raise ReservedModelNameError(
+                f"'{cls.__name__}' is a reserved LenAPI model name. {guidance}"
+            )
         for item in args:
             if isinstance(item, Column):
                 for foreign_key in item.foreign_keys:
@@ -831,6 +1062,26 @@ class Model(DeclarativeBase):
             return session.scalar(
                 select(target_model).where(target_column == value)
             )
+        reverse_matches = []
+        for mapper in Model.registry.mappers:
+            child_model = mapper.class_
+            for column in child_model.__table__.columns:
+                if not column.foreign_keys or column.info.get("lenapi_related_name") != name:
+                    continue
+                foreign_key = next(iter(column.foreign_keys))
+                if foreign_key.column.table is table:
+                    reverse_matches.append((child_model, column, foreign_key.column))
+        if reverse_matches:
+            if len(reverse_matches) != 1:
+                raise AttributeError(f"Reverse relationship '{name}' is ambiguous")
+            child_model, child_fk_column, target_column = reverse_matches[0]
+            value = object.__getattribute__(self, target_column.key)
+            session = object_session(self) or _current_session.get()
+            if session is None:
+                raise AttributeError(f"Relationship '{name}' requires an active database session")
+            return session.scalars(
+                select(child_model).where(child_fk_column == value)
+            ).all()
         return object.__getattribute__(self, name)
 
     @declared_attr
@@ -1202,7 +1453,29 @@ def _prefer_explicit_non_negative_constraint(mapper, model_class):
             table.constraints.discard(constraint)
 
 
+def _normalize_nullability(kwargs):
+    """Accept Django's ``null`` spelling as an alias for ``nullable``."""
+    if "null" not in kwargs:
+        return kwargs
+    null_value = kwargs.pop("null")
+    if not isinstance(null_value, bool):
+        raise TypeError("null must be a boolean")
+    if "nullable" in kwargs:
+        nullable_value = kwargs["nullable"]
+        if not isinstance(nullable_value, bool):
+            raise TypeError("nullable must be a boolean")
+        if nullable_value != null_value:
+            raise ValueError("Pass matching values for null and nullable, or use only one")
+    kwargs["nullable"] = null_value
+    return kwargs
+
+
 def _field(sql_type: Any, **kwargs):
+    _normalize_nullability(kwargs)
+    if "related_name" in kwargs:
+        raise TypeError(
+            "related_name is only supported by ForeignKeyField, OneToOneField, and ManyToManyField"
+        )
     blank = kwargs.pop("blank", True)
     info = dict(kwargs.pop("info", {}) or {})
     error_messages = kwargs.pop("error_messages", None)
@@ -1478,6 +1751,7 @@ def ForeignKeyField(
     model=PROTECT,
     on_delete: str | None = None,
     relation_name: str | None = None,
+    related_name: str | None = None,
     **kwargs,
 ):
     """Declare a FK using a model class or ``"table.column"`` target.
@@ -1485,6 +1759,7 @@ def ForeignKeyField(
     ``relation_name`` names the related-model attribute, for example
     ``namespace_id = ForeignKeyField(AdminNamespace, relation_name="namespace")``.
     """
+    _normalize_nullability(kwargs)
     if isinstance(target, type) and hasattr(target, "__table__"):
         primary_key = next(iter(target.__table__.primary_key.columns), None)
         if primary_key is None:
@@ -1499,6 +1774,12 @@ def ForeignKeyField(
             raise ValueError("relation_name must be a non-empty string")
         info = dict(kwargs.pop("info", {}) or {})
         info["lenapi_relation_name"] = relation_name.strip()
+        kwargs["info"] = info
+    if related_name is not None:
+        if not isinstance(related_name, str) or not related_name.strip():
+            raise ValueError("related_name must be a non-empty string")
+        info = dict(kwargs.pop("info", {}) or {})
+        info["lenapi_related_name"] = related_name.strip()
         kwargs["info"] = info
     constraint_name = kwargs.pop("constraint_name", None)
     policies = {CASCADE: "CASCADE", SET_NULL: "SET NULL", PROTECT: "RESTRICT"}
@@ -1536,6 +1817,48 @@ def OneToOneField(target: str | type, *, model=PROTECT, on_delete: str | None = 
     return ForeignKeyField(target, model=model, on_delete=on_delete, **kwargs)
 
 
+def OneToManyField(target: str | type, *, foreign_key: str, back_populates: str | None = None):
+    """Declare the parent-side collection for a child's ForeignKeyField.
+
+    Example::
+
+        class Course(Model):
+            students = OneToManyField("Student", foreign_key="course_id")
+
+        class Student(Model):
+            course_id = ForeignKeyField(Course)
+    """
+    if not isinstance(foreign_key, str) or not foreign_key.strip():
+        raise ValueError("OneToManyField requires the child's foreign_key field name")
+    target_class = target if isinstance(target, type) else None
+    target_name = target_class.__name__ if target_class is not None else str(target).rsplit(".", 1)[-1]
+    target_table = (
+        target_class.__table__.name if target_class is not None
+        else project_object_name(target_name.lower())
+    )
+
+    def resolve_target():
+        matches = [
+            mapper.class_ for mapper in Model.registry.mappers
+            if mapper.local_table.name == target_table
+        ]
+        if not matches:
+            matches = [
+                mapper.class_ for mapper in Model.registry.mappers
+                if mapper.class_.__module__ == OneToManyField.__module__
+                and mapper.class_.__name__ == target_name
+            ]
+        if len(matches) == 1:
+            return matches[0]
+        raise LookupError(f"Could not uniquely resolve OneToManyField target {target_name!r}")
+
+    return relationship(
+        target_class or resolve_target,
+        back_populates=back_populates,
+        foreign_keys=lambda: [getattr(target_class or resolve_target(), foreign_key)],
+    )
+
+
 class _ManyRelatedSet(set):
     """Set-like SQLAlchemy relationship collection with list-style all()."""
 
@@ -1548,13 +1871,29 @@ class _ManyRelatedSet(set):
         return self
 
 
-def ManyToManyField(target, *, table_name: str | None = None, back_populates: str | None = None):
+def ManyToManyField(
+    target,
+    *,
+    table_name: str | None = None,
+    back_populates: str | None = None,
+    related_name: str | None = None,
+    blank: bool = True,
+):
     """Declare a many-to-many relationship with an inferred association table.
 
     ``target`` may be a model class or its class name. By default the join
     table is named ``<source_table>_<field_name>`` and is included in model
     metadata so Alembic can migrate it.
     """
+    if not isinstance(blank, bool):
+        raise TypeError("blank must be a boolean")
+    if related_name is not None:
+        if not isinstance(related_name, str) or not related_name.strip():
+            raise ValueError("related_name must be a non-empty string")
+        if back_populates is not None:
+            raise ValueError("Pass either related_name or back_populates, not both")
+        related_name = related_name.strip()
+
     field_holder = {}
 
     def make_relationship(cls):
@@ -1645,12 +1984,17 @@ def ManyToManyField(target, *, table_name: str | None = None, back_populates: st
             )
 
         relationship_target = target_class or resolve_relationship_target
-        return relationship(
-            relationship_target,
-            secondary=association,
-            back_populates=back_populates,
-            collection_class=_ManyRelatedSet,
-        )
+        relationship_options = {
+            "secondary": association,
+            "back_populates": back_populates,
+            "collection_class": _ManyRelatedSet,
+        }
+        if related_name is not None:
+            relationship_options["back_populates"] = None
+            relationship_options["backref"] = backref(
+                related_name, collection_class=_ManyRelatedSet
+            )
+        return relationship(relationship_target, **relationship_options)
 
     attribute = declared_attr(make_relationship)
     field_holder["attribute"] = attribute

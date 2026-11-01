@@ -72,6 +72,7 @@ from lenapi.model import (
     ManyToManyField,
     Max,
     Min,
+    OneToManyField,
     PROTECT,
     OneToOneField,
     PhoneField,
@@ -647,6 +648,15 @@ class ParentRecord(Model):
     name = StringField(max_length=40)
 
 
+class LegacyNullAliasRecord(Model):
+    optional_value = StringField(null=True)
+    required_value = StringField(null=False)
+
+
+class LegacyNullAliasForeignKeyRecord(Model):
+    parent_id = ForeignKeyField(ParentRecord, null=False)
+
+
 class CascadeChild(Model):
     parent_id = ForeignKeyField("parentrecord.id", model=CASCADE)
 
@@ -674,6 +684,27 @@ class ArticleRecord(Model):
 
 class ProfileRecord(Model):
     parent_id = OneToOneField("parentrecord.id", nullable=False)
+
+
+class RelationCourseRecord(Model):
+    name = StringField(max_length=40)
+    students = OneToManyField("RelationStudentRecord", foreign_key="course_id")
+
+
+class RelationStudentRecord(Model):
+    name = StringField(max_length=40)
+    course_id = ForeignKeyField(RelationCourseRecord, relation_name="course")
+    tags = ManyToManyField("RelationTagRecord", blank=True, related_name="students")
+
+
+class RelationProfileRecord(Model):
+    student_id = OneToOneField(
+        RelationStudentRecord, relation_name="student", related_name="profiles"
+    )
+
+
+class RelationTagRecord(Model):
+    name = StringField(max_length=40)
 
 
 class PositiveFieldRecord(Model):
@@ -913,6 +944,98 @@ def test_foreign_key_accepts_model_class_and_relation_name(tmp_path):
         db.close()
 
 
+def test_relationship_loaders_sync_filtered_and_all_queries(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'relationship-loaders-sync.db'}")
+    Model.metadata.create_all(db.engine, tables=[
+        RelationCourseRecord.__table__,
+        RelationStudentRecord.__table__,
+        RelationProfileRecord.__table__,
+        RelationTagRecord.__table__,
+        RelationStudentRecord.tags.property.secondary,
+    ])
+    session = db.session()
+    token = set_current_session(session)
+    try:
+        course = RelationCourseRecord.create(name="Python")
+        student = RelationStudentRecord.create(name="Ada", course_id=course.id)
+        profile = RelationProfileRecord.create(student_id=student.id)
+        tag = RelationTagRecord.create(name="backend")
+        student.tags.add(tag)
+        session.commit()
+
+        # FK and one-to-one: both filtered query and get.all() sync APIs.
+        fk_rows = RelationStudentRecord.filter(name="Ada").special("course_id").all()
+        assert fk_rows[0].course_id.name == "Python"
+        fk_all = RelationStudentRecord.get.all().special("course")
+        assert fk_all[0].course.name == "Python"
+        one_to_one = RelationProfileRecord.get(id=profile.id).special("student_id")
+        assert one_to_one.student_id.name == "Ada"
+
+        # One-to-many and many-to-many loaders are eager and preserve model rows.
+        courses = RelationCourseRecord.filter(name="Python").batch("students").all()
+        assert [row.name for row in courses[0].students] == ["Ada"]
+        students = RelationStudentRecord.get.all().many("tags")
+        assert [row.name for row in students[0].tags] == ["backend"]
+        assert [row.name for row in tag.students] == ["Ada"]
+        assert [row.id for row in student.profiles] == [profile.id]
+    finally:
+        reset_current_session(token)
+        session.close()
+        db.close()
+
+
+def test_relationship_loaders_async_filtered_and_all_queries(tmp_path):
+    async def run():
+        db = AsyncDatabase(f"sqlite+aiosqlite:///{tmp_path / 'relationship-loaders-async.db'}")
+        tables = [
+            RelationCourseRecord.__table__,
+            RelationStudentRecord.__table__,
+            RelationProfileRecord.__table__,
+            RelationTagRecord.__table__,
+            RelationStudentRecord.tags.property.secondary,
+        ]
+        async with db.engine.begin() as connection:
+            for table in tables:
+                await connection.run_sync(table.create)
+        try:
+            async with db.session() as session:
+                course = await RelationCourseRecord.acreate(session=session, name="Python")
+                student = await RelationStudentRecord.acreate(
+                    session=session, name="Ada", course_id=course.id
+                )
+                profile = await RelationProfileRecord.acreate(
+                    session=session, student_id=student.id
+                )
+                tag = await RelationTagRecord.acreate(session=session, name="backend")
+                association = RelationStudentRecord.tags.property.secondary
+                association_columns = list(association.c)
+                await session.execute(insert(association).values({
+                    association_columns[0].key: student.id,
+                    association_columns[1].key: tag.id,
+                }))
+                await session.commit()
+
+                fk_rows = await RelationStudentRecord.afilter(name="Ada").special("course_id").all(session=session)
+                assert fk_rows[0].course_id.name == "Python"
+                fk_all = await RelationStudentRecord.aget.all(session=session)
+                fk_all = await fk_all.aspecial("course", session=session)
+                assert fk_all[0].course.name == "Python"
+                one_to_one = await RelationProfileRecord.aget(id=profile.id).aspecial(
+                    "student_id", session=session
+                )
+                assert one_to_one.student_id.name == "Ada"
+
+                courses = await RelationCourseRecord.afilter(name="Python").batch("students").all(session=session)
+                assert [row.name for row in courses[0].students] == ["Ada"]
+                students = await RelationStudentRecord.aget.all(session=session)
+                students = await students.amany("tags", session=session)
+                assert [row.name for row in students[0].tags] == ["backend"]
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
 def test_new_fields_validate_values_and_default_temporal_fields(tmp_path):
     assert ProfileRecord.__table__.c.parent_id.unique is True
     assert "code" in StringPrimaryKeyRecord.__table__.primary_key.columns
@@ -925,6 +1048,12 @@ def test_new_fields_validate_values_and_default_temporal_fields(tmp_path):
         "ck_positivefieldrecord_count_non_negative",
         "ck_positivefieldrecord_total_non_negative",
     }
+
+    assert LegacyNullAliasRecord.__table__.c.optional_value.nullable is True
+    assert LegacyNullAliasRecord.__table__.c.required_value.nullable is False
+    assert LegacyNullAliasForeignKeyRecord.__table__.c.parent_id.nullable is False
+    with pytest.raises(ValueError, match="matching values"):
+        StringField(null=True, nullable=False)
 
     # Alembic copies table metadata while generating migrations. Ensure that
     # copy still has one of each generated CHECK constraint; an unguarded

@@ -1833,6 +1833,7 @@ from lenapi import User, model
 
 class Classroom(model.Model):
     name = model.StringField(max_length=120)
+    learners = model.OneToManyField("Learner", foreign_key="classroom_id")
 
 class Student(model.Model):
     person_name = model.StringField(max_length=120, unique=True)
@@ -1876,7 +1877,9 @@ Table names are inferred from model class names in lowercase (`Student` becomes 
 
 `model.Model` is the base class for SQL-backed models. Subclass it to declare a table; each field assignment declares a database column, and the framework supplies an integer `id` primary key unless you define one yourself. Field declarations describe storage and database constraints; use Pydantic schemas to validate API input.
 
-The field helpers include `AutoField`, signed `IntegerField` and `BigIntegerField`/`BigIntField`, nonnegative `PositiveIntegerField` and `PositiveBigIntegerField`, `StringField`, `TextField`, `EmailField`, `PhoneField`, `IPField`, `URLField`, `BooleanField`, `FloatField`, `DecimalField`, `DateField`, `TimeField`, `DateTimeField`, `DurationField`, `JSONField`/`Json`, `UUIDField`, `ImageField`, `FileField`, `FileImageField`, `ForeignKeyField`, `OneToOneField`, and `ManyToManyField`. Fields normally default to `nullable=True` and `blank=True`; `BooleanField` defaults to `True`. `JSONField` and its alias `Json` store JSON-compatible Python values. Use a factory such as `default=dict` for a fresh mutable value on each new row:
+`User` and `AdminUser` are reserved LenAPI model names. If an application declares a separate model with either name, migration stops with guidance to rename the application model before changing the database. Use a distinct name such as `Customer` or `ProjectAdmin`; to extend the built-in user model, subclass LenAPI's `User` without declaring a separate table.
+
+The field helpers include `AutoField`, signed `IntegerField` and `BigIntegerField`/`BigIntField`, nonnegative `PositiveIntegerField` and `PositiveBigIntegerField`, `StringField`, `TextField`, `EmailField`, `PhoneField`, `IPField`, `URLField`, `BooleanField`, `FloatField`, `DecimalField`, `DateField`, `TimeField`, `DateTimeField`, `DurationField`, `JSONField`/`Json`, `UUIDField`, `ImageField`, `FileField`, `FileImageField`, `ForeignKeyField`, `OneToOneField`, `OneToManyField`, and `ManyToManyField`. Fields normally default to `nullable=True` and `blank=True`; `null=` is accepted as an alias for `nullable=`. `BooleanField` defaults to `True`. `JSONField` and its alias `Json` store JSON-compatible Python values. Use a factory such as `default=dict` for a fresh mutable value on each new row:
 
 ```python
 class Student(model.Model):
@@ -2092,13 +2095,11 @@ if classroom is not None:
     print(classroom.name)
 ```
 
-For async code, use the stored foreign-key ID for a second async lookup. `.special()` is a sync helper:
+Use the async relationship loader to resolve foreign keys and one-to-one fields in a batch:
 
 ```python
-student = await Student.aget(id=1)
-classroom = None
-if student is not None and student.classroom_id is not None:
-    classroom = await Classroom.aget(id=student.classroom_id)
+student = await Student.afilter(id=1).special("classroom_id").all()
+classroom = student[0].classroom_id if student else None
 ```
 
 For `ManyToManyField`, the related collection is available as an attribute. In sync code, call `.all()` to get its related model instances:
@@ -2111,30 +2112,30 @@ courses = teacher.courses.all()
 print([course.name for course in courses])
 ```
 
-In async routes, eager-load the collection with SQLAlchemy's `selectinload` and the injected `AsyncSession` before reading it. Direct lazy access would try to perform database I/O during ordinary attribute access:
+In async routes, use `.amany()` on loaded rows or `.many(...).all()` on the query. LenAPI eagerly loads the collection for you:
 
 ```python
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-from lenapi import HTTPException
-from app.models import Teacher
-
-@app.get("/teachers/{teacher_id}/courses")
-async def teacher_courses(teacher_id: int, db: AsyncSession):
-    result = await db.scalars(
-        select(Teacher)
-        .options(selectinload(Teacher.courses))
-        .where(Teacher.id == teacher_id)
-    )
-    teacher = result.one_or_none()
-    if teacher is None:
-        raise HTTPException(404, "Teacher not found")
-    return [{"id": course.id, "name": course.name}
-            for course in teacher.courses.all()]
+teachers = await Teacher.afilter(id=1).many("courses").all()
+courses = teachers[0].courses.all() if teachers else []
 ```
 
-Declare the relationships in `app/models.py` and run `python lenora.py migration` before querying them. Async relationship loading requires `ACTIVATE_ASYNC = True` and the matching async driver.
+Declare the relationships in `app/models.py` and run `python lenora.py migration` before querying them. For one-to-many collections, declare `OneToManyField` on the parent and use `.batch()` / `.abatch()`. Sync and async filter and get-all queries support these loaders:
+
+```python
+class Classroom(model.Model):
+    learners = model.OneToManyField("Learner", foreign_key="classroom_id")
+
+# Sync filtered query and all-row query
+rooms = Classroom.filter(name="Room A").batch("learners").all()
+all_rooms = Classroom.get.all().batch("learners")
+
+# Async equivalents
+rooms = await Classroom.afilter(name="Room A").batch("learners").all()
+all_rooms = await Classroom.aget.all()
+all_rooms = await all_rooms.abatch("learners")
+```
+
+Use `.special("foreign_key")` for a foreign-key or one-to-one relation, `.many("collection")` for a many-to-many collection, and `.batch("collection")` for a one-to-many collection. Their async counterparts are `.aspecial()`, `.amany()`, and `.abatch()` when loading an already retrieved list. Async relationship loading requires `ACTIVATE_ASYNC = True` and the matching async driver.
 
 `filter(...)` accepts equality filters and lookups such as `course__icontains="py"`, `id__gte=10`, `id__in=[1, 2]`, and `classroom_id__isnull=True`. Supported lookup suffixes are `exact`, `iexact`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `notin`, `contains`, `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`, and `isnull`. Query methods include `.values(...)`, `.order(field)` (prefix with `-` for descending), `.limit(n)`, `.offset(n)`, and terminal operations `.all()`, `.first()`, `.one_or_none()`, `.count()`, `.aggregate(...)`, and `.delete()`. Async query builders use `afilter()`, `asearch()`, and `asearch_any()`; await terminal methods such as `.all()`, `.get()`, `.count()`, `.aggregate()`, or `.delete()`.
 
@@ -2293,7 +2294,7 @@ classroom_name = student.classroom_id.name
 
 Here, the field name must be a `ForeignKeyField` targeting a registered lenApi model. The value at `student.classroom_id` is the related model instance; the project example defines this as `classroom_id`.
 
-Use `OneToOneField` when a dependent row must have exactly one owner and the owner may have at most one dependent row. It is a foreign key with a database unique constraint. A one-to-many relation uses an ordinary `ForeignKeyField` on the many-side; query matching rows with `filter()`:
+Use `OneToOneField` when a dependent row must have exactly one owner and the owner may have at most one dependent row. It is a foreign key with a database unique constraint. Use `OneToManyField` on the parent side to expose a child collection; the child still declares the matching `ForeignKeyField`:
 
 ```python
 class Classroom(model.Model):
@@ -2307,15 +2308,16 @@ class LearnerProfile(model.Model):
     learner_id = model.OneToOneField("learner.id", nullable=False)
     biography = model.TextField()
 
-classroom = Classroom.get_or_404(id=1)
-learners = Learner.filter(classroom_id=classroom.id).all()
+classrooms = Classroom.get(id=1).batch("learners").all()
+classroom = classrooms[0] if classrooms else None
+learners = classroom.learners if classroom else []
 learner = Learner.get_or_404(id=1).special("classroom_id")
 print(learner.classroom_id.name)
 
 profile = LearnerProfile.get(learner_id=learner.id).get()
 ```
 
-For many-to-many queries, load the owning model and access its set-like collection. With async routes, await model query methods; use eager loading with SQLAlchemy `selectinload()` when traversing async relationships.
+For many-to-many queries, load the owning model with `.many("courses")` or `.amany("courses")`, then access its set-like collection. `OneToManyField` collections use `.batch("learners")` or `.abatch("learners")`.
 
 Choose what happens to dependent records when their referenced model is deleted with `model`:
 
@@ -2342,7 +2344,7 @@ teacher.courses.remove(course)
 teacher.save()
 ```
 
-Pass `table_name="teacher_courses"` to `ManyToManyField` to choose the association table name. Use `back_populates="teachers"` to pair it with a reciprocal `teachers = ManyToManyField("Teacher", table_name="teacher_courses", back_populates="courses")` field on `Course`.
+Pass `table_name="teacher_courses"` to `ManyToManyField` to choose the association table name. Use `back_populates="teachers"` to pair it with a reciprocal `teachers = ManyToManyField("Teacher", table_name="teacher_courses", back_populates="courses")` field on `Course`, or use `related_name="teachers"` to declare a reverse collection from one side.
 
 ```python
 from lenapi import Application, Database

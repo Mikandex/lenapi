@@ -82,6 +82,7 @@ PRIVATE_MEDIA_ROOT = BASE_DIR / "private_media"
 # Choose one primary method: "jwt", "api_key", "basic_login", "opaque_bearer", or "session".
 # Session can also be added to selected routes; add HMAC/OIDC with Depends(...).
 AUTHENTICATION = "jwt"
+ALLOW_MULTIPLE_SESSIONS = True  # Set False to replace older JWT/session logins per user.
 BASIC_AUTH_FIELD = "username"  # Basic login field on User: username, email, phone, etc.
 API_KEY = "__LENAPI_GENERATED_API_KEY__"
 # Optional Google OpenID Connect settings. Leave blank to disable Google login.
@@ -851,13 +852,20 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     config.attributes["app_import_string"] = args.app
     # Register project ORM classes before Alembic reads Model.metadata. Do not
     # rely on main.py importing app.models as a side effect.
+    from .models import ReservedModelNameError
+
     try:
         import_module("app.models")
+    except ReservedModelNameError as exc:
+        parser.error(str(exc))
     except ModuleNotFoundError as exc:
         if exc.name not in {"app", "app.models"}:
             raise
     module_name, _, attribute_path = args.app.partition(":")
-    app = import_module(module_name)
+    try:
+        app = import_module(module_name)
+    except ReservedModelNameError as exc:
+        parser.error(str(exc))
     for attribute in attribute_path.split(".") if attribute_path else []:
         app = getattr(app, attribute)
 
@@ -1007,7 +1015,7 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     from alembic.autogenerate import compare_metadata
     from alembic.migration import MigrationContext
     from alembic.script import ScriptDirectory
-    from sqlalchemy import MetaData, create_engine, inspect, text
+    from sqlalchemy import MetaData, Table, create_engine, inspect, select, text
     from lenapi import Model
 
     engine = app.database.engine
@@ -1361,6 +1369,92 @@ def test_http_endpoint_is_registered_and_documented(method, path):
 
         script = ScriptDirectory.from_config(config)
 
+        # Also inspect already-generated local revisions. A developer may run
+        # `migrate` after an unsafe revision was created by an older LenAPI
+        # version, so checking only the current metadata diff would be too late.
+        unsafe_revision_additions = []
+        if revisions.exists():
+            with engine.connect() as connection:
+                inspector = inspect(connection)
+                for path in sorted(revisions.glob("*.py")):
+                    if path.name == "__init__.py":
+                        continue
+                    try:
+                        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                    except (OSError, SyntaxError):
+                        continue
+
+                    unique_columns = set()
+                    add_column_calls = []
+                    for node in ast.walk(tree):
+                        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                            continue
+                        owner = node.func.value
+                        if not isinstance(owner, ast.Name) or owner.id != "op":
+                            continue
+                        if node.func.attr == "create_unique_constraint" and len(node.args) >= 3:
+                            try:
+                                unique_table = ast.literal_eval(node.args[1])
+                                unique_names = ast.literal_eval(node.args[2])
+                            except (ValueError, TypeError):
+                                continue
+                            if isinstance(unique_table, str) and isinstance(unique_names, (list, tuple)):
+                                unique_columns.update((unique_table, name) for name in unique_names)
+                        elif node.func.attr == "add_column" and len(node.args) >= 2:
+                            try:
+                                add_table = ast.literal_eval(node.args[0])
+                                column_call = node.args[1]
+                                if not isinstance(column_call, ast.Call):
+                                    continue
+                                column_name = ast.literal_eval(column_call.args[0])
+                                keywords = {item.arg: item.value for item in column_call.keywords if item.arg}
+                                nullable = ast.literal_eval(keywords.get("nullable", ast.Constant(True)))
+                                has_server_default = (
+                                    "server_default" in keywords
+                                    and not (isinstance(keywords["server_default"], ast.Constant)
+                                             and keywords["server_default"].value is None)
+                                )
+                            except (ValueError, TypeError, IndexError):
+                                continue
+                            if isinstance(add_table, str) and isinstance(column_name, str):
+                                add_column_calls.append((add_table, column_name, nullable, has_server_default))
+
+                    for table_name, column_name, nullable, has_server_default in add_column_calls:
+                        if nullable or table_name not in inspector.get_table_names():
+                            continue
+                        existing_columns = {
+                            item["name"] for item in inspector.get_columns(table_name)
+                        }
+                        if column_name in existing_columns:
+                            continue
+                        reflected = Table(
+                            table_name, MetaData(), autoload_with=connection
+                        )
+                        first_column = next(iter(reflected.columns), None)
+                        if first_column is None or connection.execute(
+                            select(first_column).select_from(reflected).limit(1)
+                        ).first() is None:
+                            continue
+                        is_unique = (table_name, column_name) in unique_columns
+                        if has_server_default and not is_unique:
+                            continue
+                        unsafe_revision_additions.append(
+                            (path.name, table_name, column_name, is_unique)
+                        )
+
+        if unsafe_revision_additions:
+            details = "; ".join(
+                f"{migration}: {table_name}.{column_name}"
+                + (" (unique)" if is_unique else "")
+                for migration, table_name, column_name, is_unique in unsafe_revision_additions
+            )
+            parser.error(
+                "a local migration cannot safely add a NOT NULL column to a populated "
+                f"table: {details}. Edit the migration to add it nullable, backfill valid "
+                "values, then enforce NOT NULL (and uniqueness if needed); or provide a "
+                "suitable server_default for a non-unique column."
+            )
+
         if existing_revisions:
             with engine.connect() as connection:
                 database_tables = set(inspect(connection).get_table_names())
@@ -1426,6 +1520,73 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             if directives and directives[0].upgrade_ops.is_empty():
                 directives.clear()
 
+        # Alembic can emit ADD COLUMN ... NOT NULL for a populated table even
+        # though the database has no value to put in existing rows. Stop before
+        # writing that unusable revision. A Python-side default is not enough:
+        # the database migration itself needs a server default or a backfill.
+        with engine.connect() as connection:
+            migration_context = MigrationContext.configure(
+                connection,
+                opts={
+                    "compare_type": True,
+                    "include_object": include_migration_object,
+                    "version_table": version_table,
+                },
+            )
+            differences = compare_metadata(migration_context, Model.metadata)
+            inspector = inspect(connection)
+            unsafe_additions = []
+            for difference in differences:
+                if not isinstance(difference, tuple) or len(difference) < 4:
+                    continue
+                if difference[0] != "add_column":
+                    continue
+                _, schema, table_name, column = difference[:4]
+                if column.nullable:
+                    continue
+                if table_name not in inspector.get_table_names(schema=schema):
+                    continue
+
+                reflected = Table(
+                    table_name,
+                    MetaData(),
+                    schema=schema,
+                    autoload_with=connection,
+                )
+                first_column = next(iter(reflected.columns), None)
+                if first_column is None:
+                    continue
+                has_rows = connection.execute(
+                    select(first_column).select_from(reflected).limit(1)
+                ).first() is not None
+                if not has_rows:
+                    continue
+
+                is_unique = bool(column.unique) or any(
+                    constraint.__class__.__name__ == "UniqueConstraint"
+                    and column.name in {item.name for item in constraint.columns}
+                    for constraint in column.table.constraints
+                )
+                # A constant server default may satisfy NOT NULL but still
+                # violate a new UNIQUE constraint for every pre-existing row.
+                if column.server_default is not None and not is_unique:
+                    continue
+                unsafe_additions.append((table_name, column.name, is_unique))
+
+        if unsafe_additions:
+            details = "; ".join(
+                f"{table_name}.{column_name}"
+                + (" (unique; each existing row needs a distinct value)" if is_unique else "")
+                for table_name, column_name, is_unique in unsafe_additions
+            )
+            parser.error(
+                "cannot safely add this NOT NULL column to a populated table: "
+                f"{details}. Add the field as nullable, migrate and backfill valid values, "
+                "then make it NOT NULL in a later migration; or provide a suitable "
+                "server_default for a non-unique column. For unique columns, backfill a "
+                "different value for every existing row before adding the unique constraint."
+            )
+
         command.revision(
             config,
             message=args.message,
@@ -1489,6 +1650,62 @@ def test_http_endpoint_is_registered_and_documented(method, path):
     if mark_existing_schema:
         command.stamp(config, "head")
         logger.info("Existing database matches the models; migration history initialized without changing its data.")
+
+    # `migrate` applies existing files without running autogeneration. Protect
+    # that path too, including migrations produced before this safeguard existed.
+    if args.command == "migrate":
+        unsafe_pending = []
+        with engine.connect() as connection:
+            inspector = inspect(connection)
+            for path in sorted(revisions.glob("*.py")):
+                if path.name == "__init__.py":
+                    continue
+                try:
+                    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                except (OSError, SyntaxError):
+                    continue
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                        continue
+                    if not isinstance(node.func.value, ast.Name) or node.func.value.id != "op":
+                        continue
+                    if node.func.attr != "add_column" or len(node.args) < 2:
+                        continue
+                    try:
+                        table_name = ast.literal_eval(node.args[0])
+                        column_call = node.args[1]
+                        if not isinstance(column_call, ast.Call) or not column_call.args:
+                            continue
+                        column_name = ast.literal_eval(column_call.args[0])
+                        keywords = {item.arg: item.value for item in column_call.keywords if item.arg}
+                        nullable = ast.literal_eval(keywords.get("nullable", ast.Constant(True)))
+                        server_default = keywords.get("server_default")
+                        has_server_default = (
+                            server_default is not None
+                            and not (isinstance(server_default, ast.Constant)
+                                     and server_default.value is None)
+                        )
+                    except (ValueError, TypeError, IndexError):
+                        continue
+                    if nullable or has_server_default or not isinstance(table_name, str):
+                        continue
+                    if table_name not in inspector.get_table_names():
+                        continue
+                    if column_name in {item["name"] for item in inspector.get_columns(table_name)}:
+                        continue
+                    reflected = Table(table_name, MetaData(), autoload_with=connection)
+                    first_column = next(iter(reflected.columns), None)
+                    if first_column is not None and connection.execute(
+                        select(first_column).select_from(reflected).limit(1)
+                    ).first() is not None:
+                        unsafe_pending.append(f"{path.name}: {table_name}.{column_name}")
+        if unsafe_pending:
+            parser.error(
+                "refusing to apply a migration that adds a NOT NULL column without a "
+                "server default to a populated table: " + "; ".join(unsafe_pending)
+                + ". Edit the migration to add the column as nullable, backfill valid "
+                "values, and then enforce NOT NULL in a later migration."
+            )
 
     script = ScriptDirectory.from_config(config)
     with engine.connect() as connection:

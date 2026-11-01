@@ -5,6 +5,8 @@ model, rather than putting credential lookup and password handling in
 ``main.py``.
 """
 
+import asyncio
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from importlib import import_module
 
@@ -80,6 +82,31 @@ def _user_authenticator(user_model, identifier_field="username", password_field=
     return authenticate
 
 
+def _async_user_authenticator(user_model, identifier_field="username", password_field="password"):
+    """Build an async SQL-backed credential check for a user model."""
+    columns = user_model.__table__.columns
+    if identifier_field not in columns:
+        raise ValueError(f"Authentication identifier '{identifier_field}' is not a field on {user_model.__name__}")
+    if password_field not in columns:
+        raise ValueError(f"Password field '{password_field}' is not a field on {user_model.__name__}")
+
+    async def authenticate(identifier, password):
+        user = await user_model.aget(**{identifier_field: identifier})
+        stored_password = (
+            getattr(user, password_field) if user is not None else _DUMMY_PASSWORD_HASH
+        )
+        # PBKDF2 is CPU-bound; move it off the event loop even though the
+        # database lookup itself is asynchronous.
+        password_matches = await asyncio.to_thread(
+            check_password, password, stored_password
+        )
+        if user is not None and password_matches:
+            return str(user.id)
+        return None
+
+    return authenticate
+
+
 def basic(user_model, *, identifier_field="username", password_field="password"):
     """Create database-backed HTTP Basic authentication for a user model."""
     return BasicAuth(_user_authenticator(user_model, identifier_field, password_field))
@@ -104,7 +131,7 @@ def api_key(user_model, *, field="api_key", header_name="x-api-key"):
 
 
 def jwt_auth(settings, user_model=None, *, identifier_field="username", password_field="password",
-             security_store=None):
+             security_store=None, cache=None, allow_multiple_sessions=True):
     """Create JWT authentication, optionally backed by a project user model.
 
     Use ``auth.router(authenticate)`` to mount token and refresh endpoints.
@@ -116,18 +143,31 @@ def jwt_auth(settings, user_model=None, *, identifier_field="username", password
         refresh_token_lifetime_seconds=token.get("REFRESH_LIFETIME_SECONDS", 60 * 60 * 24 * 30),
         issuer=token.get("ISSUER"),
         security_store=security_store,
+        session_store=cache if cache is not None else security_store,
+        allow_multiple_sessions=allow_multiple_sessions,
         login_field=identifier_field,
         authenticate=(
             _user_authenticator(user_model, identifier_field, password_field)
+            if user_model is not None else None
+        ),
+        authenticate_async=(
+            _async_user_authenticator(user_model, identifier_field, password_field)
             if user_model is not None else None
         ),
     )
     return auth
 
 
-def session(*, store=None, lookup=None, cookie_name="lenapi_session"):
+def session(
+    *, store=None, cache=None, lookup=None, cookie_name="lenapi_session",
+    allow_multiple_sessions=True,
+):
     """Create session authentication for use as a route dependency."""
-    return SessionAuth(lookup, store=store if lookup is None else None, cookie_name=cookie_name)
+    return SessionAuth(
+        lookup, store=store if lookup is None and cache is None else None,
+        cache=cache if lookup is None else None, cookie_name=cookie_name,
+        allow_multiple_sessions=allow_multiple_sessions,
+    )
 
 
 def opaque_bearer(*, store=None, lookup=None):
@@ -158,8 +198,12 @@ def configure(
     api_key_field=None,
     identifier_field=None,
     password_field="password",
+    allow_multiple_sessions=None,
+    cache=None,
 ):
     """Build the primary authenticator selected by ``settings.AUTHENTICATION``."""
+    if allow_multiple_sessions is None:
+        allow_multiple_sessions = getattr(settings, "ALLOW_MULTIPLE_SESSIONS", True)
     if user_model is None:
         from .models import User
 
@@ -181,10 +225,18 @@ def configure(
             identifier_field=identifier_field,
             password_field=password_field,
             security_store=security_store,
+            cache=cache,
+            allow_multiple_sessions=allow_multiple_sessions,
         )
     if mode == "session":
         options = getattr(settings, "SESSION", {})
-        return session(store=security_store, cookie_name=options.get("COOKIE_NAME", "lenapi_session"))
+        configured_policy = options.get("ALLOW_MULTIPLE_SESSIONS", allow_multiple_sessions)
+        return session(
+            store=security_store if cache is None else None,
+            cache=cache,
+            cookie_name=options.get("COOKIE_NAME", "lenapi_session"),
+            allow_multiple_sessions=configured_policy,
+        )
     if mode == "opaque_bearer":
         return opaque_bearer(store=security_store)
     if mode == "hmac":
@@ -208,6 +260,7 @@ def authentication_type(
     api_key_field=None,
     identifier_field=None,
     password_field="password",
+    allow_multiple_sessions=None,
     app=None,
 ):
     """Create the authenticator selected by a project settings module.
@@ -235,9 +288,11 @@ def authentication_type(
         selected_settings,
         user_model,
         security_store=getattr(app, "security_store", None),
+        cache=getattr(app, "cache", None),
         api_key_field=api_key_field,
         identifier_field=identifier_field,
         password_field=password_field,
+        allow_multiple_sessions=allow_multiple_sessions,
     )
     return authenticator
 
@@ -250,6 +305,7 @@ def authentication(
     api_key_field=None,
     identifier_field=None,
     password_field="password",
+    allow_multiple_sessions=None,
     app=None,
 ):
     """Create a route authentication dependency from project settings.
@@ -276,6 +332,7 @@ def authentication(
         api_key_field=api_key_field,
         identifier_field=identifier_field,
         password_field=password_field,
+        allow_multiple_sessions=allow_multiple_sessions,
         app=app,
     )
 
@@ -288,6 +345,7 @@ def install_default_authentication(app, settings):
     authenticator = authentication_type(
         mode, settings=settings, user_model=User,
         api_key_field="api_key" if mode == "api_key" else None,
+        allow_multiple_sessions=None,
         app=app,
     )
 

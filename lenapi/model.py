@@ -33,6 +33,7 @@ from .models import (
     PositiveIntegerField,
     JSONField,
     ManyToManyField,
+    OneToManyField,
     OneToOneField,
     Max,
     Min,
@@ -62,6 +63,6 @@ __all__ = [
     "Email_field", "IP_field", "Phone_field", "TExtfield",
     "BooleanField", "FloatField", "DateTimeField", "DateField", "TimeField", "DurationField", "JSONField", "Json", "UUIDField", "ImageField", "FileField", "FileImageField", "URLField",
     "Count", "Sum", "Min", "Max", "Avg",
-    "ForeignKeyField", "OneToOneField", "ManyToManyField", "CASCADE", "SET_NULL", "PROTECT",
+    "ForeignKeyField", "OneToOneField", "OneToManyField", "ManyToManyField", "CASCADE", "SET_NULL", "PROTECT",
     "cascade", "null", "protected",
 ]

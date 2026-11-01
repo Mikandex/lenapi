@@ -116,7 +116,10 @@ class JWTAuth:
         refresh_token_lifetime_seconds: int = 60 * 60 * 24 * 30,
         issuer: str | None = None,
         authenticate=None,
+        authenticate_async=None,
         security_store=None,
+        session_store=None,
+        allow_multiple_sessions: bool = True,
         login_field: str = "username",
     ) -> None:
         key = secret_key.encode("utf-8") if isinstance(secret_key, str) else secret_key
@@ -128,16 +131,35 @@ class JWTAuth:
             raise ValueError("refresh_token_lifetime_seconds must be positive")
         if not isinstance(login_field, str) or not login_field.isidentifier() or login_field == "password":
             raise ValueError("login_field must be a valid model field name other than 'password'")
+        if not isinstance(allow_multiple_sessions, bool):
+            raise TypeError("allow_multiple_sessions must be a boolean")
+        if not allow_multiple_sessions and security_store is None and session_store is None:
+            raise ValueError("Single-session JWT authentication requires a configured security store or cache")
         self.secret_key = key
         self.token_lifetime_seconds = token_lifetime_seconds
         self.refresh_token_lifetime_seconds = refresh_token_lifetime_seconds
         self.issuer = issuer
         self.authenticate = authenticate
+        self._authenticate_async = authenticate_async
         self.security_store = security_store
+        self.session_store = session_store if session_store is not None else security_store
+        self.allow_multiple_sessions = allow_multiple_sessions
         self.login_field = login_field
         self._refresh_namespace = hashlib.sha256(key).hexdigest()[:32]
         self._used_refresh_tokens: dict[str, float] = {}
         self._refresh_lock = threading.Lock()
+
+    async def authenticate_async(self, identifier: str, password: str):
+        """Verify login credentials asynchronously.
+
+        Uses the configured async credential callback when available. For
+        sync-only callbacks, runs them in a worker thread so async routes do
+        not block the event loop.
+        """
+        authenticate = self._authenticate_async or self.authenticate
+        if authenticate is None:
+            raise ValueError("No credential authentication callback is configured")
+        return await call_sync_or_async(authenticate, identifier, password)
 
     def create_access_token(
         self,
@@ -147,13 +169,18 @@ class JWTAuth:
         expires_in: int | None = None,
     ) -> str:
         """Sign a token for a subject, adding issued-at and expiration claims."""
+        if not self.allow_multiple_sessions:
+            raise RuntimeError(
+                "Single-session JWT mode requires `await auth.issue_tokens(subject)` "
+                "so the active session can be recorded"
+            )
         if not isinstance(subject, str) or not subject:
             raise ValueError("subject must be a non-empty string")
         lifetime = self.token_lifetime_seconds if expires_in is None else expires_in
         if lifetime <= 0:
             raise ValueError("expires_in must be positive")
         payload = dict(claims or {})
-        reserved = {"sub", "iat", "exp", "iss", "token_use", "jti"}
+        reserved = {"sub", "iat", "exp", "iss", "token_use", "jti", "sid"}
         if reserved.intersection(payload):
             raise ValueError("claims cannot override reserved token claims")
         return self._create_token(subject, payload, lifetime, token_use="access")
@@ -166,17 +193,94 @@ class JWTAuth:
         expires_in: int | None = None,
     ) -> str:
         """Create a refresh token that cannot be used as a bearer access token."""
+        if not self.allow_multiple_sessions:
+            raise RuntimeError(
+                "Single-session JWT mode requires `await auth.issue_tokens(subject)` "
+                "so the active session can be recorded"
+            )
         if not isinstance(subject, str) or not subject:
             raise ValueError("subject must be a non-empty string")
         lifetime = self.refresh_token_lifetime_seconds if expires_in is None else expires_in
         if lifetime <= 0:
             raise ValueError("expires_in must be positive")
         payload = dict(claims or {})
-        reserved = {"sub", "iat", "exp", "iss", "token_use", "jti"}
+        reserved = {"sub", "iat", "exp", "iss", "token_use", "jti", "sid"}
         if reserved.intersection(payload):
             raise ValueError("claims cannot override reserved token claims")
         payload["jti"] = secrets.token_urlsafe(32)
         return self._create_token(subject, payload, lifetime, token_use="refresh")
+
+    async def issue_tokens(
+        self,
+        subject: str,
+        *,
+        claims: dict[str, Any] | None = None,
+        expires_in: int | None = None,
+    ) -> dict[str, Any]:
+        """Issue an access/refresh pair and apply the configured login policy.
+
+        In single-session mode, the newest login replaces the user's active
+        session in the shared security store. Older access and refresh tokens
+        are rejected on subsequent use.
+        """
+        if self.allow_multiple_sessions:
+            return {
+                "access_token": self.create_access_token(
+                    subject, claims=claims, expires_in=expires_in
+                ),
+                "refresh_token": self.create_refresh_token(subject, claims=claims),
+                "token_type": "bearer",
+                "expires_in": self.token_lifetime_seconds if expires_in is None else expires_in,
+            }
+        if not isinstance(subject, str) or not subject:
+            raise ValueError("subject must be a non-empty string")
+        lifetime = self.token_lifetime_seconds if expires_in is None else expires_in
+        if isinstance(lifetime, bool) or not isinstance(lifetime, int) or lifetime <= 0:
+            raise ValueError("expires_in must be a positive integer")
+        payload = dict(claims or {})
+        reserved = {"sub", "iat", "exp", "iss", "token_use", "jti", "sid"}
+        if reserved.intersection(payload):
+            raise ValueError("claims cannot override reserved token claims")
+        session_id = secrets.token_urlsafe(32)
+        token_claims = {**payload, "sid": session_id}
+        access_token = self._create_token(subject, token_claims, lifetime, token_use="access")
+        refresh_claims = {**token_claims, "jti": secrets.token_urlsafe(32)}
+        refresh_token = self._create_token(
+            subject, refresh_claims, self.refresh_token_lifetime_seconds,
+            token_use="refresh",
+        )
+        await call_sync_or_async(self.session_store.set,
+            self._active_session_key(subject), session_id,
+            ttl=self.refresh_token_lifetime_seconds,
+        )
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": lifetime,
+        }
+
+    def _active_session_key(self, subject: str) -> str:
+        subject_hash = hashlib.sha256(subject.encode("utf-8")).hexdigest()
+        return f"jwt_active_session:{self._refresh_namespace}:{subject_hash}"
+
+    async def _require_active_session(self, payload: dict[str, Any], *, session_store=None) -> None:
+        if self.allow_multiple_sessions:
+            return
+        session_id = payload.get("sid")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("Token is not associated with an active login session")
+        store = session_store if session_store is not None else self.session_store
+        if store is None:
+            raise HTTPException(503, "Authentication session storage is unavailable")
+        try:
+            active_session = await call_sync_or_async(
+                store.get, self._active_session_key(payload["sub"])
+            )
+        except RuntimeError as exc:
+            raise HTTPException(503, "Authentication session storage is unavailable") from exc
+        if not isinstance(active_session, str) or not secrets.compare_digest(active_session, session_id):
+            raise ValueError("Token session has been replaced or revoked")
 
     def _create_token(self, subject: str, payload: dict[str, Any], lifetime: int, *, token_use: str) -> str:
         now = int(time.time())
@@ -199,10 +303,15 @@ class JWTAuth:
         payload = self.decode_token(refresh_token, allow_refresh=True)
         if payload.get("token_use") != "refresh":
             raise ValueError("A refresh token is required")
+        await self._require_active_session(payload)
         await self._consume_refresh_token(payload, security_store=security_store)
         claims = {key: value for key, value in payload.items()
                   if key not in {"sub", "iat", "exp", "iss", "token_use", "jti"}}
-        return self.create_access_token(payload["sub"], claims=claims)
+        if self.allow_multiple_sessions:
+            return self.create_access_token(payload["sub"], claims=claims)
+        return self._create_token(
+            payload["sub"], claims, self.token_lifetime_seconds, token_use="access"
+        )
 
     async def _consume_refresh_token(self, payload: dict[str, Any], *, security_store=None) -> None:
         token_id = payload.get("jti")
@@ -240,9 +349,9 @@ class JWTAuth:
         """
         from .application import Router
 
-        authenticate = authenticate or self.authenticate
-        if authenticate is None:
+        if authenticate is None and self.authenticate is None and self._authenticate_async is None:
             raise ValueError("JWT token routes require an authenticate(identifier, password) callback")
+        authenticate = authenticate or self.authenticate_async
 
         # Keep password verification endpoints rate-limited even when the app
         # has no global throttle configured. An empty mapping explicitly opts
@@ -271,12 +380,10 @@ class JWTAuth:
                 subject, claims = user, None
             if not isinstance(subject, str) or not subject:
                 raise TypeError("authenticate must return a non-empty string user ID")
-            return {
-                "access_token": self.create_access_token(subject, claims=claims),
-                "refresh_token": self.create_refresh_token(subject, claims=claims),
-                "token_type": "bearer",
-                "expires_in": self.token_lifetime_seconds,
-            }
+            try:
+                return await self.issue_tokens(subject, claims=claims)
+            except (ValueError, RuntimeError) as exc:
+                raise HTTPException(503, "Could not create an authentication session") from exc
 
         @router.post("/refresh", include_in_schema=False, throttle=token_throttle)
         async def refresh_token(body: _RefreshRequest):
@@ -289,9 +396,19 @@ class JWTAuth:
                 raise HTTPException(401, "Invalid or expired refresh token") from exc
             claims = {key: value for key, value in payload.items()
                       if key not in {"sub", "iat", "exp", "iss", "token_use", "jti"}}
+            if self.allow_multiple_sessions:
+                new_refresh_token = self.create_refresh_token(payload["sub"], claims=claims)
+            else:
+                if not isinstance(claims.get("sid"), str):
+                    raise HTTPException(401, "Invalid or expired refresh token")
+                refresh_claims = {**claims, "jti": secrets.token_urlsafe(32)}
+                new_refresh_token = self._create_token(
+                    payload["sub"], refresh_claims,
+                    self.refresh_token_lifetime_seconds, token_use="refresh",
+                )
             return {
                 "access_token": access_token,
-                "refresh_token": self.create_refresh_token(payload["sub"], claims=claims),
+                "refresh_token": new_refresh_token,
                 "token_type": "bearer",
                 "expires_in": self.token_lifetime_seconds,
             }
@@ -334,14 +451,16 @@ class JWTAuth:
         except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("Malformed token") from exc
 
-    def __call__(self, request: Request) -> dict[str, Any]:
+    async def __call__(self, request: Request) -> dict[str, Any]:
         """Resolve a verified Bearer token for use with ``Depends``."""
         authorization = request.headers.get("authorization", "")
         scheme, separator, token = authorization.partition(" ")
         if not separator or scheme.lower() != "bearer" or not token.strip():
             raise HTTPException(401, "Bearer token required", headers={"WWW-Authenticate": "Bearer"})
         try:
-            return self.decode_token(token.strip())
+            payload = self.decode_token(token.strip())
+            await self._require_active_session(payload)
+            return payload
         except ValueError as exc:
             raise HTTPException(
                 401,
@@ -407,23 +526,107 @@ class BasicAuth:
 
 
 class SessionAuth:
-    """Resolve an HttpOnly session cookie with an application-provided store lookup."""
+    """Resolve an HttpOnly session cookie through a server-side session store."""
 
-    def __init__(self, lookup=None, *, store=None, cookie_name: str = "lenapi_session") -> None:
-        if lookup is None and store is None:
-            raise ValueError("SessionAuth requires a lookup callback or security store")
+    def __init__(
+        self, lookup=None, *, store=None, cache=None, cookie_name: str = "lenapi_session",
+        allow_multiple_sessions: bool = True,
+    ) -> None:
+        if lookup is None and store is None and cache is None:
+            raise ValueError("SessionAuth requires a lookup callback, security store, or cache")
+        if store is not None and cache is not None:
+            raise ValueError("Pass either store or cache to SessionAuth, not both")
+        if not isinstance(allow_multiple_sessions, bool):
+            raise TypeError("allow_multiple_sessions must be a boolean")
+        if not allow_multiple_sessions and store is None and cache is None:
+            raise ValueError("Single-session authentication requires a shared store or cache")
         self.lookup = lookup
         self.store = store
+        self.cache = cache
+        self._state_store = cache if cache is not None else store
         self.cookie_name = cookie_name
+        self.allow_multiple_sessions = allow_multiple_sessions
+
+    @staticmethod
+    def _identity_subject(identity: Any) -> str:
+        if not isinstance(identity, dict):
+            raise ValueError("Session identity must be a dictionary with a user ID")
+        for field in ("sub", "user_id", "id"):
+            value = identity.get(field)
+            if value is not None and str(value):
+                return str(value)
+        raise ValueError("Session identity must include 'sub', 'user_id', or 'id'")
+
+    def _active_session_key(self, identity: dict[str, Any]) -> str:
+        subject_hash = hashlib.sha256(
+            self._identity_subject(identity).encode("utf-8")
+        ).hexdigest()
+        return f"session_active:{self.cookie_name}:{subject_hash}"
+
+    async def create_session(self, identity: dict[str, Any], *, ttl: int = 3600) -> str:
+        """Create a session ID and store its identity with the configured policy."""
+        if self._state_store is None:
+            raise RuntimeError("Creating sessions requires a configured security store or cache")
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
+            raise ValueError("ttl must be a positive integer")
+        if not isinstance(identity, dict):
+            raise TypeError("identity must be a dictionary")
+        active_session_key = (
+            self._active_session_key(identity)
+            if not self.allow_multiple_sessions else None
+        )
+        previous_session_id = None
+        if active_session_key is not None:
+            previous_session_id = await call_sync_or_async(
+                self._state_store.get, active_session_key
+            )
+        session_id = secrets.token_urlsafe(32)
+        stored_identity = identity if self.cache is not None else json.dumps(
+            identity, separators=(",", ":")
+        )
+        await call_sync_or_async(
+            self._state_store.set, f"session:{session_id}", stored_identity, ttl=ttl,
+        )
+        if active_session_key is not None:
+            await call_sync_or_async(
+                self._state_store.set, active_session_key, session_id, ttl=ttl
+            )
+            if (
+                isinstance(previous_session_id, str)
+                and previous_session_id != session_id
+            ):
+                await call_sync_or_async(
+                    self._state_store.delete, f"session:{previous_session_id}"
+                )
+        return session_id
 
     async def __call__(self, request: Request) -> Any:
         session_id = request.cookies.get(self.cookie_name)
-        if session_id and self.store is not None:
-            serialized = await call_sync_or_async(self.store.get, f"session:{session_id}")
+        if session_id and self._state_store is not None:
             try:
-                identity = json.loads(serialized) if serialized is not None else None
-            except (TypeError, json.JSONDecodeError):
-                identity = None
+                serialized = await call_sync_or_async(
+                    self._state_store.get, f"session:{session_id}"
+                )
+            except RuntimeError as exc:
+                raise HTTPException(503, "Session storage is unavailable") from exc
+            if isinstance(serialized, dict):
+                identity = serialized
+            else:
+                try:
+                    identity = json.loads(serialized) if serialized is not None else None
+                except (TypeError, json.JSONDecodeError):
+                    identity = None
+            if identity is not None and not self.allow_multiple_sessions:
+                try:
+                    active_id = await call_sync_or_async(
+                        self._state_store.get, self._active_session_key(identity)
+                    )
+                except (TypeError, ValueError):
+                    active_id = None
+                except RuntimeError as exc:
+                    raise HTTPException(503, "Session storage is unavailable") from exc
+                if not isinstance(active_id, str) or not secrets.compare_digest(active_id, session_id):
+                    identity = None
         else:
             identity = (
                 await call_sync_or_async(self.lookup, session_id)
@@ -530,9 +733,15 @@ class WebhookAuth:
         return {"auth_method": "webhook", "event_id": event_id}
 
 
-def session_auth(lookup=None, *, store=None, cookie_name: str = "lenapi_session") -> SessionAuth:
-    """Create a session-cookie dependency with a callback or shared security store."""
-    return SessionAuth(lookup, store=store, cookie_name=cookie_name)
+def session_auth(
+    lookup=None, *, store=None, cache=None, cookie_name: str = "lenapi_session",
+    allow_multiple_sessions: bool = True,
+) -> SessionAuth:
+    """Create a session-cookie dependency with a callback, security store, or cache."""
+    return SessionAuth(
+        lookup, store=store, cache=cache, cookie_name=cookie_name,
+        allow_multiple_sessions=allow_multiple_sessions,
+    )
 
 
 def opaque_bearer_auth(token_lookup=None, *, store=None) -> OpaqueBearerAuth:
@@ -701,7 +910,7 @@ def hmac_auth(
 
 def create_authenticator(
     settings, *, authenticate=None, authenticate_api_key=None, session_lookup=None,
-    token_lookup=None, oidc_token_lookup=None, security_store=None,
+    token_lookup=None, oidc_token_lookup=None, security_store=None, cache=None,
 ):
     """Create the authentication dependency selected in a project settings module."""
     mode = getattr(settings, "AUTHENTICATION", "jwt").lower()
@@ -713,6 +922,8 @@ def create_authenticator(
             refresh_token_lifetime_seconds=token.get("REFRESH_LIFETIME_SECONDS", 60 * 60 * 24 * 30),
             issuer=token.get("ISSUER"),
             security_store=security_store,
+            session_store=cache if cache is not None else security_store,
+            allow_multiple_sessions=getattr(settings, "ALLOW_MULTIPLE_SESSIONS", True),
         )
     if mode == "api_key":
         return APIKeyAuth(getattr(settings, "API_KEY", None), authenticate=authenticate_api_key)
@@ -726,8 +937,14 @@ def create_authenticator(
         if lookup is None and security_store is None:
             raise ValueError("session authentication requires security_store or session_lookup")
         return SessionAuth(
-            lookup, store=security_store if lookup is None else None,
+            lookup,
+            store=security_store if lookup is None and cache is None else None,
+            cache=cache if lookup is None else None,
             cookie_name=session.get("COOKIE_NAME", "lenapi_session"),
+            allow_multiple_sessions=session.get(
+                "ALLOW_MULTIPLE_SESSIONS",
+                getattr(settings, "ALLOW_MULTIPLE_SESSIONS", True),
+            ),
         )
     if mode == "opaque_bearer":
         lookup = token_lookup or getattr(settings, "TOKEN_LOOKUP", None)

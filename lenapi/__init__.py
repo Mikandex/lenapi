@@ -8,7 +8,7 @@ if sys.version_info < (3, 11):
         "on 2026-10-01 and is no longer supported."
     )
 
-__version__ = "0.1.4.2"
+__version__ = "0.1.4.3"
 
 from .application import Application, LENAPI, Router
 from .background import BackgroundQueue, BackgroundTasks
@@ -46,6 +46,7 @@ from .models import (
     PositiveIntegerField,
     JSONField,
     ManyToManyField,
+    OneToManyField,
     OneToOneField,
     Max,
     Min,
@@ -98,6 +99,6 @@ from . import model
 __all__ = [
     "Application", "LENAPI", "Router", "Depends", "BackgroundTasks", "BackgroundQueue", "Cache", "Faker", "OpenAI", "Ollama", "CORSMiddleware", "DocsAuthMiddleware", "GZipMiddleware", "RequestIDMiddleware", "TimingMiddleware", "require_role", "require_permission", "require_owner", "Database", "AsyncDatabase", "transaction", "MongoDatabase", "MongoDocument", "MultipleDocumentsFound", "Body", "File", "Model", "AdminUser", "AutoField", "logger", "get_logger", "WebSocket", "WebSocketConnection", "WebSocketDisconnect", "WebSocketService",
     "IntegerField", "PositiveIntegerField", "BigIntField", "BigIntegerField", "PositiveBigIntegerField", "DecimalField", "StringField", "EmailField", "IPField", "PhoneField", "TextField", "UUIDField", "ImageField", "FileField", "FileImageField", "URLField", "BooleanField", "FloatField", "User",
-    "DateTimeField", "DateField", "TimeField", "DurationField", "JSONField", "ForeignKeyField", "OneToOneField", "ManyToManyField", "Count", "Sum", "Min", "Max", "Avg", "Request", "UploadFile", "Response", "JSONResponse",
+    "DateTimeField", "DateField", "TimeField", "DurationField", "JSONField", "ForeignKeyField", "OneToOneField", "OneToManyField", "ManyToManyField", "Count", "Sum", "Min", "Max", "Avg", "Request", "UploadFile", "Response", "JSONResponse",
     "HTTPException", "JWTAuth", "APIKeyAuth", "BasicAuth", "CSRFProtect", "SessionAuth", "OpaqueBearerAuth", "HMACAuth", "OIDCAuth", "WebhookAuth", "hmac_request_signature", "session_auth", "opaque_bearer_auth", "hmac_auth", "oidc_auth", "webhook_auth", "create_authenticator", "authentication", "SocialAuth", "hash_password", "verify_password", "make_password", "check_password", "make_api_key", "hash_api_key", "UNSET", "model", "CASCADE", "SET_NULL", "PROTECT", "cascade", "null", "protected",
 ]
