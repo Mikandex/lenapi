@@ -27,7 +27,9 @@ from lenapi.middleware import DocsAuthMiddleware
 from lenapi.models import SECURITY_STORE_TABLE
 
 
-async def _http_request(app, path, *, method="GET", payload=None, headers=(), query_string=b""):
+async def _http_request(
+    app, path, *, method="GET", payload=None, headers=(), query_string=b"", return_headers=False
+):
     body = b"" if payload is None else json.dumps(payload).encode()
     headers = list(headers)
     if payload is not None:
@@ -53,7 +55,8 @@ async def _http_request(app, path, *, method="GET", payload=None, headers=(), qu
     }, receive, send)
     start = next(item for item in messages if item["type"] == "http.response.start")
     response_body = next(item for item in messages if item["type"] == "http.response.body")["body"]
-    return start["status"], json.loads(response_body or b"null")
+    result = (start["status"], json.loads(response_body or b"null"))
+    return (*result, start["headers"]) if return_headers else result
 
 
 def test_authentication_public_api_is_available_from_security_module():
@@ -159,6 +162,50 @@ def test_social_auth_callback_requires_state_even_when_provider_origin_is_presen
 
     assert status == 400
     assert body["error"] == "Invalid or expired OAuth state"
+
+
+def test_social_auth_success_callback_redirects_without_exposing_identity():
+    settings = SimpleNamespace(
+        GOOGLE_CLIENT_ID="test-client",
+        GOOGLE_CLIENT_SECRET="test-secret",
+        GOOGLE_REDIRECT_URI="https://api.example/auth/google/callback",
+        GOOGLE_COOKIE_SECURE=True,
+        SOCIAL_AUTH_SUCCESS_CALLBACK="https://backend.example/auth/social/success",
+    )
+    app = Application(database=Database("sqlite://"), security_storage="memory")
+    auth = SocialAuth(["google"], settings=settings)
+    delivered = {}
+
+    async def fetch_identity(provider, code, verifier):
+        return {"sub": "provider-user-1", "email": "ada@example.com", "email_verified": True}
+
+    async def deliver_success(provider, identity, user_id):
+        delivered.update(provider=provider, identity=identity, user_id=user_id)
+        return "https://frontend.example/login/success", ["session_id=secret; Path=/; HttpOnly; Secure"]
+
+    auth._fetch_identity = fetch_identity
+    auth._deliver_success = deliver_success
+    app.include_router(auth.router(), prefix="/auth")
+    status, body, headers = asyncio.run(_http_request(
+        app,
+        "/auth/google/callback",
+        query_string=b"state=valid-state&code=provider-code",
+        headers=[(
+            b"cookie",
+            b"lenapi_social_google_state=valid-state; lenapi_social_google_verifier=valid-verifier",
+        )],
+        return_headers=True,
+    ))
+
+    response_headers = dict(headers)
+    set_cookies = [value for key, value in headers if key == b"set-cookie"]
+    assert status == 303
+    assert body is None
+    assert response_headers[b"location"] == b"https://frontend.example/login/success"
+    assert b"session_id=secret; Path=/; HttpOnly; Secure" in set_cookies
+    assert "provider-user-1" not in repr(body)
+    assert delivered["provider"] == "google"
+    assert delivered["identity"]["sub"] == "provider-user-1"
 
 
 def test_social_auth_origin_configuration_is_normalized_and_validated():

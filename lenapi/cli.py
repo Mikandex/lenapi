@@ -101,6 +101,11 @@ LINKEDIN_REDIRECT_URI = ""
 LINKEDIN_COOKIE_SECURE = urlparse(LINKEDIN_REDIRECT_URI).scheme == "https"
 # Exact browser origins allowed to start social login; configure your frontend origin.
 SOCIAL_AUTH_ALLOWED_ORIGINS = []
+# Optional server-to-server endpoint for application-owned social login/session handling.
+# Use HTTPS when enabling it.
+SOCIAL_AUTH_SUCCESS_CALLBACK = ""
+# Browser destination after the social-auth webhook succeeds.
+FRONTEND_REDIRECT_URI = ""
 # Keep this generated key private. Rotate it to invalidate existing tokens.
 SECRET_KEY = "__LENAPI_GENERATED_SECRET_KEY__"
 TOKEN = {

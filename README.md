@@ -1419,6 +1419,8 @@ def oidc_profile(identity=Depends(provider_auth)):
 ```python
 # settings.py — replace with the exact origin serving your frontend.
 SOCIAL_AUTH_ALLOWED_ORIGINS = ["https://myapp.com"]
+SOCIAL_AUTH_SUCCESS_CALLBACK = "https://api.example.com/auth/social/success"
+FRONTEND_REDIRECT_URI = "https://app.example.com/login/success"
 
 # main.py
 from lenapi import LENAPI
@@ -1427,7 +1429,7 @@ from lenapi.security import SocialAuth
 auth = SocialAuth(
     providers=["google", "github", "linkedin"],
     auto_register=True,
-    jwt_enabled=True,
+    jwt_enabled=False,  # Your success endpoint owns session/JWT issuance.
 )
 
 app = LENAPI()
@@ -1440,23 +1442,38 @@ This mounts routes such as `/auth/google/login` and `/auth/google/callback` only
 2. The provider authenticates the person and redirects the browser to the registered callback URL.
 3. LenAPI validates OAuth state (and PKCE where supported), exchanges the authorization code, and fetches the provider profile.
 4. With `auto_register=True`, LenAPI finds or creates the local user and stores the provider-to-user mapping.
-5. With `jwt_enabled=True`, LenAPI issues **one LenAPI JWT access token** for use on protected application routes.
+5. LenAPI sends the verified identity to `SOCIAL_AUTH_SUCCESS_CALLBACK`; your backend applies its account rules and handles session/JWT issuance.
 
-`jwt_enabled` controls only that final LenAPI credential. SocialAuth currently issues a JWT access token; it does not issue an API key, session cookie, opaque bearer token, or refresh token. The provider's OAuth access token is used internally during the callback and is not returned to the client. With `jwt_enabled=False`, the callback response contains the provider `identity` and includes `user_id` when a local user was resolved, but no LenAPI token. For sessions, API keys, or opaque tokens, implement the desired credential issuance after the provider callback using the matching LenAPI auth dependency/store, or build a custom callback flow. Google and LinkedIn use OIDC identity endpoints in this integration; GitHub uses OAuth 2.0 and its profile/email APIs, not OIDC.
+The provider's OAuth access token is used internally and is never returned. A successful social login requires `SOCIAL_AUTH_SUCCESS_CALLBACK`; without it the callback returns a generic `503` and no identity data. The browser callback never returns provider identity or a LenAPI token. `jwt_enabled` remains accepted for compatibility but credential issuance belongs to your backend callback. Google and LinkedIn use OIDC identity endpoints in this integration; GitHub uses OAuth 2.0 and its profile/email APIs, not OIDC.
 
-For example, with both flags enabled, the callback response includes fields in this shape (identity claims vary by provider):
+To keep provider identity out of the browser response and let your backend own login/session handling, configure `SOCIAL_AUTH_SUCCESS_CALLBACK`. LenAPI validates the provider callback and POSTs the verified identity as JSON to your backend. After any successful webhook response, LenAPI redirects the callback tab to `FRONTEND_REDIRECT_URI`; the webhook may optionally return JSON containing `redirect_url` to override that setting for this login. LenAPI forwards any `Set-Cookie` headers from the webhook response. The configured callback URL and redirect URL must use HTTPS; HTTP is accepted only for localhost development. Redirect URLs may not include query strings or fragments. When callback mode is enabled, your backend owns JWT/session issuance; `jwt_enabled` does not cause LenAPI to create or return a JWT.
 
-```json
-{
-  "identity": {"sub": "provider-subject", "email": "ada@example.com"},
-  "user_id": 42,
-  "access_token": "<LenAPI JWT>",
-  "token_type": "bearer",
-  "expires_in": 3600
-}
+```python
+# Developer backend endpoint (the SOCIAL_AUTH_SUCCESS_CALLBACK URL)
+from lenapi import JSONResponse, LENAPI, Request
+import settings
+
+app = LENAPI()
+
+@app.post("/auth/social/success")
+async def social_success(request: Request):
+    data = await request.json()
+    identity = data["identity"]
+    user_id = data.get("user_id")
+
+    # Implement your own account rules and issue your own session/JWT here.
+    user = await find_or_create_user(identity, user_id)
+    session_id = await create_session(user)
+
+    response = JSONResponse({"accepted": True})
+    response.set_cookie(
+        "session_id", session_id, max_age=3600, path="/",
+        httponly=True, secure=True, samesite="lax",
+    )
+    return response
 ```
 
-The client then sends `Authorization: Bearer <access_token>` to routes protected with LenAPI JWT authentication. Store and transmit the token securely; do not use the provider token in place of the LenAPI token.
+The webhook body is `{"provider": "google", "identity": {...}, "user_id": "..."}`; `user_id` is omitted when auto-registration is disabled. This is a plain HTTPS server-to-server POST; the receiving application is responsible for protecting its endpoint. The backend's `Set-Cookie` is forwarded to the browser with LenAPI's redirect response, so choose cookie domain and frontend/API domains accordingly. The redirect destination comes from the configured `FRONTEND_REDIRECT_URI` or the webhook's optional `redirect_url`, never a browser-supplied URL. The helper functions in the sample are application code, not LenAPI built-ins.
 
 `allowed_origins` can also be passed directly to `SocialAuth`; otherwise it reads `SOCIAL_AUTH_ALLOWED_ORIGINS` from `settings.py`. When a browser sends an `Origin` header to a provider login route, LenApi requires an exact match in this list and returns `403` otherwise. Replace `https://myapp.com` with the exact origin serving your frontend. Top-level navigations can omit `Origin`; those still rely on the required, random, browser-cookie-bound OAuth `state` check on callback. Do not treat the origin allowlist as a replacement for OAuth state validation, HTTPS, or correct provider callback URL registration. The provider callback itself is not checked against the browser `Origin` header because providers may omit it or send a different origin.
 

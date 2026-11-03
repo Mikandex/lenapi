@@ -11,7 +11,6 @@ from urllib.parse import urlencode, urlsplit
 from sqlalchemy import insert, select
 from sqlalchemy.exc import IntegrityError
 
-from .authentication import jwt_auth
 from .concurrency import call_sync_or_async
 from .models import SOCIAL_ACCOUNT_TABLE, User, _session
 from .request import get_current_request
@@ -43,6 +42,8 @@ class SocialAuth:
         settings=None,
         user_model=None,
         allowed_origins=None,
+        success_callback: str | None = None,
+        frontend_redirect_uri: str | None = None,
     ) -> None:
         if isinstance(providers, str):
             raise TypeError("providers must be a list or tuple of provider names")
@@ -70,11 +71,62 @@ class SocialAuth:
         self.auto_register = bool(auto_register)
         self.jwt_enabled = bool(jwt_enabled)
         self.settings = settings or self._load_settings()
+        if success_callback is None:
+            success_callback = getattr(self.settings, "SOCIAL_AUTH_SUCCESS_CALLBACK", "") or None
+        self.success_callback = self._validate_success_callback(success_callback)
+        if frontend_redirect_uri is None:
+            frontend_redirect_uri = getattr(self.settings, "FRONTEND_REDIRECT_URI", "") or None
+        self.frontend_redirect_uri = (
+            self._validate_success_redirect(frontend_redirect_uri)
+            if frontend_redirect_uri
+            else None
+        )
         if allowed_origins is None:
             allowed_origins = getattr(self.settings, "SOCIAL_AUTH_ALLOWED_ORIGINS", ())
         self.allowed_origins = self._normalize_origins(allowed_origins)
         self.user_model = user_model or self._load_user_model()
-        self.jwt = jwt_auth(self.settings) if self.jwt_enabled else None
+
+    @staticmethod
+    def _validate_success_callback(url: str | None) -> str | None:
+        if url is None or url == "":
+            return None
+        if not isinstance(url, str):
+            raise TypeError("SOCIAL_AUTH_SUCCESS_CALLBACK must be a URL string")
+        parsed = urlsplit(url.strip())
+        if (
+            parsed.scheme.lower() not in {"https", "http"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("SOCIAL_AUTH_SUCCESS_CALLBACK must be a valid HTTPS URL")
+        if parsed.scheme.lower() != "https" and parsed.hostname.lower() not in {
+            "localhost", "127.0.0.1", "::1"
+        }:
+            raise ValueError("SOCIAL_AUTH_SUCCESS_CALLBACK must use HTTPS")
+        return url.strip()
+
+    @staticmethod
+    def _validate_success_redirect(url: str) -> str:
+        if not isinstance(url, str):
+            raise ValueError("Social login success callback did not provide a redirect URL")
+        parsed = urlsplit(url.strip())
+        if (
+            parsed.scheme.lower() not in {"https", "http"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Social login success callback returned an invalid redirect URL")
+        if parsed.scheme.lower() != "https" and parsed.hostname.lower() not in {
+            "localhost", "127.0.0.1", "::1"
+        }:
+            raise ValueError("Social login success redirect must use HTTPS")
+        return url.strip()
 
     @staticmethod
     def _normalize_origin(origin: str) -> str:
@@ -265,27 +317,60 @@ class SocialAuth:
                     message = f"{provider} authentication failed"
                 return self._callback_error(provider, state_cookie, verifier_cookie, message, status)
 
-            result = {"identity": identity}
-            if user_id is not None:
-                result["user_id"] = user_id
-            if self.jwt_enabled:
-                subject = str(user_id) if user_id is not None else f"{provider}:{identity['sub']}"
-                claims = {
-                    "auth_provider": provider,
-                    "email": identity.get("email"),
-                    "email_verified": identity.get("email_verified", False),
-                    "name": identity.get("name"),
-                    "username": identity.get("username"),
-                }
-                result.update({
-                    "access_token": self.jwt.create_access_token(subject, claims=claims),
-                    "token_type": "bearer",
-                    "expires_in": self.jwt.token_lifetime_seconds,
-                })
-            response = JSONResponse(result)
+            if not self.success_callback:
+                return self._callback_error(
+                    provider, state_cookie, verifier_cookie,
+                    "Social login success callback is not configured", 503,
+                )
+            try:
+                redirect_url, cookies = await self._deliver_success(
+                    provider, identity, user_id
+                )
+            except Exception:
+                response = self._callback_error(
+                    provider, state_cookie, verifier_cookie,
+                    "Social login could not be completed by the application", 502,
+                )
+                return response
+            response = Response(status_code=303, headers={"location": redirect_url})
+            response._cookies.extend(cookies)
             self._clear_cookies(response, state_cookie, verifier_cookie)
             return response
         callback.__name__ = f"{provider}_callback"
+
+    async def _deliver_success(self, provider: str, identity: dict, user_id) -> tuple[str, list[str]]:
+        """Send verified identity to the developer backend and prepare a clean redirect."""
+        import json
+        import httpx
+
+        payload = {"provider": provider, "identity": identity}
+        if user_id is not None:
+            payload["user_id"] = str(user_id)
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            response = await client.post(self.success_callback, content=body, headers=headers)
+        if not response.is_success:
+            raise ValueError("Social login success callback rejected the login")
+        result = {}
+        if response.content:
+            try:
+                parsed_result = response.json()
+            except (ValueError, json.JSONDecodeError):
+                parsed_result = {}
+            if isinstance(parsed_result, dict):
+                result = parsed_result
+        redirect_url = result.get("redirect_url") or self.frontend_redirect_uri
+        if not redirect_url:
+            raise ValueError(
+                "Social login needs a frontend redirect URL in the webhook response "
+                "or FRONTEND_REDIRECT_URI setting"
+            )
+        redirect_url = self._validate_success_redirect(redirect_url)
+        cookies = response.headers.get_list("set-cookie")
+        if any("\r" in cookie or "\n" in cookie for cookie in cookies):
+            raise ValueError("Social login success callback returned invalid cookies")
+        return redirect_url, cookies
 
     def _authorization_url(self, provider, client_id, redirect_uri, state, challenge):
         if provider == "google":
