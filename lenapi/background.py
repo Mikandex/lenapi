@@ -12,6 +12,14 @@ from collections.abc import Callable
 from sqlalchemy import and_, or_, select, update
 
 from .models import BACKGROUND_JOBS_TABLE
+from .models import (
+    reset_current_async_session,
+    reset_current_database_backend,
+    reset_current_session,
+    set_current_async_session,
+    set_current_database_backend,
+    set_current_session,
+)
 
 from .logging import get_logger
 
@@ -24,8 +32,12 @@ _MEMORY_QUEUE_JOBS: dict[str, dict[str, dict]] = {}
 class BackgroundTasks:
     """Collect functions to run after the response body has been sent."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, session_factory=None, async_session_factory=None,
+                 database_backend: str | None = None) -> None:
         self._tasks: list[tuple[Callable, tuple, dict]] = []
+        self._session_factory = session_factory
+        self._async_session_factory = async_session_factory
+        self._database_backend = database_backend
 
     def add_task(self, function: Callable, *args, **kwargs) -> None:
         if not callable(function):
@@ -37,9 +49,56 @@ class BackgroundTasks:
         for function, args, kwargs in tasks:
             try:
                 if inspect.iscoroutinefunction(function):
-                    await function(*args, **kwargs)
+                    # Async handlers run on this event-loop thread, so create
+                    # their independent sessions and bind them to this context.
+                    session = self._session_factory() if self._session_factory else None
+                    async_session = (
+                        self._async_session_factory() if self._async_session_factory else None
+                    )
+                    session_token = set_current_session(session) if session is not None else None
+                    async_session_token = (
+                        set_current_async_session(async_session)
+                        if async_session is not None else None
+                    )
+                    backend_token = (
+                        set_current_database_backend(self._database_backend)
+                        if self._database_backend is not None else None
+                    )
+                    try:
+                        await function(*args, **kwargs)
+                    finally:
+                        if backend_token is not None:
+                            reset_current_database_backend(backend_token)
+                        if async_session_token is not None:
+                            reset_current_async_session(async_session_token)
+                        if session_token is not None:
+                            reset_current_session(session_token)
+                        if session is not None:
+                            session.close()
+                        if async_session is not None:
+                            await async_session.close()
                 else:
-                    result = await asyncio.to_thread(function, *args, **kwargs)
+                    def invoke_sync_task():
+                        # SQLAlchemy sessions are thread-affine for several
+                        # drivers (including SQLite), so construct, use, and
+                        # close the task session in the same worker thread.
+                        session = self._session_factory() if self._session_factory else None
+                        session_token = set_current_session(session) if session is not None else None
+                        backend_token = (
+                            set_current_database_backend(self._database_backend)
+                            if self._database_backend is not None else None
+                        )
+                        try:
+                            return function(*args, **kwargs)
+                        finally:
+                            if backend_token is not None:
+                                reset_current_database_backend(backend_token)
+                            if session_token is not None:
+                                reset_current_session(session_token)
+                            if session is not None:
+                                session.close()
+
+                    result = await asyncio.to_thread(invoke_sync_task)
                     if inspect.isawaitable(result):
                         await result
             except Exception:

@@ -672,7 +672,11 @@ class Application(Router):
                 media_root=self.media_root,
                 private_media_root=self.private_media_root,
             )
-            request.background_tasks = BackgroundTasks()
+            request.background_tasks = BackgroundTasks(
+                session_factory=self.session_factory,
+                async_session_factory=self.async_session_factory,
+                database_backend=self.database_type,
+            )
             session = None
             async_session = None
             session_token = None

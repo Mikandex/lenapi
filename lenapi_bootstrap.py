@@ -54,7 +54,12 @@ def configure_project(source_file: str, package: str | None = None):
 
 
 def create_app(source_file: str, package: str | None = None):
-    """Create a configured app and import the project's models for migrations."""
+    """Create a configured app and import project models under its namespace.
+
+    Call this before importing application routers or models. Generated
+    ``main.py`` does so at module import time, which lets Uvicorn load
+    ``main:app`` directly without the ``lenora`` launcher.
+    """
     settings = configure_project(source_file, package)
     model_module = f"{package}.app.models" if package else "app.models"
     importlib.import_module(model_module)

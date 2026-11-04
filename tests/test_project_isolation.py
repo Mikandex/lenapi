@@ -171,6 +171,50 @@ def test_generated_project_uses_namespaced_tables_and_requires_orphan_confirmati
         ).fetchone() is None
 
 
+def test_generated_project_imports_with_uvicorn_before_model_declarations(tmp_path):
+    env = os.environ.copy()
+    env.pop("LENAPI_PROJECT_NAME", None)
+    env.pop("LENAPI_PROJECT_NAMESPACE", None)
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    created = subprocess.run(
+        [sys.executable, "-c", "from lenapi.cli import main; main()", "startproject", "demo"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+
+    project_dir = tmp_path / "demo"
+    models_path = project_dir / "app" / "models.py"
+    with models_path.open("a", encoding="utf-8") as models_file:
+        models_file.write(
+            "\nfrom lenapi import model\n"
+            "class UvicornNamespaceProbe(model.Model):\n"
+            "    value = model.StringField(max_length=20)\n"
+        )
+
+    direct_import = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from uvicorn.importer import import_from_string\n"
+            "app = import_from_string('main:app')\n"
+            "from app.models import UvicornNamespaceProbe\n"
+            "assert UvicornNamespaceProbe.__table__.name == "
+            "f'{app.project_namespace}_uvicornnamespaceprobe'\n"
+            "assert app.project_name == 'demo'\n",
+        ],
+        cwd=project_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert direct_import.returncode == 0, direct_import.stdout + direct_import.stderr
+
+
 def test_project_settings_identity_matches_project_directory(tmp_path, monkeypatch):
     monkeypatch.delenv("LENAPI_PROJECT_NAME", raising=False)
     monkeypatch.delenv("LENAPI_PROJECT_NAMESPACE", raising=False)

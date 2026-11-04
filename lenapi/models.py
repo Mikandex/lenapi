@@ -9,9 +9,10 @@ import re
 import uuid
 from urllib.parse import urlsplit
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, Float, ForeignKey, Integer, Interval, JSON, MetaData, Numeric, String, Table, Text, Time, Uuid, UniqueConstraint, and_, delete, false, func, inspect, or_, select
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, Float, ForeignKey, Integer, Interval, JSON, MetaData, Numeric, String, Table, Text, Time, Uuid, UniqueConstraint, and_, delete, false, func, inspect, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, MappedColumn, Mapper, backref, declared_attr, mapped_column, object_session, relationship, selectinload
+from sqlalchemy.sql.elements import False_, True_
 from sqlalchemy import event
 
 from .response import HTTPException
@@ -1615,8 +1616,19 @@ TExtfield = TextField
 
 
 def BooleanField(**kwargs):
-    """Declare a boolean column that defaults to ``True`` unless overridden."""
+    """Declare a boolean column that defaults to ``True`` unless overridden.
+
+    Normalize SQLAlchemy's dialect-compiled Boolean server defaults to stable
+    SQL literals. Alembic otherwise renders ``false()`` as ``0`` when a
+    revision is generated against SQLite, which PostgreSQL rejects later.
+    """
     kwargs.setdefault("default", True)
+    server_default = kwargs.get("server_default")
+    expression = getattr(server_default, "arg", server_default)
+    if isinstance(expression, False_):
+        kwargs["server_default"] = text("false")
+    elif isinstance(expression, True_):
+        kwargs["server_default"] = text("true")
     return _field(Boolean, **kwargs)
 
 

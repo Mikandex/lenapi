@@ -119,6 +119,8 @@ TOKEN = {
 
 from lenapi_bootstrap import create_app
 
+# Keep app creation before imports from app.models or routers. This configures
+# the project namespace for direct ``uvicorn main:app`` startup.
 app = create_app(__file__, __package__)
 
 
@@ -231,6 +233,7 @@ from sqlalchemy import create_engine, inspect
 
 from lenapi import Model
 from lenapi.project import project_namespace, project_object_name
+from lenapi.migration_render import render_migration_item
 
 config = context.config
 
@@ -291,6 +294,7 @@ def run_migrations_offline():
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
         include_object=include_migration_object,
+        render_item=render_migration_item,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -307,6 +311,7 @@ def run_migrations_online():
             version_table=project_object_name("alembic_version"),
             compare_type=True,
             include_object=include_migration_object,
+            render_item=render_migration_item,
             render_as_batch=connection.dialect.name == "sqlite",
         )
         with context.begin_transaction():

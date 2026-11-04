@@ -228,6 +228,32 @@ def test_typed_path_query_body_request_and_background_tasks():
     app.database.close()
 
 
+def test_sync_background_task_gets_fresh_database_session(tmp_path):
+    app = Application(
+        database=Database(f"sqlite:///{tmp_path / 'background.sqlite3'}"),
+        security_storage="memory",
+    )
+    Model.metadata.create_all(app.database.engine, tables=[FeatureRecord.__table__])
+
+    @app.post("/audit")
+    def audit(request: Request):
+        request.background_tasks.add_task(FeatureRecord.create, name="background-audit")
+        return {"accepted": True}
+
+    status, _headers, result = json_request(app, "/audit", method="POST")
+    assert status == 200
+    assert result == {"accepted": True}
+
+    with app.database.engine.connect() as connection:
+        rows = connection.execute(
+            select(FeatureRecord.__table__).where(
+                FeatureRecord.__table__.c.name == "background-audit"
+            )
+        ).mappings().all()
+    assert len(rows) == 1
+    app.database.close()
+
+
 def test_dependency_results_are_cached_and_cycles_return_422():
     app = make_app()
     calls = []
