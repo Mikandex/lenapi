@@ -476,6 +476,10 @@ def _main() -> None:
         "repair-migrations", help="rebuild migration history from the live schema and current models while preserving application data"
     )
     repair_migrations.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
+    repair_migrations.add_argument(
+        "--message", "-m", default="repaired schema baseline",
+        help="description for the regenerated migration",
+    )
     clear_migrations = commands.add_parser(
         "clear_migrations", help="clear migration files and version history for an empty database only"
     )
