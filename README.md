@@ -1999,7 +1999,7 @@ python lenora.py migrate
 python lenora.py showmigrations
 ```
 
-`repair-migrations` repairs only migration history. It compares the live SQL schema with the current models, then stamps the local head only when they match; it preserves schema and data and refuses mismatches. If a revision file is missing, restore it when possible; use repair only after confirming the live schema matches current model metadata. On an empty database with no revisions, use `migration` to create a new initial revision instead. MongoDB has no Alembic history and does not support this repair command.
+`repair-migrations` rebuilds SQL migration history from the live database schema and the current models. It removes this project's local revision files and Alembic version table, then generates and applies a fresh migration. Application tables and rows are preserved; existing tables or columns no longer represented by models are retained rather than dropped. Back up the database before running it. MongoDB has no Alembic history and does not support this repair command.
 
 ```bash
 python lenora.py repair-migrations

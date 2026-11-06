@@ -473,7 +473,7 @@ def _main() -> None:
     showmigrations = commands.add_parser("showmigrations", help="show local and applied database migration history")
     showmigrations.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
     repair_migrations = commands.add_parser(
-        "repair-migrations", help="repair a missing database revision when the schema matches current models"
+        "repair-migrations", help="rebuild migration history from the live schema and current models while preserving application data"
     )
     repair_migrations.add_argument("--app", default=DEFAULT_APP, help=f"ASGI app import string (default: {DEFAULT_APP})")
     clear_migrations = commands.add_parser(
@@ -1028,7 +1028,7 @@ def test_http_endpoint_is_registered_and_documented(method, path):
 
     engine = app.database.engine
     revisions = Path.cwd() / "migrations" / "versions"
-    if namespace and args.command != "delete_migrations":
+    if namespace and args.command not in {"delete_migrations", "repair-migrations"}:
         # Never read or adopt the legacy global alembic_version table: it may
         # belong to another project using the same database. Also refuse to
         # replay a pre-namespace local chain into the shared database.
@@ -1096,7 +1096,22 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             name for name in inspector.get_view_names()
             if namespace and name.startswith(f"{namespace}_")
         }
-    if args.command in {"migration", "migrate", "repair-migrations"}:
+    if args.command == "repair-migrations":
+        # A repair rebases only migration metadata. Keep every application
+        # table, view, and row; autogenerate a new revision against the live
+        # schema below so the resulting migration contains only forward diffs.
+        revisions.mkdir(parents=True, exist_ok=True)
+        with engine.begin() as connection:
+            if version_table in inspect(connection).get_table_names():
+                quoted_version = connection.dialect.identifier_preparer.quote(version_table)
+                connection.exec_driver_sql(f"DROP TABLE {quoted_version}")
+        for path in revisions.glob("*.py"):
+            if path.name != "__init__.py":
+                path.unlink()
+        logger.info(
+            "Reset local migration revisions and the project Alembic version table; application data was preserved."
+        )
+    if args.command in {"migration", "migrate"}:
         confirm_project_orphans(orphaned_tables | owned_views, "database tables/views")
         if orphaned_tables or owned_views:
             dialect = engine.dialect.name
@@ -1278,72 +1293,6 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             print("Database migration state: " + ", ".join(sorted(current_heads)))
         return
 
-    if args.command == "repair-migrations":
-        script = ScriptDirectory.from_config(config)
-        with engine.connect() as connection:
-            table_names = set(inspect(connection).get_table_names())
-            differences = compare_metadata(
-                MigrationContext.configure(
-                    connection,
-                    opts={"compare_type": True, "include_object": include_migration_object,
-                          "version_table": version_table},
-                ),
-                Model.metadata,
-            )
-        if differences:
-            parser.error(
-                "database schema does not match current models; refusing to change migration history. "
-                "Restore the missing revision file or reconcile the schema first. "
-                "If the database is empty, run python lenora.py migration instead."
-            )
-        local_revisions = [
-            path for path in revisions.glob("*.py") if path.name != "__init__.py"
-        ]
-        if not local_revisions:
-            if not table_names:
-                parser.error("database is empty; run python lenora.py migration to create the initial revision")
-            from alembic.autogenerate import render_python_code
-            from alembic.operations.ops import CreateIndexOp, CreateTableOp, UpgradeOps
-            from alembic.util import rev_id
-
-            revision_id = rev_id()
-            operations = []
-            tables = list(Model.metadata.sorted_tables)
-            for table in tables:
-                operations.append(CreateTableOp.from_table(table))
-            for table in tables:
-                operations.extend(
-                    CreateIndexOp.from_index(index)
-                    for index in sorted(table.indexes, key=lambda index: index.name or "")
-                )
-            upgrade_code = render_python_code(UpgradeOps(ops=operations))
-            downgrade_code = "\n".join(
-                f"    op.drop_table({table.name!r})" for table in reversed(tables)
-            ) or "    pass"
-            revisions.mkdir(parents=True, exist_ok=True)
-            baseline = revisions / f"{revision_id}_baseline.py"
-            baseline.write_text(
-                '"""Baseline schema captured from the current model metadata.\n\n'
-                f"Revision ID: {revision_id}\nRevises: None\n\n\n"
-                '"""\nfrom alembic import op\nimport sqlalchemy as sa\n\n'
-                f"revision = {revision_id!r}\ndown_revision = None\n"
-                "branch_labels = None\ndepends_on = None\n\n\n"
-                "def upgrade():\n"
-                f"{upgrade_code}\n\n\n"
-                "def downgrade():\n"
-                f"{downgrade_code}\n",
-                encoding="utf-8",
-            )
-            logger.info("Created baseline migration %s from current models.", baseline.name)
-            head = revision_id
-        else:
-            head = script.get_current_head()
-            if head is None:
-                parser.error("no migration head found; inspect showmigrations and restore missing revision files")
-        command.stamp(config, "head")
-        logger.info("Migration history repaired to %s; schema and data were preserved.", head)
-        return
-
     if args.command == "clear_migrations":
         with engine.connect() as connection:
             table_names = set(inspect(connection).get_table_names())
@@ -1354,7 +1303,7 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         if application_tables:
             parser.error(
                 "refusing to clear migrations because the database contains application tables; "
-                "use `python lenora.py repair-migrations` for a missing revision when its schema matches models"
+                "use `python lenora.py repair-migrations` to rebuild migration history while preserving application tables and data"
             )
         if version_table in table_names:
             with engine.begin() as connection:
@@ -1367,13 +1316,19 @@ def test_http_endpoint_is_registered_and_documented(method, path):
         logger.info("Cleared migration files and database history; no application tables existed.")
         return
 
-    schema_generation = args.command in {"migration", "background-worker"}
+    schema_generation = args.command in {"migration", "background-worker", "repair-migrations"}
     if schema_generation:
         existing_revisions = [
             path for path in revisions.glob("*.py") if path.name != "__init__.py"
         ]
         revisions_before_autogenerate = {path.resolve() for path in existing_revisions}
-        config.attributes["lenapi_initial_revision"] = not existing_revisions
+        # Repair autogeneration must compare against the real database even
+        # for SQLite. The normal initial-migration path uses an empty temporary
+        # database to generate a create-all baseline, which would overwrite
+        # the meaning of an existing schema during repair.
+        config.attributes["lenapi_initial_revision"] = (
+            not existing_revisions and args.command != "repair-migrations"
+        )
 
         script = ScriptDirectory.from_config(config)
 
@@ -1525,6 +1480,36 @@ def test_http_endpoint_is_registered_and_documented(method, path):
                         temporary_engine.dispose()
 
         def skip_empty_revision(migration_context, revision, directives):
+            if args.command == "repair-migrations":
+                # Preserve existing database data: an autogenerate diff must
+                # never remove a table or column simply because its model was
+                # removed or renamed. Keep the remaining forward changes.
+                from alembic.operations import ops
+
+                def keep_data_operations(container):
+                    kept = []
+                    for operation in container.ops:
+                        if isinstance(operation, (ops.DropTableOp, ops.DropColumnOp)):
+                            preserved_name = getattr(operation, "table_name", "table")
+                            if isinstance(operation, ops.DropColumnOp):
+                                preserved_name = f"{preserved_name}.{operation.column_name}"
+                            logger.warning(
+                                "Keeping existing database data in %s; model removal was not applied.",
+                                preserved_name,
+                            )
+                            continue
+                        nested = getattr(operation, "ops", None)
+                        if nested is not None:
+                            keep_data_operations(operation)
+                        kept.append(operation)
+                    container.ops = kept
+
+                for directive in directives or ():
+                    for upgrade_ops in directive.upgrade_ops_list:
+                        keep_data_operations(upgrade_ops)
+                # Unlike an ordinary migration, an empty repair revision is
+                # useful: it records the new baseline after a history reset.
+                return
             if directives and directives[0].upgrade_ops.is_empty():
                 directives.clear()
 
@@ -1643,7 +1628,11 @@ def test_http_endpoint_is_registered_and_documented(method, path):
             name for name in table_names
             if namespace and name.startswith(f"{namespace}_") and name != version_table
         }
-        if existing_tables and version_table not in table_names:
+        if (
+            existing_tables
+            and version_table not in table_names
+            and args.command != "repair-migrations"
+        ):
             differences = compare_metadata(
                 MigrationContext.configure(
                     connection,
