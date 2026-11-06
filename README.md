@@ -1422,7 +1422,6 @@ def oidc_profile(identity=Depends(provider_auth)):
 # settings.py — replace with the exact origin serving your frontend.
 SOCIAL_AUTH_ALLOWED_ORIGINS = ["https://myapp.com"]
 SOCIAL_AUTH_SUCCESS_CALLBACK = "https://api.example.com/auth/social/success"
-FRONTEND_REDIRECT_URI = "https://app.example.com/login/success"
 
 # main.py
 from lenapi import LENAPI
@@ -1448,12 +1447,14 @@ This mounts routes such as `/auth/google/login` and `/auth/google/callback` only
 
 The provider's OAuth access token is used internally and is never returned. A successful social login requires `SOCIAL_AUTH_SUCCESS_CALLBACK`; without it the callback returns a generic `503` and no identity data. The browser callback never returns provider identity or a LenAPI token. `jwt_enabled` remains accepted for compatibility but credential issuance belongs to your backend callback. Google and LinkedIn use OIDC identity endpoints in this integration; GitHub uses OAuth 2.0 and its profile/email APIs, not OIDC.
 
-To keep provider identity out of the browser response and let your backend own login/session handling, configure `SOCIAL_AUTH_SUCCESS_CALLBACK`. LenAPI validates the provider callback and POSTs the verified identity as JSON to your backend. After any successful webhook response, LenAPI redirects the callback tab to `FRONTEND_REDIRECT_URI`; the webhook may optionally return JSON containing `redirect_url` to override that setting for this login. LenAPI forwards any `Set-Cookie` headers from the webhook response. The configured callback URL and redirect URL must use HTTPS; HTTP is accepted only for localhost development. Redirect URLs may not include query strings or fragments. When callback mode is enabled, your backend owns JWT/session issuance; `jwt_enabled` does not cause LenAPI to create or return a JWT.
+To keep provider identity out of the browser response and let your backend own login/session handling, configure `SOCIAL_AUTH_SUCCESS_CALLBACK`. LenAPI validates the provider callback and POSTs the verified identity as JSON to your backend. The webhook must return JSON containing `redirect_url`; LenAPI redirects the browser to that URL and forwards any `Set-Cookie` headers from the webhook response. Redirect URLs must use HTTPS; HTTP is accepted only for localhost development. Query parameters are allowed so the webhook can include a short-lived, single-use exchange code; URL fragments are rejected. Do not put a bearer token or provider access token in the redirect URL. When callback mode is enabled, your backend owns JWT/session issuance; `jwt_enabled` does not cause LenAPI to create or return a JWT.
 
 ```python
 # Developer backend endpoint (the SOCIAL_AUTH_SUCCESS_CALLBACK URL)
 from lenapi import JSONResponse, LENAPI, Request
-import settings
+import hashlib
+import secrets
+from urllib.parse import urlencode
 
 app = LENAPI()
 
@@ -1463,19 +1464,20 @@ async def social_success(request: Request):
     identity = data["identity"]
     user_id = data.get("user_id")
 
-    # Implement your own account rules and issue your own session/JWT here.
+    # Apply your own account rules, then store a short-lived, single-use code.
     user = await find_or_create_user(identity, user_id)
-    session_id = await create_session(user)
-
-    response = JSONResponse({"accepted": True})
-    response.set_cookie(
-        "session_id", session_id, max_age=3600, path="/",
-        httponly=True, secure=True, samesite="lax",
+    code = secrets.token_urlsafe(32)
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    await app.cache.set(
+        f"social_login:{code_hash}", {"user_id": str(user.id)}, ttl=400
     )
-    return response
+    redirect_url = "https://app.example.com/login/success?" + urlencode({"code": code})
+    return JSONResponse({"redirect_url": redirect_url})
 ```
 
-The webhook body is `{"provider": "google", "identity": {...}, "user_id": "..."}`; `user_id` is omitted when auto-registration is disabled. This is a plain HTTPS server-to-server POST; the receiving application is responsible for protecting its endpoint. The backend's `Set-Cookie` is forwarded to the browser with LenAPI's redirect response, so choose cookie domain and frontend/API domains accordingly. The redirect destination comes from the configured `FRONTEND_REDIRECT_URI` or the webhook's optional `redirect_url`, never a browser-supplied URL. The helper functions in the sample are application code, not LenAPI built-ins.
+The frontend should immediately POST the code to a separate backend exchange route. That route hashes the submitted code, retrieves and deletes its cache entry, and only then issues your bearer token or session. Do not place an access token in the redirect URL.
+
+The webhook body is `{"provider": "google", "identity": {...}, "user_id": "..."}`; `user_id` is omitted when auto-registration is disabled. This is a plain HTTPS server-to-server POST; the receiving application is responsible for protecting its endpoint. The backend's `Set-Cookie` is forwarded to the browser with LenAPI's redirect response, so choose cookie domain and frontend/API domains accordingly. The redirect destination comes from the webhook's `redirect_url`, never a browser-supplied URL. The helper functions in the sample are application code, not LenAPI built-ins.
 
 `allowed_origins` can also be passed directly to `SocialAuth`; otherwise it reads `SOCIAL_AUTH_ALLOWED_ORIGINS` from `settings.py`. When a browser sends an `Origin` header to a provider login route, LenApi requires an exact match in this list and returns `403` otherwise. Replace `https://myapp.com` with the exact origin serving your frontend. Top-level navigations can omit `Origin`; those still rely on the required, random, browser-cookie-bound OAuth `state` check on callback. Do not treat the origin allowlist as a replacement for OAuth state validation, HTTPS, or correct provider callback URL registration. The provider callback itself is not checked against the browser `Origin` header because providers may omit it or send a different origin.
 

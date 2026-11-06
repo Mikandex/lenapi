@@ -43,7 +43,6 @@ class SocialAuth:
         user_model=None,
         allowed_origins=None,
         success_callback: str | None = None,
-        frontend_redirect_uri: str | None = None,
     ) -> None:
         if isinstance(providers, str):
             raise TypeError("providers must be a list or tuple of provider names")
@@ -74,13 +73,6 @@ class SocialAuth:
         if success_callback is None:
             success_callback = getattr(self.settings, "SOCIAL_AUTH_SUCCESS_CALLBACK", "") or None
         self.success_callback = self._validate_success_callback(success_callback)
-        if frontend_redirect_uri is None:
-            frontend_redirect_uri = getattr(self.settings, "FRONTEND_REDIRECT_URI", "") or None
-        self.frontend_redirect_uri = (
-            self._validate_success_redirect(frontend_redirect_uri)
-            if frontend_redirect_uri
-            else None
-        )
         if allowed_origins is None:
             allowed_origins = getattr(self.settings, "SOCIAL_AUTH_ALLOWED_ORIGINS", ())
         self.allowed_origins = self._normalize_origins(allowed_origins)
@@ -118,7 +110,6 @@ class SocialAuth:
             or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
-            or parsed.query
             or parsed.fragment
         ):
             raise ValueError("Social login success callback returned an invalid redirect URL")
@@ -360,11 +351,10 @@ class SocialAuth:
                 parsed_result = {}
             if isinstance(parsed_result, dict):
                 result = parsed_result
-        redirect_url = result.get("redirect_url") or self.frontend_redirect_uri
+        redirect_url = result.get("redirect_url")
         if not redirect_url:
             raise ValueError(
-                "Social login needs a frontend redirect URL in the webhook response "
-                "or FRONTEND_REDIRECT_URI setting"
+                "Social login success callback must return a redirect_url"
             )
         redirect_url = self._validate_success_redirect(redirect_url)
         cookies = response.headers.get_list("set-cookie")

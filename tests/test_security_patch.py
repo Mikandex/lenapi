@@ -208,6 +208,48 @@ def test_social_auth_success_callback_redirects_without_exposing_identity():
     assert delivered["identity"]["sub"] == "provider-user-1"
 
 
+def test_social_auth_uses_webhook_redirect_with_query_parameters(monkeypatch):
+    import httpx
+
+    settings = SimpleNamespace(
+        SOCIAL_AUTH_SUCCESS_CALLBACK="https://backend.example/auth/social/success",
+    )
+    auth = SocialAuth(["google"], settings=settings)
+
+    class CallbackResponse:
+        is_success = True
+        content = b'{"redirect_url": "https://frontend.example/login/success?code=one-time-code"}'
+        headers = httpx.Headers([
+            ("set-cookie", "session_id=opaque-session; Path=/; HttpOnly; Secure; SameSite=None")
+        ])
+
+        @staticmethod
+        def json():
+            return {"redirect_url": "https://frontend.example/login/success?code=one-time-code"}
+
+    class CallbackClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, **kwargs):
+            assert url == settings.SOCIAL_AUTH_SUCCESS_CALLBACK
+            return CallbackResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", CallbackClient)
+    redirect_url, cookies = asyncio.run(
+        auth._deliver_success("google", {"sub": "provider-user"}, None)
+    )
+
+    assert redirect_url == "https://frontend.example/login/success?code=one-time-code"
+    assert cookies == [
+        "session_id=opaque-session; Path=/; HttpOnly; Secure; SameSite=None"
+    ]
 def test_social_auth_origin_configuration_is_normalized_and_validated():
     auth = SocialAuth(
         ["google"],
