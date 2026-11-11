@@ -172,7 +172,8 @@ from lenapi.admin import admin
 #     exclude=("password", "private_notes"),
 # )
 ''',
-    "lenora.py": '''"""Project-local command launcher."""
+    "lenora.py": '''#!/usr/bin/env python3
+"""Project-local command launcher."""
 
 from lenapi_bootstrap import configure_project
 configure_project(__file__)
@@ -425,12 +426,12 @@ def _main() -> None:
         description="lenApi project tools",
         epilog=(
             "Examples:\n"
-            "  python lenora.py startproject myproject\n"
-            "  python lenora.py apikey\n"
-            "  python lenora.py run --port 8010\n"
-            "  python lenora.py migration --message add_users\n\n"
+            "  lenora.py startproject myproject\n"
+            "  lenora.py apikey\n"
+            "  lenora.py run --port 8010\n"
+            "  lenora.py migration --message add_users\n\n"
             "For flags and arguments for a command, run: "
-            "python lenora.py <command> --help"
+            "lenora.py <command> --help"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -562,12 +563,14 @@ def _main() -> None:
                         "__LENAPI_GENERATED_API_KEY__", secrets.token_urlsafe(32)
                     )
                 destination.write_text(contents, encoding="utf-8")
+                if relative_path == "lenora.py":
+                    destination.chmod(0o755)
         except OSError as exc:
             import shutil
             shutil.rmtree(project_dir, ignore_errors=True)
             parser.error(f"could not create project: {exc}")
         print(f"Created lenApi project in {project_dir}")
-        print(f"Next: cd {args.name} && python lenora.py migration && python lenora.py run")
+        print(f"Next: cd {args.name} && lenora.py migration && lenora.py run")
         return
 
     if args.command == "repair-settings":

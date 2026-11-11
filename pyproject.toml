@@ -48,6 +48,7 @@ monitoring = ["psutil>=5.9,<8"]
 
 [project.scripts]
 lenora = "lenapi.cli:main"
+"lenora.py" = "lenapi.cli:main"
 
 [tool.setuptools]
 py-modules = ["lenapi_bootstrap"]

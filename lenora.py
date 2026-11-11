@@ -1,4 +1,5 @@
-"""Project CLI entry point: python lenora.py <command>."""
+#!/usr/bin/env python3
+"""Project CLI entry point; run as ``./lenora.py <command>`` or with Python."""
 
 from lenapi.cli import main
 
