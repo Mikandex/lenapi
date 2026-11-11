@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from contextvars import ContextVar
 import ipaddress
+import hashlib
 import math
 import re
 import uuid
@@ -1411,7 +1412,9 @@ def _install_non_negative_constraint(column, table):
         or column.info.get("lenapi_non_negative_constraint_added")
     ):
         return
-    name = f"ck_{table.name}_{column.name}_non_negative"
+    name = _bounded_constraint_name(
+        f"ck_{table.name}_{column.name}_non_negative"
+    )
     if not any(constraint.name == name for constraint in table.constraints):
         table.append_constraint(CheckConstraint(
             column >= 0,
@@ -1422,6 +1425,21 @@ def _install_non_negative_constraint(column, table):
         # reattaches the table's existing constraints. Preserve this marker in
         # Column.info so reconstruction does not append a second copy.
         column.info["lenapi_non_negative_constraint_added"] = True
+
+
+def _bounded_constraint_name(name: str, max_length: int = 63) -> str:
+    """Keep generated constraint identifiers within portable DB limits.
+
+    PostgreSQL allows 63-byte identifiers. Preserve the readable prefix and
+    append a deterministic digest so long table/column names remain unique
+    and stable between model imports and Alembic runs.
+    """
+    if len(name.encode("utf-8")) <= max_length:
+        return name
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    prefix_budget = max_length - len(digest) - 1
+    prefix = name.encode("utf-8")[:prefix_budget].decode("utf-8", errors="ignore")
+    return f"{prefix}_{digest}"
 
 
 @event.listens_for(Mapper, "after_mapper_constructed")
